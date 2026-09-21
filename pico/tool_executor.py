@@ -44,6 +44,7 @@ class ToolExecutor:
 
     def execute(self, name, args):
         agent = self.agent
+        args = agent.redact_artifact(args or {})
         if agent.allowed_tools is not None and name not in agent.allowed_tools:
             return ToolExecutionResult(
                 content=f"error: tool '{name}' is not allowed in this run",
@@ -112,7 +113,9 @@ class ToolExecutor:
         before_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
-            content = clip(tool["run"](args))
+            content = agent.redact_text(clip(tool["run"](args)))
+            if agent.transaction_context is not None:
+                agent.transaction_context.workspace.enforce_storage_limit()
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
@@ -139,15 +142,19 @@ class ToolExecutor:
                 diff_summary=diff_summary,
             )
             agent.record_process_note_for_tool(name, metadata)
+            if name == "run_shell":
+                agent.last_shell_validation_succeeded = tool_status == "ok"
             return ToolExecutionResult(content=content, metadata=metadata)
         except Exception as exc:
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
+            explicit_error_code = str(getattr(exc, "code", "") or "")
+            error_code = explicit_error_code or ("tool_partial_success" if workspace_changed else "tool_failed")
             metadata = _metadata(
                 "partial_success" if workspace_changed else "error",
-                tool_error_code="tool_partial_success" if workspace_changed else "tool_failed",
+                tool_error_code=error_code,
                 security_event_type=security_event_type,
                 risk_level="high" if tool["risky"] else "low",
                 read_only=not tool["risky"],
@@ -157,4 +164,6 @@ class ToolExecutor:
                 diff_summary=diff_summary,
             )
             agent.record_process_note_for_tool(name, metadata)
-            return ToolExecutionResult(content=f"error: tool {name} failed: {exc}", metadata=metadata)
+            if name == "run_shell":
+                agent.last_shell_validation_succeeded = False
+            return ToolExecutionResult(content=agent.redact_text(f"error: tool {name} failed: {exc}"), metadata=metadata)

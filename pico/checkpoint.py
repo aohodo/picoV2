@@ -30,7 +30,7 @@ RUNTIME_IDENTITY_KEYS = (
 def current_runtime_identity(agent):
     return {
         "session_id": agent.session.get("id", ""),
-        "cwd": str(agent.root),
+        "cwd": str(agent.source_root),
         "model": str(getattr(agent.model_client, "model", "")),
         "model_client": agent.model_client.__class__.__name__,
         "approval_policy": agent.approval_policy,
@@ -39,7 +39,9 @@ def current_runtime_identity(agent):
         "max_new_tokens": int(agent.max_new_tokens),
         "feature_flags": dict(agent.feature_flags),
         "shell_env_allowlist": list(agent.shell_env_allowlist),
-        "workspace_fingerprint": getattr(getattr(agent, "prefix_state", None), "workspace_fingerprint", agent.workspace.fingerprint()),
+        "workspace_fingerprint": agent.workspace.__class__.build(
+            agent.source_root, repo_root_override=agent.source_root
+        ).fingerprint(),
         "tool_signature": agent.tool_signature(),
     }
 
@@ -166,6 +168,13 @@ def create_checkpoint(agent, task_state, user_message, trigger):
         "freshness": freshness,
         "summary": f"{trigger}: {clip(str(user_message), 120)}",
         "runtime_identity": current_runtime_identity(agent),
+        "transaction": {
+            "transaction_id": getattr(task_state, "transaction_id", ""),
+            "state": getattr(task_state, "transaction_state", ""),
+            "source_root": str(getattr(agent, "source_root", agent.root)),
+            "execution_root": str(agent.root) if getattr(agent, "transaction_context", None) else "",
+            "schema_version": "tsw-v1",
+        },
     }
     state["items"][checkpoint_id] = checkpoint
     state["current_id"] = checkpoint_id

@@ -5,8 +5,9 @@ from pathlib import Path
 
 
 class SessionStore:
-    def __init__(self, root):
+    def __init__(self, root, secret_boundary=None):
         self.root = Path(root)
+        self.secret_boundary = secret_boundary
         self.root.mkdir(parents=True, exist_ok=True)
 
     def path(self, session_id):
@@ -14,7 +15,8 @@ class SessionStore:
 
     def save(self, session):
         path = self.path(session["id"])
-        path.write_text(json.dumps(session, indent=2), encoding="utf-8")
+        payload = self.secret_boundary.sanitize_object(session) if self.secret_boundary else session
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return path
 
     def load(self, session_id):

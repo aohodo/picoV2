@@ -6,14 +6,18 @@
 """
 
 import argparse
+import json
 import os
 import shutil
 import sys
 import textwrap
+from pathlib import Path
 
 from .config import load_project_env, provider_env
 from .providers.clients import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import Pico, SessionStore
+from .security import SecretBoundary
+from .state_root import WorkspaceState
 from .workspace import WorkspaceContext, middle
 
 DEFAULT_SECRET_ENV_NAMES = (
@@ -243,7 +247,19 @@ def build_agent(args):
     workspace = WorkspaceContext.build(args.cwd)
     load_project_env(workspace.repo_root)
     configured_secret_names = _configured_secret_names(args)
-    store = SessionStore(workspace.repo_root + "/.pico/sessions")
+    workspace_state = WorkspaceState(workspace.repo_root).ensure()
+    boundary = SecretBoundary(secret_env_names=configured_secret_names)
+    store = SessionStore(workspace_state.sessions, secret_boundary=boundary)
+    legacy_sessions = Path(workspace.repo_root) / ".pico" / "sessions"
+    if legacy_sessions.exists():
+        for legacy_path in legacy_sessions.glob("*.json"):
+            target = store.path(legacy_path.stem)
+            if target.exists():
+                continue
+            try:
+                store.save(json.loads(legacy_path.read_text(encoding="utf-8")))
+            except (OSError, KeyError, json.JSONDecodeError):
+                continue
     model = _build_model_client(args)
     session_id = args.resume
     if session_id == "latest":
@@ -258,6 +274,8 @@ def build_agent(args):
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
             secret_env_names=configured_secret_names,
+            commit_policy=getattr(args, "commit_policy", "review"),
+            state_root=workspace_state.global_root,
         )
     return Pico(
         model_client=model,
@@ -267,6 +285,8 @@ def build_agent(args):
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         secret_env_names=configured_secret_names,
+        commit_policy=getattr(args, "commit_policy", "review"),
+        state_root=workspace_state.global_root,
     )
 
 
@@ -295,6 +315,12 @@ def build_arg_parser():
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
     parser.add_argument("--approval", choices=("ask", "auto", "never"), default="ask", help="Approval policy for risky tools.")
     parser.add_argument(
+        "--commit-policy",
+        choices=("review", "auto"),
+        default="review",
+        help="Apply validated staged changes after review, or automatically for CI/benchmarks.",
+    )
+    parser.add_argument(
         "--secret-env-name",
         dest="secret_env_names",
         action="append",
@@ -308,6 +334,28 @@ def build_arg_parser():
     return parser
 
 
+def review_transaction(agent):
+    context = agent.transaction_context
+    if context is None or context.workspace.state != "READY_FOR_REVIEW":
+        return
+    print("\nTransaction READY_FOR_REVIEW")
+    for change in context.workspace.diff():
+        print(f"- {change['operation']}: {change['path']}")
+    try:
+        decision = input("Apply staged changes? [y/N/d=discard] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\nStaged transaction retained for resume.")
+        return
+    if decision in {"y", "yes", "apply"}:
+        result = agent.apply_transaction()
+        print(f"transaction {result['state'].lower()}")
+    elif decision in {"d", "discard"}:
+        result = agent.discard_transaction()
+        print(f"transaction {result['state'].lower()}")
+    else:
+        print("staged transaction retained for resume")
+
+
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     agent = build_agent(args)
@@ -315,6 +363,10 @@ def main(argv=None):
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
     host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", DEFAULT_OLLAMA_HOST)))
     print(build_welcome(agent, model=model, host=host))
+    # A resumed task may already be waiting for the user's commit decision.
+    # Surface that decision before accepting another prompt so the staged work
+    # cannot become unreachable behind an active READY_FOR_REVIEW transaction.
+    review_transaction(agent)
 
     if args.prompt:
         # one-shot 模式：只跑一次 ask，不进入 REPL 循环。
@@ -323,6 +375,7 @@ def main(argv=None):
             print()
             try:
                 print(agent.ask(prompt))
+                review_transaction(agent)
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -358,5 +411,6 @@ def main(argv=None):
         print()
         try:
             print(agent.ask(user_input))
+            review_transaction(agent)
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)

@@ -20,7 +20,12 @@ from .checkpoint import CHECKPOINT_NONE_STATUS
 from .prompt_prefix import build_prompt_prefix, tool_signature
 from .run_store import RunStore
 from .security import REDACTED_VALUE
+from .security import SecretBoundary
 from .session_store import SessionStore
+from .sandbox import DockerSandboxRunner, SandboxLease
+from .state_root import WorkspaceState
+from .transaction_context import TransactionContext
+from .transactional_workspace import TransactionalWorkspace
 from .tool_context import ToolContext
 from .tool_executor import ToolExecutor
 from . import tools as toolkit
@@ -61,7 +66,9 @@ DURABLE_MEMORY_LINE_PATTERNS = (
     ("dependency-facts", re.compile(r"^依赖：\s*(.+)$")),
     ("user-preferences", re.compile(r"^偏好：\s*(.+)$")),
 )
-SECRET_SHAPED_TEXT_PATTERN = re.compile(r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,})")
+SECRET_SHAPED_TEXT_PATTERN = re.compile(
+    r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,}|<redacted>)"
+)
 
 __all__ = ["Pico", "SessionStore"]
 
@@ -84,10 +91,15 @@ class Pico:
         secret_env_names=None,
         feature_flags=None,
         allowed_tools=None,
+        commit_policy=None,
+        state_root=None,
+        transaction_context=None,
+        sandbox_image="pico-sandbox:1",
     ):
         self.model_client = model_client
         self.workspace = workspace
-        self.root = Path(workspace.repo_root)
+        self.source_root = Path(workspace.repo_root).resolve()
+        self.root = self.source_root
         self.session_store = session_store
         self.approval_policy = approval_policy
         self.max_steps = max_steps
@@ -97,11 +109,36 @@ class Pico:
         self.read_only = read_only
         self.shell_env_allowlist = tuple(shell_env_allowlist or DEFAULT_SHELL_ENV_ALLOWLIST)
         self.secret_env_names = {str(name).upper() for name in (secret_env_names or ())}
+        self.secret_boundary = (
+            transaction_context.secret_boundary
+            if transaction_context is not None
+            else SecretBoundary(secret_env_names=self.secret_env_names)
+        )
+        for attribute in ("api_key", "token", "auth_token"):
+            self.secret_boundary.register_secret(getattr(model_client, attribute, ""))
+        self.session_store.secret_boundary = self.secret_boundary
+        self.commit_policy = str(commit_policy or ("auto" if approval_policy == "auto" else "review"))
+        if self.commit_policy not in {"review", "auto"}:
+            raise ValueError("commit_policy must be 'review' or 'auto'")
+        self.sandbox_image = str(sandbox_image)
+        self.workspace_state = None
+        if state_root is not None:
+            self.workspace_state = WorkspaceState(self.source_root, root=state_root).ensure()
+            self.transactions_root = self.workspace_state.transactions
+        else:
+            self.transactions_root = Path(self.session_store.root).parent / "transactions"
+            self.transactions_root.mkdir(parents=True, exist_ok=True)
+        self.transaction_context = transaction_context
+        if transaction_context is not None:
+            self.root = Path(transaction_context.execution_root)
         self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
-        self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
+        self.run_store = run_store or RunStore(
+            self.workspace_state.runs if self.workspace_state else Path(workspace.repo_root) / ".pico" / "runs"
+        )
+        self.run_store.secret_boundary = self.secret_boundary
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -110,9 +147,33 @@ class Pico:
             "memory": memorylib.default_memory_state(),
         }
         self._ensure_session_shape()
+        active_transaction_id = str(self.session.get("active_transaction_id", "")).strip()
+        if self.transaction_context is None and active_transaction_id:
+            transaction = TransactionalWorkspace.load(
+                self.source_root,
+                self.transactions_root,
+                active_transaction_id,
+                secret_boundary=self.secret_boundary,
+            )
+            if not transaction.execution_root.exists():
+                raise RuntimeError("RECOVERY_UNAVAILABLE: transaction shadow workspace is missing")
+            runner = DockerSandboxRunner(
+                transaction.execution_root,
+                self.secret_boundary,
+                image=self.sandbox_image,
+            )
+            self.transaction_context = TransactionContext(
+                transaction_id=transaction.transaction_id,
+                workspace=transaction,
+                secret_boundary=self.secret_boundary,
+                sandbox_lease=SandboxLease(runner),
+                owns_context=True,
+            )
+            self.root = transaction.execution_root
         self.memory = memorylib.LayeredMemory(
             self.session.setdefault("memory", memorylib.default_memory_state()),
             workspace_root=self.root,
+            durable_root=(self.workspace_state.memory if self.workspace_state else self.source_root / ".pico" / "memory"),
         )
         self.session["memory"] = self.memory.to_dict()
         self.tools = self._apply_tool_allowlist(self.build_tools())
@@ -130,10 +191,115 @@ class Pico:
         self.last_durable_rejections = []
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
+        self.last_shell_validation_succeeded = None
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
         }
+
+    def begin_transaction(self):
+        if self.transaction_context is not None:
+            return self.transaction_context
+        transaction = TransactionalWorkspace(
+            self.source_root,
+            self.transactions_root,
+            secret_boundary=self.secret_boundary,
+        ).begin()
+        runner = DockerSandboxRunner(
+            transaction.execution_root,
+            self.secret_boundary,
+            image=self.sandbox_image,
+        )
+        self.transaction_context = TransactionContext(
+            transaction_id=transaction.transaction_id,
+            workspace=transaction,
+            secret_boundary=self.secret_boundary,
+            sandbox_lease=SandboxLease(runner),
+            owns_context=True,
+        )
+        self.root = transaction.execution_root
+        self.workspace = WorkspaceContext.build(self.root, repo_root_override=self.root)
+        self.session["active_transaction_id"] = transaction.transaction_id
+        self.last_shell_validation_succeeded = None
+        self.memory.workspace_root = self.root
+        self.tools = self._apply_tool_allowlist(self.build_tools())
+        self._apply_prefix_state(self.build_prefix())
+        self.session_path = self.session_store.save(self.session)
+        return self.transaction_context
+
+    def _restore_source_view(self, clear_context=True):
+        context = self.transaction_context
+        self.root = self.source_root
+        self.workspace = WorkspaceContext.build(self.source_root, repo_root_override=self.source_root)
+        self.memory.workspace_root = self.source_root
+        if clear_context:
+            if context and context.owns_context:
+                context.sandbox_lease.stop()
+            self.transaction_context = None
+            self.session.pop("active_transaction_id", None)
+        self.tools = self._apply_tool_allowlist(self.build_tools())
+        self._apply_prefix_state(self.build_prefix())
+        self.session_path = self.session_store.save(self.session)
+
+    def finalize_transaction(self):
+        context = self.transaction_context
+        if context is None or not context.owns_context:
+            return {"state": "COMMITTED", "changes": [], "conflicts": []}
+        transaction = context.workspace
+        changes = transaction.stage()
+        if self.last_shell_validation_succeeded is False:
+            conflicts = transaction.block_validation("last_shell_command_failed")
+            return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
+        conflicts = transaction.validate_commit()
+        if conflicts:
+            return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
+        if self.commit_policy == "auto" or not changes:
+            context.sandbox_lease.stop()
+            transaction.commit()
+            result = {"state": transaction.state, "changes": changes, "conflicts": []}
+            self._restore_source_view(clear_context=True)
+            return result
+        return {"state": transaction.state, "changes": changes, "conflicts": []}
+
+    def apply_transaction(self):
+        if self.transaction_context is None:
+            raise RuntimeError("no active transaction")
+        context = self.transaction_context
+        transaction = context.workspace
+        context.sandbox_lease.stop()
+        committed_changes = transaction.commit()
+        result = {"state": transaction.state, "changes": committed_changes, "conflicts": []}
+        self._restore_source_view(clear_context=True)
+        if self.current_task_state is not None:
+            self.current_task_state.transaction_state = transaction.state
+            self.current_task_state.finish_success(self.current_task_state.final_answer)
+            self.run_store.write_task_state(self.current_task_state)
+            self.run_store.write_report(
+                self.current_task_state,
+                self.redact_artifact(self.build_report(self.current_task_state)),
+            )
+        return result
+
+    def discard_transaction(self):
+        if self.transaction_context is None:
+            raise RuntimeError("no active transaction")
+        transaction = self.transaction_context.workspace
+        transaction.discard()
+        self._restore_source_view(clear_context=True)
+        if self.current_task_state is not None:
+            self.current_task_state.transaction_state = transaction.state
+            self.current_task_state.stop("transaction_discarded", final_answer=self.current_task_state.final_answer)
+            self.run_store.write_task_state(self.current_task_state)
+            self.run_store.write_report(
+                self.current_task_state,
+                self.redact_artifact(self.build_report(self.current_task_state)),
+            )
+        return {"state": transaction.state}
+
+    def interrupt_transaction(self, reason="interrupted"):
+        if self.transaction_context is not None and self.transaction_context.owns_context:
+            self.transaction_context.workspace.interrupt(reason)
+            self.session_path = self.session_store.save(self.session)
 
     @classmethod
     def from_session(cls, model_client, workspace, session_store, session_id, **kwargs):
@@ -286,7 +452,7 @@ class Pico:
         return prompt
 
     def record(self, item):
-        self.session["history"].append(item)
+        self.session["history"].append(self.redact_artifact(item))
         self.session_path = self.session_store.save(self.session)
 
     @staticmethod
@@ -309,13 +475,16 @@ class Pico:
         return securitylib.detected_secret_env_summary(secret_env_names=self.secret_env_names)
 
     def redact_text(self, text):
-        return securitylib.redact_text(text, secret_env_names=self.secret_env_names)
+        return self.secret_boundary.sanitize_text(text)
 
     def redact_artifact(self, value, key=None):
-        return securitylib.redact_artifact(value, key=key, secret_env_names=self.secret_env_names)
+        return self.secret_boundary.sanitize_object(value, key=key)
 
     def shell_env(self):
-        return securitylib.shell_env(allowlist=self.shell_env_allowlist, root=self.root)
+        return self.secret_boundary.build_sandbox_env(
+            allowlist=self.shell_env_allowlist,
+            extra={"PWD": "/workspace"},
+        )
 
     def prompt_metadata(self, user_message, prompt):
         _, metadata = self._build_prompt_and_metadata(user_message)
@@ -351,7 +520,7 @@ class Pico:
             }
         )
         metadata.update(self.detected_secret_env_summary())
-        return prompt, metadata
+        return self.secret_boundary.sanitize_text(prompt), self.secret_boundary.sanitize_object(metadata)
 
     def emit_trace(self, task_state, event, payload=None):
         payload = self.redact_artifact(payload or {})
@@ -490,7 +659,7 @@ class Pico:
         rejections = []
         for line in str(final_answer or "").splitlines():
             text = line.strip()
-            if not text or REDACTED_VALUE in text:
+            if not text:
                 continue
             for topic, pattern in DURABLE_MEMORY_LINE_PATTERNS:
                 match = pattern.match(text)
@@ -518,6 +687,11 @@ class Pico:
     def ask(self, user_message):
         from .agent_loop import AgentLoop
 
+        if self.transaction_context is None:
+            self.begin_transaction()
+        elif self.transaction_context.workspace.state not in {"ACTIVE", "INTERRUPTED"}:
+            state = self.transaction_context.workspace.state
+            raise RuntimeError(f"active transaction is {state}; Apply, Discard, or recover it before another task")
         return AgentLoop(self).run(user_message)
 
     def execute_tool(self, name, args):
@@ -544,7 +718,18 @@ class Pico:
         工具是否存在、参数是否合法、是否重复、是否需要审批、执行结果是否裁剪、
         是否需要回写记忆。
         """
-        return self.execute_tool(name, args).content
+        direct_transaction = self.transaction_context is None
+        if direct_transaction:
+            self.begin_transaction()
+        result = self.execute_tool(name, args)
+        if direct_transaction and self.commit_policy == "auto" and result.metadata.get("read_only") is False:
+            if result.metadata.get("tool_status") == "ok":
+                outcome = self.finalize_transaction()
+                if outcome["state"] == "CONFLICTED":
+                    return "error: workspace conflict: " + json.dumps(outcome["conflicts"], ensure_ascii=False)
+            else:
+                self.interrupt_transaction(result.metadata.get("tool_error_code") or "tool_failed")
+        return result.content
 
     def repeated_tool_call(self, name, args):
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
@@ -582,6 +767,8 @@ class Pico:
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
             "redacted_env": self.detected_secret_env_summary(),
+            "transaction_id": task_state.transaction_id,
+            "transaction_state": task_state.transaction_state,
         }
 
     def tool_example(self, name):
@@ -596,6 +783,11 @@ class Pico:
             root=self.root,
             path_resolver=self.path,
             shell_env_provider=self.shell_env,
+            sandbox_runner=(
+                self.transaction_context.sandbox_lease.runner
+                if self.transaction_context is not None
+                else None
+            ),
             depth=self.depth,
             max_depth=self.max_depth,
             spawn_delegate=self.spawn_delegate,
@@ -603,6 +795,8 @@ class Pico:
 
     def spawn_delegate(self, args):
         task = str(args.get("task", "")).strip()
+        if self.transaction_context is None:
+            raise RuntimeError("delegate requires an active transaction")
         child = Pico(
             model_client=self.model_client,
             workspace=self.workspace,
@@ -616,6 +810,10 @@ class Pico:
             read_only=True,
             secret_env_names=self.secret_env_names,
             shell_env_allowlist=self.shell_env_allowlist,
+            commit_policy=self.commit_policy,
+            state_root=(self.workspace_state.global_root if self.workspace_state else None),
+            transaction_context=self.transaction_context.borrow(),
+            sandbox_image=self.sandbox_image,
         )
         # 委派的目标是“调查”，不是“放权执行”。
         # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
@@ -778,10 +976,16 @@ class Pico:
         return text[start:end]
 
     def reset(self):
+        if self.transaction_context is not None:
+            raise RuntimeError("active transaction must be applied or discarded before session reset")
         self.session["history"] = []
         self.session["memory"].clear()
         self.session["memory"].update(memorylib.default_memory_state())
-        self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
+        self.memory = memorylib.LayeredMemory(
+            self.session["memory"],
+            workspace_root=self.root,
+            durable_root=(self.workspace_state.memory if self.workspace_state else self.source_root / ".pico" / "memory"),
+        )
         self.session_store.save(self.session)
 
     def path(self, raw_path):
@@ -792,4 +996,7 @@ class Pico:
         # 这样既能防住 "../" 逃逸，也能防住符号链接解析后跳出仓库。
         if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):
             raise ValueError(f"path escapes workspace: {raw_path}")
+        relative = resolved.relative_to(self.root)
+        if relative.parts and relative.parts[0] in {".git", ".pico"}:
+            raise ValueError(f"path is internal to the runtime: {raw_path}")
         return resolved

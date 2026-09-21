@@ -4,12 +4,10 @@
 如何做参数校验，以及最终如何执行，都是在这里定义的。
 """
 
-import shutil
-import subprocess
-import textwrap
 from functools import partial
 
 from .workspace import IGNORED_PATH_NAMES
+from .sandbox import format_shell_result
 
 BASE_TOOL_SPECS = {
     "list_files": {
@@ -30,7 +28,7 @@ BASE_TOOL_SPECS = {
     "run_shell": {
         "schema": {"command": "str", "timeout": "int=20"},
         "risky": True,
-        "description": "Run a shell command in the repo root.",
+        "description": "Run a Bash command in the Linux Docker sandbox at /workspace.",
     },
     "write_file": {
         "schema": {"path": "str", "content": "str"},
@@ -186,16 +184,6 @@ def tool_search(context, args):
         raise ValueError("pattern must not be empty")
     path = context.path(args.get("path", "."))
 
-    if shutil.which("rg"):
-        # 优先用 rg，因为搜索会非常频繁，搜索延迟会直接影响 agent 控制循环。
-        result = subprocess.run(
-            ["rg", "-n", "--smart-case", "--max-count", "200", pattern, str(path)],
-            cwd=context.root,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout.strip() or result.stderr.strip() or "(no matches)"
-
     matches = []
     files = [path] if path.is_file() else [
         item for item in path.rglob("*")
@@ -217,26 +205,9 @@ def tool_run_shell(context, args):
     timeout = int(args.get("timeout", 20))
     if timeout < 1 or timeout > 120:
         raise ValueError("timeout must be in [1, 120]")
-    result = subprocess.run(
-        command,
-        cwd=context.root,
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
-        # 目的是减少敏感信息被意外带进命令执行环境的风险。
-        env=context.shell_env(),
-    )
-    return textwrap.dedent(
-        f"""\
-        exit_code: {result.returncode}
-        stdout:
-        {result.stdout.strip() or "(empty)"}
-        stderr:
-        {result.stderr.strip() or "(empty)"}
-        """
-    ).strip()
+    if context.sandbox_runner is None:
+        raise RuntimeError("shell_sandbox_unavailable: no sandbox is attached to this transaction")
+    return format_shell_result(context.sandbox_runner.run(command, timeout=timeout))
 
 
 def tool_write_file(context, args):

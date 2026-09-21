@@ -13,6 +13,9 @@ class AgentLoop:
 
     def _persist_model_failure(self, task_state, user_message, exc, run_started_at, prompt_metadata):
         agent = self.agent
+        agent.interrupt_transaction("model_error")
+        if agent.transaction_context is not None:
+            task_state.transaction_state = agent.transaction_context.workspace.state
         error_text = agent.redact_text(str(exc))
         final = f"Model request failed: {error_text}"
         task_state.stop_model_error(final)
@@ -79,6 +82,7 @@ class AgentLoop:
             prompt_metadata.update(completion_metadata)
         agent.last_completion_metadata = completion_metadata
         agent.last_prompt_metadata = prompt_metadata
+        raw = agent.redact_text(raw)
         kind, payload = agent.parse(raw)
         agent.emit_trace(
             task_state,
@@ -95,7 +99,14 @@ class AgentLoop:
     def _finish_success(self, task_state, user_message, final, run_started_at):
         agent = self.agent
         agent.record({"role": "assistant", "content": final, "created_at": now()})
-        task_state.finish_success(final)
+        outcome = agent.finalize_transaction()
+        task_state.transaction_state = outcome["state"]
+        if outcome["state"] == "COMMITTED":
+            task_state.finish_success(final)
+        elif outcome["state"] == "READY_FOR_REVIEW":
+            task_state.stop("ready_for_review", final_answer=final)
+        else:
+            task_state.stop("workspace_conflict", final_answer=final)
         agent.promote_durable_memory(user_message, final)
         checkpoint = agent.create_checkpoint(task_state, user_message, trigger="run_finished")
         agent.run_store.write_task_state(task_state)
@@ -122,11 +133,17 @@ class AgentLoop:
 
     def run(self, user_message):
         agent = self.agent
+        if agent.transaction_context is None:
+            agent.begin_transaction()
+        user_message = agent.redact_text(user_message)
         run_started_at = time.monotonic()
         agent.memory.set_task_summary(user_message)
         agent.record({"role": "user", "content": user_message, "created_at": now()})
 
         task_state = TaskState.create(run_id=agent.new_run_id(), task_id=agent.new_task_id(), user_request=user_message)
+        if agent.transaction_context is not None:
+            task_state.transaction_id = agent.transaction_context.transaction_id
+            task_state.transaction_state = agent.transaction_context.workspace.state
         task_state.resume_status = agent.resume_state.get("status", CHECKPOINT_NONE_STATUS)
         agent.current_task_state = task_state
         agent.current_run_dir = agent.run_store.start_run(task_state)
@@ -141,6 +158,7 @@ class AgentLoop:
 
         tool_steps = 0
         attempts = 0
+        budget_final = None
         max_attempts = max(agent.max_steps * 3, agent.max_steps + 4)
 
         # 这是 agent 的主循环，可以按“感知 -> 决策 -> 行动 -> 记录”来理解：
@@ -291,14 +309,23 @@ class AgentLoop:
             )
             if kind == "final":
                 final = (payload or raw).strip()
-                return self._finish_success(task_state, user_message, final, run_started_at)
+                transaction = getattr(agent, "transaction_context", None)
+                if transaction is None or not transaction.workspace.diff():
+                    return self._finish_success(task_state, user_message, final, run_started_at)
+                budget_final = final
 
-        if attempts >= max_attempts and tool_steps < agent.max_steps:
+        if budget_final is not None:
+            final = budget_final
+            task_state.stop_step_limit(final)
+        elif attempts >= max_attempts and tool_steps < agent.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
             task_state.stop_retry_limit(final)
         else:
             final = "Stopped after reaching the step limit without a final answer."
             task_state.stop_step_limit(final)
+        agent.interrupt_transaction(task_state.stop_reason or "interrupted")
+        if agent.transaction_context is not None:
+            task_state.transaction_state = agent.transaction_context.workspace.state
         agent.record({"role": "assistant", "content": final, "created_at": now()})
         agent.promote_durable_memory(user_message, final)
         agent.run_store.write_task_state(task_state)

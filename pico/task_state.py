@@ -37,6 +37,8 @@ class TaskState:
     final_answer: str = ""
     checkpoint_id: str = ""
     resume_status: str = ""
+    transaction_id: str = ""
+    transaction_state: str = ""
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -58,6 +60,8 @@ class TaskState:
             final_answer=str(data.get("final_answer", "")),
             checkpoint_id=str(data.get("checkpoint_id", "")),
             resume_status=str(data.get("resume_status", "")),
+            transaction_id=str(data.get("transaction_id", "")),
+            transaction_state=str(data.get("transaction_state", "")),
         )
 
     def record_attempt(self):
@@ -107,4 +111,6 @@ class TaskState:
             "final_answer": self.final_answer,
             "checkpoint_id": self.checkpoint_id,
             "resume_status": self.resume_status,
+            "transaction_id": self.transaction_id,
+            "transaction_state": self.transaction_state,
         }
