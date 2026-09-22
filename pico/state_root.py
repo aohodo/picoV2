@@ -26,7 +26,7 @@ def _git_value(source_root, *args):
             ["git", *args], cwd=source_root, capture_output=True, text=True, timeout=5, check=True
         )
         return result.stdout.strip()
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return ""
 
 

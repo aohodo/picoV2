@@ -4,8 +4,8 @@ Pico 就是包在模型外面的控制循环：负责组 prompt、解析模型�
 校验并执行工具、写 trace、更新工作记忆，以及在合适的时候停下来。
 """
 
-import json
 import hashlib
+import json
 import os
 import re
 import uuid
@@ -13,22 +13,23 @@ from datetime import datetime
 from pathlib import Path
 
 from . import checkpoint as checkpointlib
-from .features import memory as memorylib
 from . import security as securitylib
-from .context_manager import ContextManager
+from . import tools as toolkit
 from .checkpoint import CHECKPOINT_NONE_STATUS
+from .context_manager import ContextManager
+from .execution import ExecutionLease, WorkspaceCommandRunner
+from .execution_policy import ModelExecutionPolicy
+from .features import memory as memorylib
 from .prompt_prefix import build_prompt_prefix, tool_signature
 from .run_store import RunStore
-from .security import REDACTED_VALUE
-from .security import SecretBoundary
+from .security import REDACTED_VALUE, SecretBoundary
 from .session_store import SessionStore
-from .sandbox import DockerSandboxRunner, SandboxLease
 from .state_root import WorkspaceState
-from .transaction_context import TransactionContext
-from .transactional_workspace import TransactionalWorkspace
+from .task_state import TaskState
 from .tool_context import ToolContext
 from .tool_executor import ToolExecutor
-from . import tools as toolkit
+from .transaction_context import TransactionContext
+from .transactional_workspace import TransactionalWorkspace
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
 DEFAULT_SHELL_ENV_ALLOWLIST = (
@@ -95,6 +96,9 @@ class Pico:
         state_root=None,
         transaction_context=None,
         sandbox_image="pico-sandbox:1",
+        soft_discovery_limit=None,
+        hard_discovery_limit=None,
+        model_execution_policy="adaptive",
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -104,6 +108,9 @@ class Pico:
         self.approval_policy = approval_policy
         self.max_steps = max_steps
         self.max_new_tokens = max_new_tokens
+        self.soft_discovery_limit = soft_discovery_limit
+        self.hard_discovery_limit = hard_discovery_limit
+        self.model_execution_policy = ModelExecutionPolicy(model_execution_policy)
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
@@ -140,7 +147,7 @@ class Pico:
         )
         self.run_store.secret_boundary = self.secret_boundary
         self.session = session or {
-            "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
+            "id": datetime.now().astimezone().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
             "workspace_root": workspace.repo_root,
             "history": [],
@@ -157,16 +164,16 @@ class Pico:
             )
             if not transaction.execution_root.exists():
                 raise RuntimeError("RECOVERY_UNAVAILABLE: transaction shadow workspace is missing")
-            runner = DockerSandboxRunner(
+            runner = WorkspaceCommandRunner(
                 transaction.execution_root,
                 self.secret_boundary,
-                image=self.sandbox_image,
+                env_allowlist=self.shell_env_allowlist,
             )
             self.transaction_context = TransactionContext(
                 transaction_id=transaction.transaction_id,
                 workspace=transaction,
                 secret_boundary=self.secret_boundary,
-                sandbox_lease=SandboxLease(runner),
+                execution_lease=ExecutionLease(runner),
                 owns_context=True,
             )
             self.root = transaction.execution_root
@@ -182,9 +189,10 @@ class Pico:
         self.prefix = self.prefix_state.text
         self.context_manager = ContextManager(self)
         self.resume_state = self.evaluate_resume_state()
-        self.session_path = self.session_store.save(self.session)
         self.current_task_state = None
         self.current_run_dir = None
+        self.current_run_lease = None
+        self.current_run_started_at = None
         self.last_prompt_metadata = {}
         self.last_completion_metadata = {}
         self.last_durable_promotions = []
@@ -192,10 +200,61 @@ class Pico:
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
         self.last_shell_validation_succeeded = None
+        self.progress_controller = None
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
         }
+        self._recover_orphaned_runs()
+        self.session_path = self.session_store.save(self.session)
+
+    def _recover_orphaned_runs(self):
+        for payload in self.run_store.claim_orphaned_runs():
+            task_state = TaskState.from_dict(payload)
+            transaction_error = ""
+            transaction_id = str(task_state.transaction_id or "").strip()
+            if transaction_id:
+                try:
+                    if (
+                        self.transaction_context is not None
+                        and self.transaction_context.transaction_id == transaction_id
+                    ):
+                        transaction = self.transaction_context.workspace
+                    else:
+                        transaction = TransactionalWorkspace.load(
+                            self.source_root,
+                            self.transactions_root,
+                            transaction_id,
+                            secret_boundary=self.secret_boundary,
+                        )
+                    transaction.interrupt("orphaned_run")
+                    task_state.transaction_state = transaction.state
+                except Exception as exc:  # noqa: BLE001 - orphan recovery must still close the run record
+                    transaction_error = self.redact_text(str(exc))
+            final = "Recovered a run left active without a live process owner."
+            task_state.stop_orphaned(final)
+            self.run_store.write_task_state(task_state)
+            self.emit_trace(
+                task_state,
+                "orphan_recovered",
+                {
+                    "previous_status": "running",
+                    "transaction_error": transaction_error,
+                },
+            )
+            self.emit_trace(
+                task_state,
+                "run_finished",
+                {
+                    "status": task_state.status,
+                    "stop_reason": task_state.stop_reason,
+                    "final_answer": final,
+                },
+            )
+            self.run_store.write_report(
+                task_state,
+                self.redact_artifact(self.build_report(task_state)),
+            )
 
     def begin_transaction(self):
         if self.transaction_context is not None:
@@ -205,16 +264,16 @@ class Pico:
             self.transactions_root,
             secret_boundary=self.secret_boundary,
         ).begin()
-        runner = DockerSandboxRunner(
+        runner = WorkspaceCommandRunner(
             transaction.execution_root,
             self.secret_boundary,
-            image=self.sandbox_image,
+            env_allowlist=self.shell_env_allowlist,
         )
         self.transaction_context = TransactionContext(
             transaction_id=transaction.transaction_id,
             workspace=transaction,
             secret_boundary=self.secret_boundary,
-            sandbox_lease=SandboxLease(runner),
+            execution_lease=ExecutionLease(runner),
             owns_context=True,
         )
         self.root = transaction.execution_root
@@ -234,7 +293,7 @@ class Pico:
         self.memory.workspace_root = self.source_root
         if clear_context:
             if context and context.owns_context:
-                context.sandbox_lease.stop()
+                context.execution_lease.stop()
             self.transaction_context = None
             self.session.pop("active_transaction_id", None)
         self.tools = self._apply_tool_allowlist(self.build_tools())
@@ -254,7 +313,7 @@ class Pico:
         if conflicts:
             return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
         if self.commit_policy == "auto" or not changes:
-            context.sandbox_lease.stop()
+            context.execution_lease.stop()
             transaction.commit()
             result = {"state": transaction.state, "changes": changes, "conflicts": []}
             self._restore_source_view(clear_context=True)
@@ -266,7 +325,7 @@ class Pico:
             raise RuntimeError("no active transaction")
         context = self.transaction_context
         transaction = context.workspace
-        context.sandbox_lease.stop()
+        context.execution_lease.stop()
         committed_changes = transaction.commit()
         result = {"state": transaction.state, "changes": committed_changes, "conflicts": []}
         self._restore_source_view(clear_context=True)
@@ -314,6 +373,12 @@ class Pico:
     def _ensure_session_shape(self):
         self.session.setdefault("history", [])
         self.session.setdefault("memory", memorylib.default_memory_state())
+        model_events = self.session.setdefault("model_events", [])
+        if not isinstance(model_events, list):
+            self.session["model_events"] = []
+        execution_ledger = self.session.setdefault("execution_ledger", {})
+        if not isinstance(execution_ledger, dict):
+            self.session["execution_ledger"] = {}
         checkpoints = self.session.setdefault("checkpoints", {})
         if not isinstance(checkpoints, dict):
             checkpoints = {}
@@ -455,6 +520,12 @@ class Pico:
         self.session["history"].append(self.redact_artifact(item))
         self.session_path = self.session_store.save(self.session)
 
+    def record_model_events(self, events, execution_ledger=None):
+        self.session["model_events"] = self.redact_artifact(list(events)[-24:])
+        if execution_ledger is not None:
+            self.session["execution_ledger"] = self.redact_artifact(execution_ledger)
+        self.session_path = self.session_store.save(self.session)
+
     @staticmethod
     def looks_sensitive_env_name(name):
         return securitylib.looks_sensitive_env_name(name)
@@ -542,9 +613,11 @@ class Pico:
             if not path.is_file():
                 continue
             try:
-                snapshot[path.relative_to(self.root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
-            except Exception:
-                continue
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                digest = None
+            if digest is not None:
+                snapshot[path.relative_to(self.root).as_posix()] = digest
         return snapshot
 
     @staticmethod
@@ -687,9 +760,10 @@ class Pico:
     def ask(self, user_message):
         from .agent_loop import AgentLoop
 
-        if self.transaction_context is None:
-            self.begin_transaction()
-        elif self.transaction_context.workspace.state not in {"ACTIVE", "INTERRUPTED"}:
+        if (
+            self.transaction_context is not None
+            and self.transaction_context.workspace.state not in {"ACTIVE", "INTERRUPTED"}
+        ):
             state = self.transaction_context.workspace.state
             raise RuntimeError(f"active transaction is {state}; Apply, Discard, or recover it before another task")
         return AgentLoop(self).run(user_message)
@@ -731,22 +805,13 @@ class Pico:
                 self.interrupt_transaction(result.metadata.get("tool_error_code") or "tool_failed")
         return result.content
 
-    def repeated_tool_call(self, name, args):
-        # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
-        # 这里提前挡掉最简单的这种循环。
-        tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
-        if len(tool_events) < 2:
-            return False
-        recent = tool_events[-2:]
-        return all(item["name"] == name and item["args"] == args for item in recent)
-
     @staticmethod
     def new_task_id():
-        return "task_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        return "task_" + datetime.now().astimezone().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
     @staticmethod
     def new_run_id():
-        return "run_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        return "run_" + datetime.now().astimezone().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
     def build_report(self, task_state):
         # report 是一次运行的最终摘要；
@@ -769,6 +834,19 @@ class Pico:
             "redacted_env": self.detected_secret_env_summary(),
             "transaction_id": task_state.transaction_id,
             "transaction_state": task_state.transaction_state,
+            "blocked_repeats": task_state.blocked_repeats,
+            "intervention_count": task_state.intervention_count,
+            "steps_to_first_mutation": task_state.steps_to_first_mutation,
+            "steps_to_first_shell": task_state.steps_to_first_shell,
+            "max_discovery_streak": task_state.max_discovery_streak,
+            "stuck_detected": task_state.stuck_detected,
+            "model_incomplete_count": task_state.model_incomplete_count,
+            "model_protocol_error_count": task_state.model_protocol_error_count,
+            "model_transport_failure_count": task_state.model_transport_failure_count,
+            "model_execution_policy": self.model_execution_policy.mode,
+            "execution_backend": "workspace-process",
+            "execution_isolation": "deployment-boundary",
+            "session_revision": int(self.session.get("revision", 0)),
         }
 
     def tool_example(self, name):
@@ -783,8 +861,8 @@ class Pico:
             root=self.root,
             path_resolver=self.path,
             shell_env_provider=self.shell_env,
-            sandbox_runner=(
-                self.transaction_context.sandbox_lease.runner
+            command_runner=(
+                self.transaction_context.execution_lease.runner
                 if self.transaction_context is not None
                 else None
             ),
@@ -814,6 +892,9 @@ class Pico:
             state_root=(self.workspace_state.global_root if self.workspace_state else None),
             transaction_context=self.transaction_context.borrow(),
             sandbox_image=self.sandbox_image,
+            soft_discovery_limit=self.soft_discovery_limit,
+            hard_discovery_limit=self.hard_discovery_limit,
+            model_execution_policy=self.model_execution_policy.mode,
         )
         # 委派的目标是“调查”，不是“放权执行”。
         # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
@@ -826,6 +907,9 @@ class Pico:
 
     def tool_read_file(self, args):
         return toolkit.tool_read_file(self.tool_context(), args)
+
+    def tool_read_files(self, args):
+        return toolkit.tool_read_files(self.tool_context(), args)
 
     def tool_search(self, args):
         return toolkit.tool_search(self.tool_context(), args)
@@ -872,15 +956,16 @@ class Pico:
         它位于 `model_client.complete()` 之后、`run_tool()` 之前，是模型输出
         进入平台控制流的第一道结构化关口。
         """
-        raw = str(raw)
+        raw = str(raw).strip()
         # 这里支持两种工具格式：
         # 1. <tool>...</tool> 里包 JSON，适合简短调用
         # 2. XML 风格属性/子标签，适合写文件这类多行内容
-        if "<tool>" in raw and ("<final>" not in raw or raw.find("<tool>") < raw.find("<final>")):
-            body = Pico.extract(raw, "tool")
+        json_tool = re.fullmatch(r"<tool>\s*(.*?)\s*</tool>", raw, re.DOTALL)
+        if json_tool:
+            body = json_tool.group(1)
             try:
                 payload = json.loads(body)
-            except Exception:
+            except json.JSONDecodeError:
                 return "retry", Pico.retry_notice("model returned malformed tool JSON")
             if not isinstance(payload, dict):
                 return "retry", Pico.retry_notice("tool payload must be a JSON object")
@@ -892,20 +977,20 @@ class Pico:
             elif not isinstance(args, dict):
                 return "retry", Pico.retry_notice()
             return "tool", payload
-        if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
+        if re.fullmatch(r"<tool(?:\s[^>]*)?>.*?</tool>", raw, re.DOTALL):
             payload = Pico.parse_xml_tool(raw)
             if payload is not None:
                 return "tool", payload
             return "retry", Pico.retry_notice()
-        if "<final>" in raw:
-            final = Pico.extract(raw, "final").strip()
+        final_match = re.fullmatch(r"<final>\s*(.*?)\s*</final>", raw, re.DOTALL)
+        if final_match:
+            final = final_match.group(1).strip()
             if final:
                 return "final", final
             return "retry", Pico.retry_notice("model returned an empty <final> answer")
-        raw = raw.strip()
-        if raw:
-            return "final", raw
-        return "retry", Pico.retry_notice("model returned an empty response")
+        if not raw:
+            return "retry", Pico.retry_notice("model returned an empty response")
+        return "retry", Pico.retry_notice("model returned an incomplete or untyped protocol response")
 
     @staticmethod
     def retry_notice(problem=None):
@@ -921,7 +1006,7 @@ class Pico:
 
     @staticmethod
     def parse_xml_tool(raw):
-        match = re.search(r"<tool(?P<attrs>[^>]*)>(?P<body>.*?)</tool>", raw, re.S)
+        match = re.search(r"<tool(?P<attrs>[^>]*)>(?P<body>.*?)</tool>", raw, re.DOTALL)
         if not match:
             return None
         attrs = Pico.parse_attrs(match.group("attrs"))

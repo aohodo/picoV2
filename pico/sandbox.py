@@ -55,9 +55,10 @@ class DockerSandboxRunner(SandboxRunner):
             result = subprocess.run(
                 [docker, "info", "--format", "{{.ServerVersion}}"],
                 capture_output=True, text=True, timeout=10,
+                check=False,
             )
             return result.returncode == 0 and bool(result.stdout.strip())
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             return False
 
     def start(self):
@@ -79,7 +80,7 @@ class DockerSandboxRunner(SandboxRunner):
         for name, value in self.secret_boundary.build_sandbox_env(self.env_allowlist).items():
             command.extend(["--env", f"{name}={value}"])
         command.extend([self.image, "sleep", "infinity"])
-        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
         if result.returncode != 0:
             raise SandboxUnavailable(
                 "shell_sandbox_unavailable: " + self.secret_boundary.sanitize_text(result.stderr.strip())
@@ -95,7 +96,10 @@ class DockerSandboxRunner(SandboxRunner):
         try:
             result = subprocess.run(
                 [self.executable(), "exec", "-i", self.container_name, "bash", "-s"],
-                input=(str(command) + "\n").encode("utf-8"), capture_output=True, timeout=int(timeout),
+                input=("set -o pipefail\n" + str(command) + "\n").encode("utf-8"),
+                capture_output=True,
+                timeout=int(timeout),
+                check=False,
             )
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError(f"shell command timed out after {timeout}s") from exc
@@ -108,7 +112,11 @@ class DockerSandboxRunner(SandboxRunner):
     def stop(self):
         if self.started and self.executable():
             subprocess.run(
-                [self.executable(), "rm", "-f", self.container_name], capture_output=True, text=True, timeout=20
+                [self.executable(), "rm", "-f", self.container_name],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
             )
         self.started = False
 

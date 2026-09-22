@@ -1,0 +1,26 @@
+ARG UV_VERSION=0.12.17
+
+FROM python:3.12-slim-bookworm AS python_toolchain
+ARG UV_VERSION
+RUN python -m pip install --no-cache-dir --index-url https://mirrors.aliyun.com/pypi/simple/ "uv==${UV_VERSION}"
+
+FROM maven:3.9.11-eclipse-temurin-21-noble
+COPY --from=python_toolchain /usr/local /usr/local
+RUN curl -fsSL "http://mirrors.aliyun.com/ubuntu/pool/universe/r/ripgrep/ripgrep_14.1.0-1_amd64.deb" -o /tmp/ripgrep.deb \
+    && dpkg -i /tmp/ripgrep.deb \
+    && rm /tmp/ripgrep.deb \
+    && useradd --create-home --uid 10001 --shell /bin/bash pico
+
+WORKDIR /opt/pico
+COPY pyproject.toml README.md ./
+COPY pico ./pico
+RUN python -m pip install --no-cache-dir /opt/pico \
+    && mkdir -p /home/pico/.local/state/pico /home/pico/.cache/pip /home/pico/.cache/uv /home/pico/.m2/repository \
+    && chown -R pico:pico /home/pico
+
+ENV HOME=/home/pico
+ENV MAVEN_CONFIG=/home/pico/.m2
+ENV PATH=/opt/java/openjdk/bin:/usr/share/maven/bin:/usr/local/bin:/usr/bin:/bin
+USER pico
+WORKDIR /workspace
+ENTRYPOINT ["pico", "--cwd", "/workspace"]

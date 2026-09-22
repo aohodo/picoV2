@@ -7,11 +7,19 @@ runtime 只关心一件事：给我一个 prompt，我拿回一段文本。
 
 import json
 import time
-from http.client import RemoteDisconnected
 import urllib.error
 import urllib.request
+from http.client import RemoteDisconnected
+
+from ..model_contract import ModelTurn
 
 OPENAI_COMPATIBLE_USER_AGENT = "pico/0.1"
+
+
+class ProviderResponseError(RuntimeError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = str(code)
 
 
 class FakeModelClient:
@@ -78,7 +86,15 @@ class OllamaModelClient:
 
         if data.get("error"):
             raise RuntimeError(f"Ollama error: {data['error']}")
-        return data.get("response", "")
+        if data.get("done") is not True:
+            raise ProviderResponseError(
+                "provider_incomplete",
+                "Ollama response ended without done=true",
+            )
+        text = str(data.get("response", ""))
+        if not text.strip():
+            raise ProviderResponseError("provider_empty_output", "Ollama returned an empty completed response")
+        return text
 
 
 def _normalize_versioned_base_url(base_url):
@@ -117,59 +133,9 @@ def _extract_openai_text(data):
     return ""
 
 
-def _extract_openai_text_from_sse(body_text):
-    last_response = None
-    deltas = []
-    for line in body_text.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[len("data:"):].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            event = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        event_type = event.get("type", "")
-        if event_type == "response.output_text.delta":
-            delta = event.get("delta")
-            if isinstance(delta, str):
-                deltas.append(delta)
-            continue
-        if event_type == "response.output_text.done":
-            text = event.get("text")
-            if isinstance(text, str) and text:
-                return text
-        part = event.get("part")
-        if isinstance(part, dict):
-            text = part.get("text")
-            if isinstance(text, str) and text:
-                return text
-        item = event.get("item")
-        if isinstance(item, dict):
-            text = _extract_openai_text({"output": [item]})
-            if text:
-                return text
-        response = event.get("response")
-        if isinstance(response, dict):
-            last_response = response
-            text = _extract_openai_text(response)
-            if text:
-                return text
-        text = _extract_openai_text(event)
-        if text:
-            return text
-    if deltas:
-        return "".join(deltas)
-    if isinstance(last_response, dict):
-        return _extract_openai_text(last_response)
-    return ""
-
-
 def _extract_openai_response_from_sse(body_text):
-    last_response = None
-    deltas = []
+    terminal_type = ""
+    terminal_response = None
     for line in body_text.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -179,33 +145,54 @@ def _extract_openai_response_from_sse(body_text):
             continue
         try:
             event = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        response = event.get("response")
-        if isinstance(response, dict):
-            last_response = response
-            if event.get("type") == "response.completed":
-                text = _extract_openai_text(response)
-                if text:
-                    return text, response
+        except json.JSONDecodeError as exc:
+            raise ProviderResponseError(
+                "provider_transport_incomplete",
+                "OpenAI-compatible event stream contained malformed JSON",
+            ) from exc
         event_type = event.get("type", "")
-        if event_type == "response.output_text.delta":
-            delta = event.get("delta")
-            if isinstance(delta, str):
-                deltas.append(delta)
-        elif event_type == "response.output_text.done":
-            text = event.get("text")
-            if isinstance(text, str) and text:
-                return text, last_response or {}
-        else:
-            text = _extract_openai_text(event)
-            if text:
-                return text, event
-    if deltas:
-        return "".join(deltas), last_response or {}
-    if isinstance(last_response, dict):
-        return _extract_openai_text(last_response), last_response
-    return "", {}
+        if event_type in {"response.completed", "response.incomplete", "response.failed"}:
+            response = event.get("response")
+            if not isinstance(response, dict):
+                raise ProviderResponseError(
+                    "provider_invalid_envelope",
+                    f"OpenAI-compatible {event_type} event omitted its response object",
+                )
+            terminal_type = event_type
+            terminal_response = response
+    if terminal_response is None:
+        raise ProviderResponseError(
+            "provider_transport_incomplete",
+            "OpenAI-compatible event stream ended without a terminal response event",
+        )
+    expected_status = terminal_type.removeprefix("response.")
+    actual_status = str(terminal_response.get("status", "")).strip()
+    if actual_status != expected_status:
+        raise ProviderResponseError(
+            "provider_invalid_envelope",
+            f"terminal event {terminal_type} disagrees with response status {actual_status or 'missing'}",
+        )
+    return terminal_response
+
+
+def _validate_openai_response_envelope(data):
+    if not isinstance(data, dict):
+        raise ProviderResponseError("provider_invalid_envelope", "OpenAI-compatible response is not an object")
+    status = str(data.get("status", "")).strip()
+    if status not in {"completed", "incomplete", "failed"}:
+        raise ProviderResponseError(
+            "provider_invalid_envelope",
+            f"OpenAI-compatible response has invalid status: {status or 'missing'}",
+        )
+    if status == "failed":
+        error = data.get("error") or "provider reported failed"
+        raise ProviderResponseError("provider_failed", f"OpenAI-compatible response failed: {error}")
+    return data
+
+
+def _incomplete_reason(data):
+    details = data.get("incomplete_details") or {}
+    return str(details.get("reason") or "unknown")
 
 
 def _extract_usage_cache_details(data):
@@ -226,16 +213,185 @@ def _extract_usage_cache_details(data):
 
 
 class OpenAICompatibleModelClient:
-    def __init__(self, model, base_url, api_key, temperature, timeout):
+    def __init__(
+        self, model, base_url, api_key, temperature, timeout, reasoning_effort=None
+    ):
         self.model = model
         self.base_url = _normalize_versioned_base_url(base_url)
         self.api_key = api_key
         self.temperature = temperature
         self.timeout = timeout
+        configured_effort = str(reasoning_effort or "").strip().lower()
+        self.reasoning_effort_explicit = bool(configured_effort)
+        if not configured_effort and str(model).lower().startswith("qwen3.8"):
+            configured_effort = "medium"
+        if configured_effort and configured_effort not in {
+            "none", "minimal", "low", "medium", "high", "xhigh", "max"
+        }:
+            raise ValueError("unsupported reasoning effort")
+        self.reasoning_effort = configured_effort or None
         # 当前只在明确支持 prompt cache 语义的后端上启用这条链路，
         # 避免对不支持的后端传一个“看起来统一、其实没意义”的伪参数。
         self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes"))
+        self.supports_native_tools = True
         self.last_completion_metadata = {}
+
+    def _request_responses(self, payload, prompt_cache_key=None, prompt_cache_retention=None, reasoning_effort=None):
+        self.last_completion_metadata = {}
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        requested_effort = str(reasoning_effort or "").strip().lower()
+        effective_effort = self.reasoning_effort if self.reasoning_effort_explicit else requested_effort or self.reasoning_effort
+        if effective_effort is not None:
+            payload["reasoning"] = {"effort": effective_effort}
+        if self.supports_prompt_cache and prompt_cache_key:
+            payload["prompt_cache_key"] = prompt_cache_key
+        if self.supports_prompt_cache and prompt_cache_retention:
+            payload["prompt_cache_retention"] = prompt_cache_retention
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": OPENAI_COMPATIBLE_USER_AGENT,
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(
+            self.base_url + "/responses",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        attempts = 3
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    body_text = response.read().decode("utf-8")
+                    response_headers = getattr(response, "headers", {}) or {}
+                    content_type = response_headers.get("Content-Type", "")
+                break
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code >= 500 and attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
+            except (urllib.error.URLError, RemoteDisconnected) as exc:
+                if attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(
+                    "Could not reach the OpenAI-compatible backend.\n"
+                    f"Base URL: {self.base_url}\nModel: {self.model}"
+                ) from exc
+
+        if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
+            data = _extract_openai_response_from_sse(body_text)
+        else:
+            try:
+                data = json.loads(body_text)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "OpenAI-compatible error: backend returned non-JSON content that could not be parsed"
+                ) from exc
+        if data.get("error"):
+            raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
+        data = _validate_openai_response_envelope(data)
+        self.last_completion_metadata = {
+            "prompt_cache_supported": self.supports_prompt_cache,
+            "prompt_cache_key": prompt_cache_key,
+            "prompt_cache_retention": prompt_cache_retention,
+            **_extract_usage_cache_details(data),
+            "response_status": data["status"],
+            "incomplete_reason": _incomplete_reason(data) if data["status"] == "incomplete" else "",
+            "reasoning_effort": effective_effort,
+        }
+        return data
+
+    def complete_turn(
+        self,
+        input_items,
+        tools,
+        max_new_tokens,
+        instructions=None,
+        prompt_cache_key=None,
+        prompt_cache_retention=None,
+        reasoning_effort=None,
+    ):
+        payload = {
+            "model": self.model,
+            "input": list(input_items),
+            "tools": list(tools),
+            "max_output_tokens": max_new_tokens,
+            "stream": False,
+        }
+        if tools:
+            payload["tool_choice"] = "auto"
+        if instructions:
+            payload["instructions"] = str(instructions)
+        data = self._request_responses(
+            payload,
+            prompt_cache_key,
+            prompt_cache_retention,
+            reasoning_effort=reasoning_effort,
+        )
+        output = tuple(item for item in (data.get("output") or []) if isinstance(item, dict))
+        if data["status"] == "incomplete":
+            return ModelTurn(
+                kind="incomplete",
+                response_id=str(data.get("id", "")),
+                output_items=output,
+                response_status="incomplete",
+                incomplete_reason=_incomplete_reason(data),
+            )
+        for item in output:
+            if item.get("type") != "function_call":
+                continue
+            raw_args = item.get("arguments") or "{}"
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                return ModelTurn(
+                    kind="invalid",
+                    response_id=str(data.get("id", "")),
+                    output_items=output,
+                    response_status="completed",
+                    protocol_error=f"function call arguments are invalid JSON: {exc}",
+                )
+            name = str(item.get("name", "")).strip()
+            if not name:
+                return ModelTurn(
+                    kind="invalid",
+                    response_id=str(data.get("id", "")),
+                    output_items=output,
+                    response_status="completed",
+                    protocol_error="function call omitted its name",
+                )
+            return ModelTurn(
+                kind="tool",
+                tool_name=name,
+                tool_args=args,
+                call_id=str(item.get("call_id") or item.get("id") or ""),
+                response_id=str(data.get("id", "")),
+                output_items=output,
+                response_status="completed",
+            )
+        text = _extract_openai_text(data)
+        if text:
+            return ModelTurn(
+                kind="final",
+                text=text,
+                response_id=str(data.get("id", "")),
+                output_items=output,
+                response_status="completed",
+            )
+        return ModelTurn(
+            kind="invalid",
+            response_id=str(data.get("id", "")),
+            output_items=output,
+            response_status="completed",
+            protocol_error="completed response contained no function call or final message",
+        )
 
     def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
         """向 OpenAI-compatible `/responses` 接口发起一次模型调用。
@@ -254,7 +410,6 @@ class OpenAICompatibleModelClient:
         它位于 `Pico.ask()` 的模型调用阶段，是稳定前缀缓存复用链路真正
         落到 provider API 的地方。
         """
-        self.last_completion_metadata = {}
         payload = {
             "model": self.model,
             "input": [
@@ -271,85 +426,19 @@ class OpenAICompatibleModelClient:
             "max_output_tokens": max_new_tokens,
             "stream": False,
         }
-        if self.temperature is not None:
-            payload["temperature"] = self.temperature
-        # runtime 传入的是“稳定前缀”的签名，而不是整段 prompt 的签名。
-        # 这样缓存复用针对的是稳定段，不会因为动态 history 每轮变化而失效。
-        if self.supports_prompt_cache and prompt_cache_key:
-            payload["prompt_cache_key"] = prompt_cache_key
-        if self.supports_prompt_cache and prompt_cache_retention:
-            payload["prompt_cache_retention"] = prompt_cache_retention
-
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": OPENAI_COMPATIBLE_USER_AGENT,
-        }
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        request = urllib.request.Request(
-            self.base_url + "/responses",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        attempts = 3
-        for attempt in range(attempts):
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    body_text = response.read().decode("utf-8")
-                    headers = getattr(response, "headers", {}) or {}
-                    content_type = headers.get("Content-Type", "")
-                break
-            except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")
-                if exc.code >= 500 and attempt < attempts - 1:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
-            except (urllib.error.URLError, RemoteDisconnected) as exc:
-                if attempt < attempts - 1:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                raise RuntimeError(
-                    "Could not reach the OpenAI-compatible backend.\n"
-                    f"Base URL: {self.base_url}\n"
-                    f"Model: {self.model}"
-                ) from exc
-
-        # 有些兼容后端返回普通 JSON，有些返回 SSE。
-        # 这里两种都接住，并尽量统一抽取文本和 usage/cache 元数据。
-        if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
-            text, response_data = _extract_openai_response_from_sse(body_text)
-            if isinstance(response_data, dict) and response_data:
-                # 这些元数据会一路传回 runtime，进入 trace 和 report，
-                # 用来观察 prompt cache 是否真的命中。
-                self.last_completion_metadata = {
-                    "prompt_cache_supported": self.supports_prompt_cache,
-                    "prompt_cache_key": prompt_cache_key,
-                    "prompt_cache_retention": prompt_cache_retention,
-                    **_extract_usage_cache_details(response_data),
-                }
-            if text:
-                return text
-            raise RuntimeError("OpenAI-compatible error: could not extract text from event stream response")
-
-        try:
-            data = json.loads(body_text)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "OpenAI-compatible error: backend returned non-JSON content that could not be parsed"
-            ) from exc
-        if data.get("error"):
-            raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
-        self.last_completion_metadata = {
-            "prompt_cache_supported": self.supports_prompt_cache,
-            "prompt_cache_key": prompt_cache_key,
-            "prompt_cache_retention": prompt_cache_retention,
-            **_extract_usage_cache_details(data),
-        }
-        return _extract_openai_text(data)
+        data = self._request_responses(payload, prompt_cache_key, prompt_cache_retention)
+        if data["status"] == "incomplete":
+            raise ProviderResponseError(
+                "provider_incomplete",
+                f"OpenAI-compatible response was incomplete: {_incomplete_reason(data)}",
+            )
+        text = _extract_openai_text(data)
+        if not text.strip():
+            raise ProviderResponseError(
+                "provider_empty_output",
+                "OpenAI-compatible completed response contained no final text",
+            )
+        return text
 
 
 def _extract_anthropic_text(data):
@@ -458,11 +547,21 @@ class AnthropicCompatibleModelClient:
         if data.get("error"):
             raise RuntimeError(f"Anthropic-compatible error: {data['error']}")
         self.last_completion_metadata = _extract_anthropic_metadata(data)
+        stop_reason = self.last_completion_metadata["stop_reason"] or "unknown"
+        content_types = ",".join(self.last_completion_metadata["content_block_types"]) or "none"
+        if stop_reason in {"max_tokens", "pause_turn"}:
+            raise ProviderResponseError(
+                "provider_incomplete",
+                f"Anthropic-compatible response was incomplete (stop_reason={stop_reason})",
+            )
+        if stop_reason not in {"end_turn", "stop_sequence", "tool_use"}:
+            raise ProviderResponseError(
+                "provider_invalid_envelope",
+                f"Anthropic-compatible response has invalid stop_reason={stop_reason}",
+            )
         text = _extract_anthropic_text(data)
         if text:
             return text
-        stop_reason = self.last_completion_metadata["stop_reason"] or "unknown"
-        content_types = ",".join(self.last_completion_metadata["content_block_types"]) or "none"
         raise RuntimeError(
             "Anthropic-compatible response ended before a text block "
             f"(stop_reason={stop_reason}, content_types={content_types})"

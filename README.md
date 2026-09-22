@@ -255,6 +255,25 @@ uv run pico --provider ollama --model qwen3.5:4b
 
 这些内容默认只保存在本地，不需要跟仓库一起提交。
 
+### TSW 与执行环境
+
+TSW 只负责 Shadow 工作区、冲突检查、提交、回滚和恢复，不会在每次任务或
+`run_shell` 时启动嵌套 Docker。Shell 命令直接在当前事务的 Shadow 根目录中
+执行，且只继承经过筛选的环境变量。生产部署的宿主隔离由 Pico 外层运行环境
+负责；直接在宿主机运行 `uv run pico` 属于可信本地模式，不等价于安全沙箱。
+
+如需容器隔离，只构建并启动整个 Pico Runtime：
+
+```powershell
+docker build -f docker/Dockerfile.runtime -t pico-runtime:1 .
+docker run --rm -it --env-file .env `
+  -v "${PWD}:/workspace" `
+  -v pico-state:/home/pico/.local/state/pico `
+  pico-runtime:1
+```
+
+容器启动后，同一 Pico 进程内的所有 TSW 事务复用该部署边界，不需要 Docker-in-Docker。
+
 ## 开发
 
 常用本地检查：

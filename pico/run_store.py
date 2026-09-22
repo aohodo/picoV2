@@ -8,6 +8,8 @@ import json
 import tempfile
 from pathlib import Path
 
+from .file_lock import FileLock
+
 
 def _run_id(value):
     if hasattr(value, "run_id"):
@@ -32,6 +34,31 @@ class RunStore:
 
     def report_path(self, run_id):
         return self.run_dir(run_id) / "report.json"
+
+    def lease_path(self, run_id):
+        return self.run_dir(run_id) / "owner.lock"
+
+    def acquire_run_lease(self, run_id, blocking=True):
+        lease = FileLock(self.lease_path(_run_id(run_id)))
+        return lease if lease.acquire(blocking=blocking) else None
+
+    def claim_orphaned_runs(self):
+        """Yield persisted RUNNING states that have no live process lease."""
+        for state_path in sorted(self.root.glob("*/task_state.json")):
+            try:
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict) or payload.get("status") != "running":
+                continue
+            run_id = payload.get("run_id", state_path.parent.name)
+            lease = self.acquire_run_lease(run_id, blocking=False)
+            if lease is None:
+                continue
+            try:
+                yield payload
+            finally:
+                lease.release()
 
     def start_run(self, task_state):
         # 每次 ask() 都会生成一个 run 目录。

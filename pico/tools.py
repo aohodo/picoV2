@@ -6,8 +6,8 @@
 
 from functools import partial
 
+from .execution import format_shell_result
 from .workspace import IGNORED_PATH_NAMES
-from .sandbox import format_shell_result
 
 BASE_TOOL_SPECS = {
     "list_files": {
@@ -19,6 +19,11 @@ BASE_TOOL_SPECS = {
         "schema": {"path": "str", "start": "int=1", "end": "int=200"},
         "risky": False,
         "description": "Read a UTF-8 file by line range.",
+    },
+    "read_files": {
+        "schema": {"paths": "list[str]"},
+        "risky": False,
+        "description": "Read several UTF-8 files in one bounded call.",
     },
     "search": {
         "schema": {"pattern": "str", "path": "str='.'"},
@@ -55,6 +60,7 @@ def legal_tool_names():
 TOOL_EXAMPLES = {
     "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
     "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
+    "read_files": '<tool>{"name":"read_files","args":{"paths":["README.md","pyproject.toml"]}}</tool>',
     "search": '<tool>{"name":"search","args":{"pattern":"binary_search","path":"."}}</tool>',
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
@@ -75,6 +81,44 @@ def build_tool_registry(context):
     if context.depth < context.max_depth:
         tools["delegate"] = {**DELEGATE_TOOL_SPEC, "run": partial(tool_delegate, context)}
     return tools
+
+
+def native_tool_definitions(tools):
+    """Convert Pico's allowlisted tools to Responses function definitions."""
+    definitions = []
+    for name, tool in tools.items():
+        properties = {}
+        required = []
+        for field, type_spec in tool["schema"].items():
+            spec = str(type_spec)
+            base = spec.split("=", 1)[0]
+            if base == "int":
+                schema = {"type": "integer"}
+            elif base == "list[str]":
+                schema = {"type": "array", "items": {"type": "string"}, "minItems": 1}
+            else:
+                schema = {"type": "string"}
+            if name == "run_shell" and field == "timeout":
+                schema.update({"minimum": 1, "maximum": 120})
+            elif name == "delegate" and field == "max_steps":
+                schema.update({"minimum": 1, "maximum": 12})
+            properties[field] = schema
+            if "=" not in spec:
+                required.append(field)
+        definitions.append(
+            {
+                "type": "function",
+                "name": name,
+                "description": tool["description"],
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": False,
+                },
+            }
+        )
+    return definitions
 
 
 def tool_example(name):
@@ -98,6 +142,16 @@ def validate_tool(context, name, args):
         end = int(args.get("end", 200))
         if start < 1 or end < start:
             raise ValueError("invalid line range")
+        return
+
+    if name == "read_files":
+        paths = args.get("paths")
+        if not isinstance(paths, list) or not paths or len(paths) > 12:
+            raise ValueError("paths must be a non-empty list with at most 12 items")
+        for raw_path in paths:
+            path = context.path(raw_path)
+            if not path.is_file():
+                raise ValueError(f"path is not a file: {raw_path}")
         return
 
     if name == "search":
@@ -178,6 +232,16 @@ def tool_read_file(context, args):
     return f"# {path.relative_to(context.root)}\n{body}"
 
 
+def tool_read_files(context, args):
+    paths = args.get("paths")
+    if not isinstance(paths, list) or not paths or len(paths) > 12:
+        raise ValueError("paths must be a non-empty list with at most 12 items")
+    return "\n\n".join(
+        tool_read_file(context, {"path": raw_path, "start": 1, "end": 500})
+        for raw_path in paths
+    )
+
+
 def tool_search(context, args):
     pattern = str(args.get("pattern", "")).strip()
     if not pattern:
@@ -205,9 +269,9 @@ def tool_run_shell(context, args):
     timeout = int(args.get("timeout", 20))
     if timeout < 1 or timeout > 120:
         raise ValueError("timeout must be in [1, 120]")
-    if context.sandbox_runner is None:
-        raise RuntimeError("shell_sandbox_unavailable: no sandbox is attached to this transaction")
-    return format_shell_result(context.sandbox_runner.run(command, timeout=timeout))
+    if context.command_runner is None:
+        raise RuntimeError("shell_runtime_unavailable: no execution runtime is attached to this transaction")
+    return format_shell_result(context.command_runner.run(command, timeout=timeout))
 
 
 def tool_write_file(context, args):
@@ -247,6 +311,7 @@ def tool_delegate(context, args):
 _TOOL_RUNNERS = {
     "list_files": tool_list_files,
     "read_file": tool_read_file,
+    "read_files": tool_read_files,
     "search": tool_search,
     "run_shell": tool_run_shell,
     "write_file": tool_write_file,

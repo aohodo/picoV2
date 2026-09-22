@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-
 DEFAULT_TOTAL_BUDGET = 12000
 DEFAULT_SECTION_BUDGETS = {
     "prefix": 3600,
@@ -244,7 +243,7 @@ class ContextManager:
         header = "Relevant memory:"
         note_texts = [str(note.get("text", "")) for note in selected_notes if str(note.get("text", "")).strip()]
         raw_lines = [header] + [f"- {text}" for text in note_texts]
-        raw = "\n".join(raw_lines) if note_texts else "\n".join([header, "- none"])
+        raw = "\n".join(raw_lines) if note_texts else f"{header}\n- none"
         if not note_texts:
             rendered = raw
             return SectionRender(
@@ -270,7 +269,7 @@ class ContextManager:
                 break
             per_note_budget -= 1
 
-        if len(rendered) > budget and budget > 0:
+        if len(rendered) > budget > 0:
             rendered = _tail_clip(raw, budget)
             rendered_notes = [rendered]
 
@@ -343,7 +342,7 @@ class ContextManager:
                     rendered_entries = smaller_entries
         rendered = "\n".join(["Transcript:", *rendered_entries])
 
-        if len(rendered) > budget and budget > 0:
+        if len(rendered) > budget > 0:
             rendered = _tail_clip(raw, budget)
 
         return SectionRender(
@@ -443,14 +442,12 @@ class ContextManager:
 
     def _assemble_prompt(self, rendered):
         # 顺序是刻意设计的：稳定规则放前面，最新请求放最后。
-        return "\n\n".join(
-            [
-                rendered["prefix"].rendered,
-                rendered["memory"].rendered,
-                rendered["relevant_memory"].rendered,
-                rendered["history"].rendered,
-                rendered[CURRENT_REQUEST_SECTION].rendered,
-            ]
+        return (
+            f"{rendered['prefix'].rendered}\n\n"
+            f"{rendered['memory'].rendered}\n\n"
+            f"{rendered['relevant_memory'].rendered}\n\n"
+            f"{rendered['history'].rendered}\n\n"
+            f"{rendered[CURRENT_REQUEST_SECTION].rendered}"
         ).strip()
 
     def _metadata(self, prompt, rendered, budgets, reduction_log, selected_notes, user_message, section_texts):

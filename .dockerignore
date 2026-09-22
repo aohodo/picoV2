@@ -1,3 +1,8 @@
 **
 !docker/Dockerfile.sandbox
+!docker/Dockerfile.runtime
 !docker/sandbox-lock.json
+!pyproject.toml
+!README.md
+!pico/
+!pico/**

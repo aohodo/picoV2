@@ -10,7 +10,7 @@ SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9._-]{8,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.S),
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.DOTALL),
 )
 
 
@@ -81,7 +81,7 @@ def _normalized_secret_names(secret_env_names):
 
 def looks_sensitive_env_name(name):
     upper = str(name).upper()
-    return any(upper == marker or upper.endswith(marker) or upper.endswith(f"_{marker}") for marker in SENSITIVE_ENV_NAME_MARKERS)
+    return upper.endswith(tuple(SENSITIVE_ENV_NAME_MARKERS))
 
 
 def is_secret_env_name(name, secret_env_names=None):

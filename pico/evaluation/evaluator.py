@@ -1,8 +1,10 @@
 import hashlib
 import json
 import locale as locale_module
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -10,11 +12,11 @@ from zoneinfo import ZoneInfo
 
 from ..features import memory as memorylib
 from ..providers.clients import FakeModelClient
-from ..runtime import Pico, SessionStore
 from ..run_store import RunStore
+from ..runtime import Pico, SessionStore
 from ..task_state import STOP_REASON_FINAL_ANSWER_RETURNED
 from ..tools import legal_tool_names
-from ..workspace import WorkspaceContext
+from ..workspace import WorkspaceContext, remove_workspace_tree
 
 BENCHMARK_SCHEMA_VERSION = 1
 DEFAULT_BENCHMARK_PATH = Path("benchmarks/coding_tasks.json")
@@ -115,14 +117,14 @@ def _git_value(args, fallback="", cwd=None):
             timeout=5,
         )
         return result.stdout.strip() or fallback
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return fallback
 
 
 def _current_locale():
     try:
         return locale_module.setlocale(locale_module.LC_CTYPE)
-    except Exception:
+    except locale_module.Error:
         return locale_module.getdefaultlocale()[0] or "C"
 
 
@@ -148,6 +150,27 @@ def _scripted_outputs_for_task(task):
     return list(outputs)
 
 
+def _normalize_verifier(value):
+    if isinstance(value, str):
+        argv = shlex.split(value, posix=True)
+    elif isinstance(value, list):
+        argv = [str(item) for item in value]
+    else:
+        raise TypeError("verifier must be a command string or argument list")
+    if not argv or any(not item for item in argv):
+        raise ValueError("verifier must contain at least one non-empty argument")
+    if argv[0].lower() in {"python", "python3", "py"}:
+        argv[0] = "python"
+    return argv
+
+
+def _verifier_command(argv):
+    command = list(argv)
+    if command[0] == "python":
+        command[0] = sys.executable
+    return command
+
+
 def _fixture_snapshot_id(fixture_paths):
     sha = hashlib.sha256()
     for fixture_path in sorted({Path(path).resolve() for path in fixture_paths}, key=lambda path: str(path)):
@@ -163,7 +186,7 @@ def _fixture_snapshot_id(fixture_paths):
 
 def validate_benchmark(data, repo_root=None):
     if not isinstance(data, dict):
-        raise ValueError("benchmark must be a mapping")
+        raise TypeError("benchmark must be a mapping")
 
     missing = [key for key in REQUIRED_BENCHMARK_KEYS if key not in data]
     if missing:
@@ -181,7 +204,7 @@ def validate_benchmark(data, repo_root=None):
     normalized_tasks = []
     for index, task in enumerate(tasks):
         if not isinstance(task, dict):
-            raise ValueError(f"benchmark task at index {index} must be a mapping")
+            raise TypeError(f"benchmark task at index {index} must be a mapping")
 
         missing_task_keys = [key for key in REQUIRED_TASK_KEYS if key not in task]
         if missing_task_keys:
@@ -224,7 +247,10 @@ def validate_benchmark(data, repo_root=None):
         normalized_task["allowed_tools"] = normalized_allowed_tools
         normalized_task["step_budget"] = step_budget
         normalized_task["expected_artifact"] = str(task["expected_artifact"]).strip()
-        normalized_task["verifier"] = str(task["verifier"]).strip()
+        try:
+            normalized_task["verifier"] = _normalize_verifier(task["verifier"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"benchmark task {task_id} has an invalid verifier: {exc}") from exc
         normalized_task["category"] = str(task["category"]).strip()
         normalized_tasks.append(normalized_task)
 
@@ -445,7 +471,7 @@ class BenchmarkEvaluator:
         fixture_source = self.repo_root / task["fixture_repo"]
         fixture_copy_root = self.workspace_root / task["id"] / fixture_source.name
         if fixture_copy_root.exists():
-            shutil.rmtree(fixture_copy_root)
+            remove_workspace_tree(fixture_copy_root)
         fixture_copy_root.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(fixture_source, fixture_copy_root)
 
@@ -490,11 +516,12 @@ class BenchmarkEvaluator:
         artifact_digest = _digest_file(artifact_file) if expected_artifact_exists else ""
 
         verifier = subprocess.run(
-            task["verifier"],
+            _verifier_command(task["verifier"]),
             cwd=fixture_copy_root,
-            shell=True,
+            shell=False,
             capture_output=True,
             text=True,
+            check=False,
         )
 
         within_budget = task_state.tool_steps <= int(task["step_budget"])
@@ -524,6 +551,7 @@ class BenchmarkEvaluator:
             "artifact_exists": expected_artifact_exists,
             "artifact_digest": artifact_digest,
             "verifier": task["verifier"],
+            "verifier_argv": _verifier_command(task["verifier"]),
             "verifier_exit_code": verifier.returncode,
             "verifier_stdout": verifier.stdout,
             "verifier_stderr": verifier.stderr,

@@ -10,8 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .workspace import IGNORED_PATH_NAMES
-
+from .workspace import IGNORED_PATH_NAMES, remove_workspace_tree
 
 TRANSACTION_SCHEMA_VERSION = "tsw-v1"
 TERMINAL_STATES = {"COMMITTED", "DISCARDED"}
@@ -43,13 +42,19 @@ def _safe_relative(value):
     return normalized
 
 
-def _manifest(root, excludes=()):
+def _manifest(root, excludes=(), includes=None):
     root = Path(root)
     excluded = set(excludes)
     result = {}
     if not root.exists():
         return result
-    for path in root.rglob("*"):
+    if includes is None:
+        paths = root.rglob("*")
+    else:
+        paths = (root / relative for relative in sorted(includes))
+    for path in paths:
+        if not path.exists() and not path.is_symlink():
+            continue
         relative = path.relative_to(root)
         if any(part in excluded for part in relative.parts):
             continue
@@ -67,13 +72,45 @@ def _manifest(root, excludes=()):
     return result
 
 
+def _git_view_paths(root):
+    """Return the Git working view: tracked plus non-ignored untracked files."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            cwd=root, capture_output=True, check=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"git workspace enumeration failed: {exc}") from exc
+    return {
+        Path(item).as_posix()
+        for item in result.stdout.decode("utf-8", errors="surrogateescape").split("\0")
+        if item
+    }
+
+
+def _is_git_workspace(root):
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=root, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0 or not result.stdout.strip():
+        return False
+    # A plain directory nested under somebody else's repository is not itself
+    # a Git workspace. Treating it as one makes `git ls-files` return paths
+    # relative to the parent repository and corrupts the shadow view.
+    return Path(result.stdout.strip()).resolve() == Path(root).resolve()
+
+
 def _git_user_owned(root):
     try:
         result = subprocess.run(
             ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=root, capture_output=True, check=True, timeout=10,
         )
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return set()
     owned = set()
     for record in result.stdout.decode("utf-8", errors="replace").split("\0"):
@@ -87,10 +124,25 @@ def _git_user_owned(root):
     return owned
 
 
-def _copy_view(source, destination):
+def _copy_view(source, destination, includes=None):
     source = Path(source)
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
+    if includes is not None:
+        for relative in sorted(includes):
+            entry = source / relative
+            if not entry.exists() and not entry.is_symlink():
+                continue
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if entry.is_symlink():
+                try:
+                    target.symlink_to(os.readlink(entry), target_is_directory=entry.is_dir())
+                except OSError:
+                    continue
+            elif entry.is_file():
+                shutil.copy2(entry, target)
+        return
     for entry in source.iterdir():
         if entry.name in COPY_EXCLUDES or entry.name == ".git":
             continue
@@ -112,8 +164,8 @@ def _copy_view(source, destination):
 class WorkspaceBackend:
     name = "copy"
 
-    def create(self, source_root, execution_root):
-        _copy_view(source_root, execution_root)
+    def create(self, source_root, execution_root, includes=None):
+        _copy_view(source_root, execution_root, includes=includes)
 
 
 class CopyWorkspaceBackend(WorkspaceBackend):
@@ -123,8 +175,8 @@ class CopyWorkspaceBackend(WorkspaceBackend):
 class GitShadowBackend(WorkspaceBackend):
     name = "git-shadow"
 
-    def create(self, source_root, execution_root):
-        _copy_view(source_root, execution_root)
+    def create(self, source_root, execution_root, includes=None):
+        _copy_view(source_root, execution_root, includes=includes)
 
 
 class TransactionalWorkspace:
@@ -201,20 +253,32 @@ class TransactionalWorkspace:
         if self.state != "NEW":
             raise RuntimeError(f"transaction cannot begin from {self.state}")
         self.transaction_root.mkdir(parents=True, exist_ok=False)
-        self.baseline = _manifest(self.source_root, COPY_EXCLUDES | {".git"})
-        is_git = (self.source_root / ".git").exists()
-        self.user_owned_paths = _git_user_owned(self.source_root) if is_git else set()
-        backend = GitShadowBackend() if is_git else CopyWorkspaceBackend()
-        backend.create(self.source_root, self.execution_root)
-        self.backend_name = backend.name
-        self._scrub_registered_secrets()
-        if is_git:
-            self._initialize_shadow_git()
-        self.execution_baseline = _manifest(self.execution_root, COPY_EXCLUDES | {".git"})
-        self._enforce_storage_limit()
-        self._write_json(self.baseline_path, {"source": self.baseline, "execution": self.execution_baseline})
-        self.state = "ACTIVE"
-        self._persist(created_at=_now())
+        try:
+            is_git = _is_git_workspace(self.source_root)
+            view_paths = _git_view_paths(self.source_root) if is_git else None
+            self.baseline = _manifest(
+                self.source_root, COPY_EXCLUDES | {".git"}, includes=view_paths
+            )
+            self.user_owned_paths = _git_user_owned(self.source_root) if is_git else set()
+            backend = GitShadowBackend() if is_git else CopyWorkspaceBackend()
+            backend.create(self.source_root, self.execution_root, includes=view_paths)
+            self.backend_name = backend.name
+            self._scrub_registered_secrets()
+            if is_git:
+                self._initialize_shadow_git()
+            self.execution_baseline = _manifest(self.execution_root, COPY_EXCLUDES | {".git"})
+            self._enforce_storage_limit()
+            self._write_json(
+                self.baseline_path,
+                {"source": self.baseline, "execution": self.execution_baseline},
+            )
+            self.state = "ACTIVE"
+            self._persist(created_at=_now())
+        except Exception as exc:
+            # A transaction is not observable until ACTIVE. Failed materialization
+            # must leave neither a resumable record nor a partial shadow tree.
+            shutil.rmtree(self.transaction_root, ignore_errors=True)
+            raise RuntimeError(f"transaction workspace creation failed: {exc}") from exc
         return self
 
     def _initialize_shadow_git(self):
@@ -227,7 +291,12 @@ class TransactionalWorkspace:
         )
         for command in commands:
             result = subprocess.run(
-                command, cwd=self.execution_root, capture_output=True, text=True, timeout=120
+                command,
+                cwd=self.execution_root,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
             )
             if result.returncode != 0:
                 raise RuntimeError(f"git shadow initialization failed: {result.stderr.strip()}")
@@ -297,7 +366,12 @@ class TransactionalWorkspace:
         self._persist()
         changes = self.diff()
         conflicts = []
-        current = _manifest(self.source_root, COPY_EXCLUDES | {".git"})
+        current_paths = _git_view_paths(self.source_root) if self.backend_name == "git-shadow" else None
+        current = _manifest(
+            self.source_root,
+            COPY_EXCLUDES | {".git"},
+            includes=current_paths,
+        )
         for change in changes:
             path = change["path"]
             if path in self.protected_paths:
@@ -362,7 +436,7 @@ class TransactionalWorkspace:
         self._persist(committed_at=_now(), change_count=len(changes))
         shutil.rmtree(self.recovery_root, ignore_errors=True)
         try:
-            shutil.rmtree(self.execution_root)
+            remove_workspace_tree(self.execution_root)
         except OSError as exc:
             self._persist(
                 committed_at=_now(),
@@ -420,7 +494,7 @@ class TransactionalWorkspace:
             raise RuntimeError(f"transaction cannot discard from {self.state}")
         self.state = "DISCARDED"
         self._persist(discarded_at=_now())
-        shutil.rmtree(self.execution_root, ignore_errors=True)
+        remove_workspace_tree(self.execution_root)
 
     def recovery_required(self):
         if not self.journal_path.exists():
