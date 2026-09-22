@@ -1,8 +1,9 @@
 """Structured tool execution for the agent runtime."""
 
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
 
+from .progress import is_validation_command
 from .workspace import clip
 
 
@@ -22,6 +23,8 @@ def _metadata(
     workspace_changed=False,
     workspace_fingerprint="",
     diff_summary=None,
+    executed=False,
+    validation=False,
 ):
     result = {
         "tool_status": tool_status,
@@ -32,6 +35,8 @@ def _metadata(
         "affected_paths": list(affected_paths or []),
         "workspace_changed": bool(workspace_changed),
         "diff_summary": list(diff_summary or []),
+        "executed": bool(executed),
+        "validation": bool(validation),
     }
     if workspace_fingerprint:
         result["workspace_fingerprint"] = workspace_fingerprint
@@ -42,10 +47,49 @@ class ToolExecutor:
     def __init__(self, agent):
         self.agent = agent
 
+    def _progress_args(self, name, args):
+        """Normalize deterministic reads to the evidence they can actually return."""
+        if name == "read_file":
+            path = self.agent.path(args["path"])
+            line_count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+            start = int(args.get("start", 1))
+            end = min(int(args.get("end", 200)), line_count)
+            return {"path": path.relative_to(self.agent.root).as_posix(), "start": start, "end": end}
+        if name == "read_files":
+            files = []
+            for raw_path in args.get("paths", []):
+                path = self.agent.path(raw_path)
+                line_count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+                files.append({"path": path.relative_to(self.agent.root).as_posix(), "start": 1, "end": min(500, line_count)})
+            return {"files": files}
+        if name in {"list_files", "search"}:
+            normalized = dict(args)
+            path = self.agent.path(args.get("path", "."))
+            normalized["path"] = path.relative_to(self.agent.root).as_posix() or "."
+            return normalized
+        return args
+
+    def _finalize(self, name, args, result, progress_recorded=False, progress_args=None):
+        controller = getattr(self.agent, "progress_controller", None)
+        if controller is None:
+            return result
+        if not progress_recorded:
+            evidence = controller.observe(name, progress_args or args, result.content, result.metadata)
+            result.metadata.update(
+                {
+                    "progress_evidence": evidence.kind,
+                    "observation_hash": evidence.observation_hash,
+                    "progress_reason": evidence.reason,
+                }
+            )
+        result.metadata.update(controller.metrics())
+        return result
+
     def execute(self, name, args):
         agent = self.agent
+        args = agent.redact_artifact(args or {})
         if agent.allowed_tools is not None and name not in agent.allowed_tools:
-            return ToolExecutionResult(
+            return self._finalize(name, args, ToolExecutionResult(
                 content=f"error: tool '{name}' is not allowed in this run",
                 metadata=_metadata(
                     "rejected",
@@ -53,11 +97,11 @@ class ToolExecutor:
                     risk_level="high",
                     read_only=False,
                 ),
-            )
+            ))
 
         tool = agent.tools.get(name)
         if tool is None:
-            return ToolExecutionResult(
+            return self._finalize(name, args, ToolExecutionResult(
                 content=f"error: unknown tool '{name}'",
                 metadata=_metadata(
                     "rejected",
@@ -65,17 +109,34 @@ class ToolExecutor:
                     risk_level="high",
                     read_only=False,
                 ),
-            )
+            ))
+
+        controller = getattr(agent, "progress_controller", None)
+        if controller is not None and not controller.preflight_known_error(name, args):
+            return self._finalize(name, args, ToolExecutionResult(
+                content=(
+                    f"error: repeated_invalid_call for {name}; this exact action already failed "
+                    "validation. Correct the arguments instead of retrying it."
+                ),
+                metadata=_metadata(
+                    "rejected",
+                    tool_error_code="repeated_invalid_call",
+                    risk_level="high" if tool["risky"] else "low",
+                    read_only=not tool["risky"],
+                ),
+            ), progress_recorded=True)
 
         try:
             agent.validate_tool(name, args)
-        except Exception as exc:
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            if controller is not None:
+                controller.record_rejected_action(name, args)
             example = agent.tool_example(name)
             message = f"error: invalid arguments for {name}: {exc}"
             if example:
                 message += f"\nexample: {example}"
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
-            return ToolExecutionResult(
+            return self._finalize(name, args, ToolExecutionResult(
                 content=message,
                 metadata=_metadata(
                     "rejected",
@@ -84,21 +145,36 @@ class ToolExecutor:
                     risk_level="high" if tool["risky"] else "low",
                     read_only=not tool["risky"],
                 ),
-            )
+            ))
 
-        if agent.repeated_tool_call(name, args):
-            return ToolExecutionResult(
-                content=f"error: repeated identical tool call for {name}; choose a different tool or return a final answer",
-                metadata=_metadata(
-                    "rejected",
-                    tool_error_code="repeated_identical_call",
-                    risk_level="high" if tool["risky"] else "low",
-                    read_only=not tool["risky"],
-                ),
+        progress_args = self._progress_args(name, args)
+        preflight = controller.preflight(name, progress_args) if controller is not None else {"allowed": True}
+        if not preflight["allowed"]:
+            evidence = preflight["evidence"]
+            metadata = _metadata(
+                "rejected",
+                tool_error_code="repeated_no_progress",
+                risk_level="high" if tool["risky"] else "low",
+                read_only=not tool["risky"],
             )
+            metadata.update(
+                {
+                    "progress_evidence": evidence.kind,
+                    "observation_hash": evidence.observation_hash,
+                    "progress_reason": evidence.reason,
+                }
+            )
+            return self._finalize(name, args, ToolExecutionResult(
+                content=(
+                    f"error: repeated_no_progress for {name}; this exact read-only call already "
+                    "succeeded and the workspace has not changed. Reuse the previous result or "
+                    "choose a materially different action."
+                ),
+                metadata=metadata,
+            ), progress_recorded=True, progress_args=progress_args)
 
         if tool["risky"] and not agent.approve(name, args):
-            return ToolExecutionResult(
+            return self._finalize(name, args, ToolExecutionResult(
                 content=f"error: approval denied for {name}",
                 metadata=_metadata(
                     "rejected",
@@ -107,12 +183,14 @@ class ToolExecutor:
                     risk_level="high",
                     read_only=False,
                 ),
-            )
+            ))
 
         before_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
-            content = clip(tool["run"](args))
+            content = agent.redact_text(clip(tool["run"](args)))
+            if agent.transaction_context is not None:
+                agent.transaction_context.workspace.enforce_storage_limit()
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
@@ -137,17 +215,23 @@ class ToolExecutor:
                 workspace_changed=workspace_changed,
                 workspace_fingerprint=agent.workspace.fingerprint(),
                 diff_summary=diff_summary,
+                executed=True,
+                validation=(name == "run_shell" and is_validation_command(args.get("command", ""))),
             )
             agent.record_process_note_for_tool(name, metadata)
-            return ToolExecutionResult(content=content, metadata=metadata)
-        except Exception as exc:
+            if name == "run_shell" and metadata["validation"]:
+                agent.last_shell_validation_succeeded = tool_status == "ok"
+            return self._finalize(name, args, ToolExecutionResult(content=content, metadata=metadata), progress_args=progress_args)
+        except Exception as exc:  # noqa: BLE001 - arbitrary tool implementations terminate at this boundary
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
+            explicit_error_code = str(getattr(exc, "code", "") or "")
+            error_code = explicit_error_code or ("tool_partial_success" if workspace_changed else "tool_failed")
             metadata = _metadata(
                 "partial_success" if workspace_changed else "error",
-                tool_error_code="tool_partial_success" if workspace_changed else "tool_failed",
+                tool_error_code=error_code,
                 security_event_type=security_event_type,
                 risk_level="high" if tool["risky"] else "low",
                 read_only=not tool["risky"],
@@ -155,6 +239,18 @@ class ToolExecutor:
                 workspace_changed=workspace_changed,
                 workspace_fingerprint=agent.workspace.fingerprint(),
                 diff_summary=diff_summary,
+                executed=True,
+                validation=(name == "run_shell" and is_validation_command(args.get("command", ""))),
             )
             agent.record_process_note_for_tool(name, metadata)
-            return ToolExecutionResult(content=f"error: tool {name} failed: {exc}", metadata=metadata)
+            if name == "run_shell" and metadata["validation"]:
+                agent.last_shell_validation_succeeded = False
+            return self._finalize(
+                name,
+                args,
+                ToolExecutionResult(
+                    content=agent.redact_text(f"error: tool {name} failed: {exc}"),
+                    metadata=metadata,
+                ),
+                progress_args=progress_args,
+            )

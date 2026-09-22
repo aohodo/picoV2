@@ -4,7 +4,6 @@ import os
 import re
 from pathlib import Path
 
-
 ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 

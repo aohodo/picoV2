@@ -1,14 +1,18 @@
 import json
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ..config import load_project_env, provider_env
-from .evaluator import run_fixed_benchmark
-from ..providers.clients import AnthropicCompatibleModelClient, FakeModelClient, OpenAICompatibleModelClient
+from ..providers.clients import (
+    AnthropicCompatibleModelClient,
+    FakeModelClient,
+    OpenAICompatibleModelClient,
+)
 from ..runtime import Pico, SessionStore
 from ..workspace import WorkspaceContext
+from .evaluator import run_fixed_benchmark
 
 METRICS_SCHEMA_VERSION = 2
 DEFAULT_HARNESS_REGRESSION_V2_PATH = Path("artifacts/harness-regression-v2.json")
@@ -36,7 +40,7 @@ def _parse_iso8601(value):
         return None
     try:
         return datetime.fromisoformat(str(value))
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
@@ -313,8 +317,8 @@ def run_memory_dependency_experiment(repetitions=3):
         "memory_irrelevant": [],
     }
     for _ in range(int(repetitions)):
-        for variant in variants:
-            variants[variant].append(_run_memory_variant(variant))
+        for variant, rows in variants.items():
+            rows.append(_run_memory_variant(variant))
 
     results = {}
     for variant, rows in variants.items():
@@ -409,11 +413,11 @@ def run_large_scale_memory_experiment(repetitions=5):
     }
     for task in MEMORY_EXPERIMENT_TASKS:
         for _ in range(repetitions):
-            for variant in variants:
+            for variant, rows in variants.items():
                 row = _run_memory_task_variant(task, variant)
                 row["task_id"] = task["id"]
                 row["category"] = task["category"]
-                variants[variant].append(row)
+                rows.append(row)
     category_counts = {}
     for task in MEMORY_EXPERIMENT_TASKS:
         category_counts[task["category"]] = category_counts.get(task["category"], 0) + 1
@@ -794,7 +798,7 @@ def run_provider_experiments(benchmark_path, workspace_root, artifact_root, max_
             result["provider"] = provider_name
             result["model"] = profile["model"]
             providers.append(result)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - provider adapters are an experiment isolation boundary
             providers.append(
                 {
                     "provider": provider_name,
@@ -857,7 +861,7 @@ def run_real_memory_experiment(provider="gpt", repetitions=1):
     for task in MEMORY_EXPERIMENT_TASKS:
         category_counts[task["category"]] = category_counts.get(task["category"], 0) + 1
         for _ in range(repetitions):
-            for variant in variants:
+            for variant, rows in variants.items():
                 with tempfile.TemporaryDirectory(prefix="pico-real-memory-") as temp_dir:
                     workspace_root = Path(temp_dir)
                     (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
@@ -887,7 +891,7 @@ def run_real_memory_experiment(provider="gpt", repetitions=1):
                             "Reply with the exact line only. If you are not certain, verify with tools instead of guessing."
                         )
                     answer = agent.ask(prompt)
-                    variants[variant].append(
+                    rows.append(
                         {
                             "task_id": task["id"],
                             "category": task["category"],
@@ -1100,8 +1104,8 @@ def collect_resume_metrics(
         context = run_real_context_experiment(provider=real_provider, repetitions=context_repetitions)
         security = run_real_security_experiment_suite(provider=real_provider, repetitions=security_repetitions)
         stress = {
-            "full": {"prompt_chars": int(round(context["summary"].get("avg_full_prompt_chars", 0.0)))},
-            "no_context_reduction": {"prompt_chars": int(round(context["summary"].get("avg_raw_prompt_chars", 0.0)))},
+            "full": {"prompt_chars": round(context["summary"].get("avg_full_prompt_chars", 0.0))},
+            "no_context_reduction": {"prompt_chars": round(context["summary"].get("avg_raw_prompt_chars", 0.0))},
         }
     else:
         stress = build_stress_agent_metrics()
@@ -1569,7 +1573,7 @@ def run_context_ablation_v2(artifact_path=DEFAULT_CONTEXT_ABLATION_V2_PATH, repe
     artifact = {
         "schema_version": METRICS_SCHEMA_VERSION,
         "artifact_type": "context-ablation-v2",
-        "captured_at": datetime.utcnow().isoformat() + "Z",
+        "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "config_count": payload["config_count"],
         "configs": payload["configs"],
         "summary": payload["summary"],
@@ -1582,7 +1586,7 @@ def run_memory_ablation_v2(artifact_path=DEFAULT_MEMORY_ABLATION_V2_PATH, repeti
     artifact = {
         "schema_version": METRICS_SCHEMA_VERSION,
         "artifact_type": "memory-ablation-v2",
-        "captured_at": datetime.utcnow().isoformat() + "Z",
+        "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "task_count": payload["task_count"],
         "runs_per_variant": payload["runs_per_variant"],
         "category_counts": payload["category_counts"],
@@ -1597,12 +1601,12 @@ def run_recovery_ablation_v2(artifact_path=DEFAULT_RECOVERY_ABLATION_V2_PATH, re
     variants = {"resume_enabled": [], "resume_disabled": []}
     for task in RECOVERY_ABLATION_TASKS:
         for _ in range(repetitions):
-            for variant in variants:
-                variants[variant].append(_run_recovery_task_variant(task, variant))
+            for variant, rows in variants.items():
+                rows.append(_run_recovery_task_variant(task, variant))
     artifact = {
         "schema_version": METRICS_SCHEMA_VERSION,
         "artifact_type": "recovery-ablation-v2",
-        "captured_at": datetime.utcnow().isoformat() + "Z",
+        "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "task_count": len(RECOVERY_ABLATION_TASKS),
         "variants": {
             variant: {

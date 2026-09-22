@@ -8,6 +8,8 @@ import json
 import tempfile
 from pathlib import Path
 
+from .file_lock import FileLock
+
 
 def _run_id(value):
     if hasattr(value, "run_id"):
@@ -16,8 +18,9 @@ def _run_id(value):
 
 
 class RunStore:
-    def __init__(self, root):
+    def __init__(self, root, secret_boundary=None):
         self.root = Path(root)
+        self.secret_boundary = secret_boundary
         self.root.mkdir(parents=True, exist_ok=True)
 
     def run_dir(self, run_id):
@@ -32,6 +35,31 @@ class RunStore:
     def report_path(self, run_id):
         return self.run_dir(run_id) / "report.json"
 
+    def lease_path(self, run_id):
+        return self.run_dir(run_id) / "owner.lock"
+
+    def acquire_run_lease(self, run_id, blocking=True):
+        lease = FileLock(self.lease_path(_run_id(run_id)))
+        return lease if lease.acquire(blocking=blocking) else None
+
+    def claim_orphaned_runs(self):
+        """Yield persisted RUNNING states that have no live process lease."""
+        for state_path in sorted(self.root.glob("*/task_state.json")):
+            try:
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict) or payload.get("status") != "running":
+                continue
+            run_id = payload.get("run_id", state_path.parent.name)
+            lease = self.acquire_run_lease(run_id, blocking=False)
+            if lease is None:
+                continue
+            try:
+                yield payload
+            finally:
+                lease.release()
+
     def start_run(self, task_state):
         # 每次 ask() 都会生成一个 run 目录。
         # 这样一次用户请求对应一组独立工件，后续排查更容易。
@@ -43,7 +71,10 @@ class RunStore:
     def write_task_state(self, task_state):
         path = self.task_state_path(task_state)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_json_atomic(path, task_state.to_dict())
+        payload = task_state.to_dict()
+        if self.secret_boundary:
+            payload = self.secret_boundary.sanitize_object(payload)
+        self._write_json_atomic(path, payload)
         return path
 
     def append_trace(self, task_state, event):
@@ -51,15 +82,17 @@ class RunStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         # trace 采用 jsonl 追加写入，原因是 agent 运行过程是流式事件序列，
         # 逐条落盘比“最后一次性写整份 trace”更稳，也更适合调试。
+        payload = self.secret_boundary.sanitize_object(event) if self.secret_boundary else event
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True, ensure_ascii=True))
+            handle.write(json.dumps(payload, sort_keys=True, ensure_ascii=True))
             handle.write("\n")
         return path
 
     def write_report(self, task_state, report):
         path = self.report_path(task_state)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_json_atomic(path, report)
+        payload = self.secret_boundary.sanitize_object(report) if self.secret_boundary else report
+        self._write_json_atomic(path, payload)
         return path
 
     def load_task_state(self, task_id):

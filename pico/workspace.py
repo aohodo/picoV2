@@ -4,10 +4,13 @@
 这份快照刻意保持小而稳定：主要包含 Git 事实和少量白名单项目文档。
 """
 
-import subprocess
-import textwrap
 import hashlib
 import json
+import os
+import shutil
+import stat
+import subprocess
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +20,22 @@ MAX_HISTORY = 12000
 # 我们不会预加载整个仓库，只会先给模型一小份“导航包”。
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
 IGNORED_PATH_NAMES = {".git", ".pico", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
+
+
+def remove_workspace_tree(path):
+    """Remove an owned workspace tree, including read-only Git files on Windows."""
+    path = Path(path)
+    if not path.exists():
+        return
+
+    def make_writable_and_retry(function, value, exc_info):
+        try:
+            os.chmod(value, stat.S_IWRITE)
+            function(value)
+        except OSError:
+            raise exc_info[1]
+
+    shutil.rmtree(path, onerror=make_writable_and_retry)
 
 
 def now():
@@ -66,7 +85,7 @@ class WorkspaceContext:
                     timeout=5,
                 )
                 return result.stdout.strip() or fallback
-            except Exception:
+            except (OSError, subprocess.SubprocessError):
                 return fallback
 
         repo_root = (
@@ -87,13 +106,14 @@ class WorkspaceContext:
                     continue
                 docs[key] = clip(path.read_text(encoding="utf-8", errors="replace"), 1200)
 
+        default_branch = git(
+            ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], "origin/main"
+        ) or "origin/main"
         return cls(
             cwd=str(cwd),
             repo_root=str(repo_root),
             branch=git(["branch", "--show-current"], "-") or "-",
-            default_branch=(
-                lambda branch: branch[len("origin/") :] if branch.startswith("origin/") else branch
-            )(git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], "origin/main") or "origin/main"),
+            default_branch=default_branch.removeprefix("origin/"),
             status=clip(git(["status", "--short"], "clean") or "clean", 1500),
             recent_commits=[line for line in git(["log", "--oneline", "-5"]).splitlines() if line],
             project_docs=docs,

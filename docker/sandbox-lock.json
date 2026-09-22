@@ -1,0 +1,16 @@
+{
+  "base_image": "maven:3.9.11-eclipse-temurin-21-noble",
+  "base_image_digest": "sha256:6fdc855a6ed81d288ca7ca37ac6ff5e9308b612485c0801d70b25a858c83d237",
+  "python_image": "python:3.12-slim-bookworm",
+  "python_image_digest": "sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e",
+  "image_digest": "sha256:f5d1290c5bdd1b28b148185689b5cc68914bfad007d5ae1b0b0b08c6856b72c3",
+  "image_tag": "pico-sandbox:1",
+  "jdk": "21.0.9",
+  "maven": "3.9.11",
+  "python": "3.12.14",
+  "pytest": "9.1.1",
+
+  "ripgrep": "14.1.0",
+  "status": "locked after a successful local build",
+  "uv": "0.12.17"
+}

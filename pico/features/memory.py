@@ -6,8 +6,8 @@ session history 负责保存完整事件流；这个模块只保存更小的一�
 """
 
 import hashlib
-from datetime import datetime
 import re
+from datetime import datetime
 from pathlib import Path
 
 from ..workspace import clip, now
@@ -135,7 +135,7 @@ class DurableMemoryStore:
             r"^(.+?)使用.+$",
         )
         for pattern in patterns:
-            match = re.match(pattern, text, re.I)
+            match = re.match(pattern, text, re.IGNORECASE)
             if match:
                 subject = " ".join(_tokenize(match.group(1)))
                 return subject or None
@@ -288,7 +288,7 @@ def _parse_timestamp(value):
         return 0.0
     try:
         return datetime.fromisoformat(str(value)).timestamp()
-    except Exception:
+    except (TypeError, ValueError):
         return 0.0
 
 
@@ -597,13 +597,20 @@ def is_effectively_empty(state, workspace_root=None):
 
 
 class LayeredMemory:
-    def __init__(self, state=None, workspace_root=None):
+    def __init__(self, state=None, workspace_root=None, durable_root=None):
         self.workspace_root = workspace_root
         self.state = normalize_memory_state(state, workspace_root)
-        self.durable_store = DurableMemoryStore(Path(workspace_root) / ".pico" / "memory") if workspace_root is not None else None
+        resolved_durable_root = durable_root
+        if resolved_durable_root is None and workspace_root is not None:
+            resolved_durable_root = Path(workspace_root) / ".pico" / "memory"
+        self.durable_store = DurableMemoryStore(resolved_durable_root) if resolved_durable_root is not None else None
+        if self.durable_store is not None:
+            self.state["durable_topics"] = self.durable_store.topic_slugs()
 
     def to_dict(self):
         self.state = normalize_memory_state(self.state, self.workspace_root)
+        if self.durable_store is not None:
+            self.state["durable_topics"] = self.durable_store.topic_slugs()
         return self.state
 
     def canonical_path(self, path):
@@ -642,10 +649,21 @@ class LayeredMemory:
         return invalidated
 
     def retrieval_candidates(self, query, limit=3):
-        return retrieval_candidates(self.state, query, limit=limit, workspace_root=self.workspace_root)
+        candidates = retrieval_candidates(self.state, query, limit=limit, workspace_root=self.workspace_root)
+        if self.durable_store is not None:
+            known = {item.get("text", "") for item in candidates}
+            for item in self.durable_store.retrieval_candidates(query, limit=limit):
+                if item.get("text", "") not in known:
+                    candidates.append(item)
+        return candidates[:limit]
 
     def retrieval_view(self, query, limit=3):
-        return retrieval_view(self.state, query, limit=limit, workspace_root=self.workspace_root)
+        candidates = self.retrieval_candidates(query, limit=limit)
+        lines = ["Relevant memory:"]
+        lines.extend(f"- {note['text']}" for note in candidates)
+        if not candidates:
+            lines.append("- none")
+        return "\n".join(lines)
 
     def render_memory_text(self):
         return render_memory_text(self.state, self.workspace_root)
@@ -656,4 +674,5 @@ class LayeredMemory:
         self.state = normalize_memory_state(self.state, self.workspace_root)
         promoted, superseded = self.durable_store.promote(promotions)
         self.state = normalize_memory_state(self.state, self.workspace_root)
+        self.state["durable_topics"] = self.durable_store.topic_slugs()
         return promoted, superseded

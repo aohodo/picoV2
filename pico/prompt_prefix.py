@@ -41,15 +41,16 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         risk = "approval required" if tool["risky"] else "safe"
         tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
     tool_text = "\n".join(tool_lines)
-    examples = "\n".join(
-        [
-            '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
-            '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
-            '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-            '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-            '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-            "<final>Done.</final>",
-        ]
+    examples = (
+        '<tool>{"name":"list_files","args":{"path":"."}}</tool>\n'
+        '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>\n'
+        '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n'
+        "    return -1\n</content></tool>\n"
+        '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text>'
+        "<new_text>return mid</new_text></tool>\n"
+        '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q",'
+        '"timeout":20}}</tool>\n'
+        "<final>Done.</final>"
     )
     # prefix 可以理解成 agent 的“工作手册”：
     # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
