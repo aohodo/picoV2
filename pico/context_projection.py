@@ -18,12 +18,19 @@ class ContextProjector:
             write_rule = "Mutation tools require approval and will be rejected by this run's policy."
         else:
             write_rule = "Mutation tools execute only after interactive approval and remain isolated in the Shadow workspace."
+        shell_profile = self.agent.execution_profile_view()
+        shell_rule = (
+            f"Shell commands use the {shell_profile.get('dialect', 'unavailable')} dialect. "
+            "Use `python -m pytest` for Python tests so the active Pico interpreter is reused. "
+        )
         return (
             "You are Pico, a local coding agent. Use the supplied function tools instead of inventing workspace facts. "
             "For repository changes, inspect only the files needed, make the requested change in the staged workspace, "
             "then run focused verification. Do not reread evidence already listed in Runtime state. "
             "Return a concise final answer only when the task is complete or concretely blocked. "
             + write_rule
+            + " "
+            + shell_rule
             + "\n\n"
             + self.agent.workspace.text()
         )

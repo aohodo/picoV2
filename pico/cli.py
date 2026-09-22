@@ -14,6 +14,7 @@ import textwrap
 from pathlib import Path
 
 from .config import load_project_env, provider_env
+from .progress_output import ConsoleProgressRenderer
 from .providers.clients import (
     AnthropicCompatibleModelClient,
     OllamaModelClient,
@@ -369,6 +370,11 @@ def build_arg_parser():
         help="Exploratory tool streak that triggers a forced-decision intervention.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable live runtime progress events on stderr.",
+    )
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
     return parser
@@ -414,6 +420,9 @@ def main(argv=None):
     except SessionError as exc:
         print_safe(str(exc), file=sys.stderr)
         return 2
+
+    if not args.no_progress:
+        agent.progress_sink = ConsoleProgressRenderer(max_steps=getattr(agent, "max_steps", None))
 
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
     host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", DEFAULT_OLLAMA_HOST)))

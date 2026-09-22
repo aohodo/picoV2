@@ -20,6 +20,8 @@ from .context_manager import ContextManager
 from .execution import ExecutionLease, WorkspaceCommandRunner
 from .execution_policy import ModelExecutionPolicy
 from .features import memory as memorylib
+from .memory_admission import extract_explicit_memory
+from .path_support import logical_path, native_path
 from .prompt_prefix import build_prompt_prefix, tool_signature
 from .run_store import RunStore
 from .security import REDACTED_VALUE, SecretBoundary
@@ -55,18 +57,6 @@ DEFAULT_FEATURE_FLAGS = {
     "context_reduction": True,
     "prompt_cache": True,
 }
-DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
-DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
-DURABLE_MEMORY_LINE_PATTERNS = (
-    ("project-conventions", re.compile(r"(?i)^Project convention:\s*(.+)$")),
-    ("key-decisions", re.compile(r"(?i)^Decision:\s*(.+)$")),
-    ("dependency-facts", re.compile(r"(?i)^Dependency:\s*(.+)$")),
-    ("user-preferences", re.compile(r"(?i)^Preference:\s*(.+)$")),
-    ("project-conventions", re.compile(r"^项目约定：\s*(.+)$")),
-    ("key-decisions", re.compile(r"^决策：\s*(.+)$")),
-    ("dependency-facts", re.compile(r"^依赖：\s*(.+)$")),
-    ("user-preferences", re.compile(r"^偏好：\s*(.+)$")),
-)
 SECRET_SHAPED_TEXT_PATTERN = re.compile(
     r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,}|<redacted>)"
 )
@@ -99,6 +89,7 @@ class Pico:
         soft_discovery_limit=None,
         hard_discovery_limit=None,
         model_execution_policy="adaptive",
+        progress_sink=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -111,6 +102,7 @@ class Pico:
         self.soft_discovery_limit = soft_discovery_limit
         self.hard_discovery_limit = hard_discovery_limit
         self.model_execution_policy = ModelExecutionPolicy(model_execution_policy)
+        self.progress_sink = progress_sink
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
@@ -142,8 +134,9 @@ class Pico:
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
+        fallback_state_root = Path(self.session_store.root).parent
         self.run_store = run_store or RunStore(
-            self.workspace_state.runs if self.workspace_state else Path(workspace.repo_root) / ".pico" / "runs"
+            self.workspace_state.runs if self.workspace_state else fallback_state_root / "runs"
         )
         self.run_store.secret_boundary = self.secret_boundary
         self.session = session or {
@@ -180,7 +173,7 @@ class Pico:
         self.memory = memorylib.LayeredMemory(
             self.session.setdefault("memory", memorylib.default_memory_state()),
             workspace_root=self.root,
-            durable_root=(self.workspace_state.memory if self.workspace_state else self.source_root / ".pico" / "memory"),
+            durable_root=(self.workspace_state.memory if self.workspace_state else fallback_state_root / "memory"),
         )
         self.session["memory"] = self.memory.to_dict()
         self.tools = self._apply_tool_allowlist(self.build_tools())
@@ -422,7 +415,14 @@ class Pico:
         del bucket[:-limit]
 
     def build_tools(self):
-        return toolkit.build_tool_registry(self.tool_context())
+        tools = toolkit.build_tool_registry(self.tool_context())
+        if "run_shell" in tools:
+            dialect = self.execution_profile_view().get("dialect", "unavailable")
+            tools["run_shell"]["description"] = (
+                f"Run a {dialect} command in the transaction workspace. "
+                "Use `python -m pytest` for Python validation."
+            )
+        return tools
 
     @staticmethod
     def _normalize_allowed_tools(allowed_tools):
@@ -557,6 +557,11 @@ class Pico:
             extra={"PWD": "/workspace"},
         )
 
+    def execution_profile_view(self):
+        if self.transaction_context is None:
+            return {"dialect": "unavailable", "executable": ""}
+        return self.transaction_context.execution_lease.runner.profile_view()
+
     def prompt_metadata(self, user_message, prompt):
         _, metadata = self._build_prompt_and_metadata(user_message)
         return metadata
@@ -599,6 +604,11 @@ class Pico:
         payload["created_at"] = now()
         # trace 是运行中的逐事件时间线，适合回答“这一轮 agent 到底做了什么”。
         self.run_store.append_trace(task_state, payload)
+        if self.progress_sink is not None:
+            try:
+                self.progress_sink(event, dict(payload), task_state)
+            except (OSError, UnicodeError):
+                pass
         return payload
 
     def capture_workspace_snapshot(self):
@@ -724,37 +734,30 @@ class Pico:
             return "noisy_output"
         return ""
 
-    def extract_durable_promotions(self, user_message, final_answer):
-        user_text = str(user_message or "")
-        if not (DURABLE_MEMORY_INTENT_PATTERN.search(user_text) or DURABLE_MEMORY_INTENT_ZH_PATTERN.search(user_text)):
-            return [], []
+    def extract_durable_promotions(self, user_message, final_answer=None):
+        # The model's final answer is deliberately not a memory source.  Only
+        # explicit user-authored facts can cross the durable-memory boundary.
+        del final_answer
+        admission = extract_explicit_memory(user_message)
         promotions = []
-        rejections = []
-        for line in str(final_answer or "").splitlines():
-            text = line.strip()
-            if not text:
-                continue
-            for topic, pattern in DURABLE_MEMORY_LINE_PATTERNS:
-                match = pattern.match(text)
-                if not match:
-                    continue
-                note_text = match.group(1).strip()
-                if note_text:
-                    reason = self.reject_durable_reason(note_text)
-                    if reason:
-                        rejections.append(f"{topic}:{reason}")
-                        break
-                    promotions.append((topic, note_text))
-                break
+        rejections = list(admission.rejections)
+        for candidate in admission.candidates:
+            reason = self.reject_durable_reason(candidate["text"])
+            if reason:
+                rejections.append(f"{candidate['topic']}:{reason}")
+            else:
+                promotions.append(dict(candidate))
         return promotions, rejections
 
-    def promote_durable_memory(self, user_message, final_answer):
+    def promote_durable_memory(self, user_message, final_answer=None):
         promotions, rejections = self.extract_durable_promotions(user_message, final_answer)
         promoted, superseded = self.memory.promote_durable(promotions)
         self.session["memory"] = self.memory.to_dict()
         self.last_durable_promotions = promoted
         self.last_durable_rejections = rejections
         self.last_durable_superseded = superseded
+        if promoted or rejections or superseded:
+            self.session_path = self.session_store.save(self.session)
         return promoted, rejections, superseded
 
     def ask(self, user_message):
@@ -843,6 +846,9 @@ class Pico:
             "model_incomplete_count": task_state.model_incomplete_count,
             "model_protocol_error_count": task_state.model_protocol_error_count,
             "model_transport_failure_count": task_state.model_transport_failure_count,
+            "model_duration_ms": task_state.model_duration_ms,
+            "tool_duration_ms": task_state.tool_duration_ms,
+            "provider_retry_count": task_state.provider_retry_count,
             "model_execution_policy": self.model_execution_policy.mode,
             "execution_backend": "workspace-process",
             "execution_isolation": "deployment-boundary",
@@ -895,6 +901,7 @@ class Pico:
             soft_discovery_limit=self.soft_discovery_limit,
             hard_discovery_limit=self.hard_discovery_limit,
             model_execution_policy=self.model_execution_policy.mode,
+            progress_sink=self.progress_sink,
         )
         # 委派的目标是“调查”，不是“放权执行”。
         # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
@@ -1069,14 +1076,18 @@ class Pico:
         self.memory = memorylib.LayeredMemory(
             self.session["memory"],
             workspace_root=self.root,
-            durable_root=(self.workspace_state.memory if self.workspace_state else self.source_root / ".pico" / "memory"),
+            durable_root=(
+                self.workspace_state.memory
+                if self.workspace_state
+                else Path(self.session_store.root).parent / "memory"
+            ),
         )
         self.session_store.save(self.session)
 
     def path(self, raw_path):
         path = Path(raw_path)
         path = path if path.is_absolute() else self.root / path
-        resolved = path.resolve()
+        resolved = logical_path(native_path(path).resolve())
         # 所有文件类工具都被锚定在 workspace root 之下。
         # 这样既能防住 "../" 逃逸，也能防住符号链接解析后跳出仓库。
         if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):

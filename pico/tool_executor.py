@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 
 from .progress import is_validation_command
+from .text_document import TextDecodingError, read_text_document
 from .workspace import clip
 
 
@@ -51,7 +52,10 @@ class ToolExecutor:
         """Normalize deterministic reads to the evidence they can actually return."""
         if name == "read_file":
             path = self.agent.path(args["path"])
-            line_count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+            try:
+                line_count = len(read_text_document(path).text.splitlines())
+            except (OSError, TextDecodingError):
+                line_count = 0
             start = int(args.get("start", 1))
             end = min(int(args.get("end", 200)), line_count)
             return {"path": path.relative_to(self.agent.root).as_posix(), "start": start, "end": end}
@@ -59,7 +63,10 @@ class ToolExecutor:
             files = []
             for raw_path in args.get("paths", []):
                 path = self.agent.path(raw_path)
-                line_count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+                try:
+                    line_count = len(read_text_document(path).text.splitlines())
+                except (OSError, TextDecodingError):
+                    line_count = 0
                 files.append({"path": path.relative_to(self.agent.root).as_posix(), "start": 1, "end": min(500, line_count)})
             return {"files": files}
         if name in {"list_files", "search"}:

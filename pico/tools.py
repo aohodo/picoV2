@@ -7,6 +7,8 @@
 from functools import partial
 
 from .execution import format_shell_result
+from .path_support import logical_path, native_path
+from .text_document import TextDecodingError, read_text_document, write_text_document
 from .workspace import IGNORED_PATH_NAMES
 
 BASE_TOOL_SPECS = {
@@ -18,12 +20,12 @@ BASE_TOOL_SPECS = {
     "read_file": {
         "schema": {"path": "str", "start": "int=1", "end": "int=200"},
         "risky": False,
-        "description": "Read a UTF-8 file by line range.",
+        "description": "Read a text file by line range while detecting its encoding.",
     },
     "read_files": {
         "schema": {"paths": "list[str]"},
         "risky": False,
-        "description": "Read several UTF-8 files in one bounded call.",
+        "description": "Read several text files in one bounded call.",
     },
     "search": {
         "schema": {"pattern": "str", "path": "str='.'"},
@@ -33,7 +35,7 @@ BASE_TOOL_SPECS = {
     "run_shell": {
         "schema": {"command": "str", "timeout": "int=20"},
         "risky": True,
-        "description": "Run a Bash command in the Linux Docker sandbox at /workspace.",
+        "description": "Run a command in the transaction workspace using the declared shell profile.",
     },
     "write_file": {
         "schema": {"path": "str", "content": "str"},
@@ -62,7 +64,7 @@ TOOL_EXAMPLES = {
     "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
     "read_files": '<tool>{"name":"read_files","args":{"paths":["README.md","pyproject.toml"]}}</tool>',
     "search": '<tool>{"name":"search","args":{"pattern":"binary_search","path":"."}}</tool>',
-    "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
+    "run_shell": '<tool>{"name":"run_shell","args":{"command":"python -m pytest -q","timeout":20}}</tool>',
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
     "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
@@ -130,13 +132,13 @@ def validate_tool(context, name, args):
 
     if name == "list_files":
         path = context.path(args.get("path", "."))
-        if not path.is_dir():
+        if not native_path(path).is_dir():
             raise ValueError("path is not a directory")
         return
 
     if name == "read_file":
         path = context.path(args["path"])
-        if not path.is_file():
+        if not native_path(path).is_file():
             raise ValueError("path is not a file")
         start = int(args.get("start", 1))
         end = int(args.get("end", 200))
@@ -150,7 +152,7 @@ def validate_tool(context, name, args):
             raise ValueError("paths must be a non-empty list with at most 12 items")
         for raw_path in paths:
             path = context.path(raw_path)
-            if not path.is_file():
+            if not native_path(path).is_file():
                 raise ValueError(f"path is not a file: {raw_path}")
         return
 
@@ -172,7 +174,7 @@ def validate_tool(context, name, args):
 
     if name == "write_file":
         path = context.path(args["path"])
-        if path.exists() and path.is_dir():
+        if native_path(path).exists() and native_path(path).is_dir():
             raise ValueError("path is a directory")
         if "content" not in args:
             raise ValueError("missing content")
@@ -182,14 +184,14 @@ def validate_tool(context, name, args):
         # patch_file 故意做得很严格：old_text 必须精确命中且只能出现一次，
         # 这样修改行为才是确定的，失败原因也更容易解释。
         path = context.path(args["path"])
-        if not path.is_file():
+        if not native_path(path).is_file():
             raise ValueError("path is not a file")
         old_text = str(args.get("old_text", ""))
         if not old_text:
             raise ValueError("old_text must not be empty")
         if "new_text" not in args:
             raise ValueError("missing new_text")
-        text = path.read_text(encoding="utf-8")
+        text = read_text_document(path).text
         count = text.count(old_text)
         if count != 1:
             raise ValueError(f"old_text must occur exactly once, found {count}")
@@ -206,10 +208,11 @@ def validate_tool(context, name, args):
 
 def tool_list_files(context, args):
     path = context.path(args.get("path", "."))
-    if not path.is_dir():
+    io_path = native_path(path)
+    if not io_path.is_dir():
         raise ValueError("path is not a directory")
     entries = [
-        item for item in sorted(path.iterdir(), key=lambda item: (item.is_file(), item.name.lower()))
+        logical_path(item) for item in sorted(io_path.iterdir(), key=lambda item: (item.is_file(), item.name.lower()))
         if item.name not in IGNORED_PATH_NAMES
     ]
     lines = []
@@ -221,15 +224,16 @@ def tool_list_files(context, args):
 
 def tool_read_file(context, args):
     path = context.path(args["path"])
-    if not path.is_file():
+    if not native_path(path).is_file():
         raise ValueError("path is not a file")
     start = int(args.get("start", 1))
     end = int(args.get("end", 200))
     if start < 1 or end < start:
         raise ValueError("invalid line range")
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    document = read_text_document(path)
+    lines = document.text.splitlines()
     body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
-    return f"# {path.relative_to(context.root)}\n{body}"
+    return f"# {path.relative_to(context.root)} [encoding={document.encoding}]\n{body}"
 
 
 def tool_read_files(context, args):
@@ -249,12 +253,17 @@ def tool_search(context, args):
     path = context.path(args.get("path", "."))
 
     matches = []
-    files = [path] if path.is_file() else [
-        item for item in path.rglob("*")
-        if item.is_file() and not any(part in IGNORED_PATH_NAMES for part in item.relative_to(context.root).parts)
+    search_root = native_path(path)
+    files = [path] if search_root.is_file() else [
+        logical_path(item) for item in search_root.rglob("*")
+        if item.is_file() and not any(part in IGNORED_PATH_NAMES for part in logical_path(item).relative_to(context.root).parts)
     ]
     for file_path in files:
-        for number, line in enumerate(file_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        try:
+            document = read_text_document(file_path)
+        except (OSError, TextDecodingError):
+            continue
+        for number, line in enumerate(document.text.splitlines(), start=1):
             if pattern.lower() in line.lower():
                 matches.append(f"{file_path.relative_to(context.root)}:{number}:{line}")
                 if len(matches) >= 200:
@@ -277,25 +286,26 @@ def tool_run_shell(context, args):
 def tool_write_file(context, args):
     path = context.path(args["path"])
     content = str(args["content"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    existing = read_text_document(path) if native_path(path).is_file() else None
+    write_text_document(path, content, existing)
     return f"wrote {path.relative_to(context.root)} ({len(content)} chars)"
 
 
 def tool_patch_file(context, args):
     path = context.path(args["path"])
-    if not path.is_file():
+    if not native_path(path).is_file():
         raise ValueError("path is not a file")
     old_text = str(args.get("old_text", ""))
     if not old_text:
         raise ValueError("old_text must not be empty")
     if "new_text" not in args:
         raise ValueError("missing new_text")
-    text = path.read_text(encoding="utf-8")
+    document = read_text_document(path)
+    text = document.text
     count = text.count(old_text)
     if count != 1:
         raise ValueError(f"old_text must occur exactly once, found {count}")
-    path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
+    write_text_document(path, text.replace(old_text, str(args["new_text"]), 1), document)
     return f"patched {path.relative_to(context.root)}"
 
 

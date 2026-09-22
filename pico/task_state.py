@@ -53,6 +53,9 @@ class TaskState:
     model_incomplete_count: int = 0
     model_protocol_error_count: int = 0
     model_transport_failure_count: int = 0
+    model_duration_ms: int = 0
+    tool_duration_ms: int = 0
+    provider_retry_count: int = 0
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -85,6 +88,9 @@ class TaskState:
             model_incomplete_count=int(data.get("model_incomplete_count", 0)),
             model_protocol_error_count=int(data.get("model_protocol_error_count", 0)),
             model_transport_failure_count=int(data.get("model_transport_failure_count", 0)),
+            model_duration_ms=int(data.get("model_duration_ms", 0)),
+            tool_duration_ms=int(data.get("tool_duration_ms", 0)),
+            provider_retry_count=int(data.get("provider_retry_count", 0)),
         )
 
     def record_attempt(self):
@@ -118,6 +124,15 @@ class TaskState:
 
     def record_model_transport_failure(self):
         self.model_transport_failure_count += 1
+        return self
+
+    def record_model_duration(self, duration_ms, provider_retries=0):
+        self.model_duration_ms += max(0, int(duration_ms))
+        self.provider_retry_count += max(0, int(provider_retries))
+        return self
+
+    def record_tool_duration(self, duration_ms):
+        self.tool_duration_ms += max(0, int(duration_ms))
         return self
 
     def stop(self, stop_reason, status=STATUS_STOPPED, final_answer=""):
@@ -183,4 +198,7 @@ class TaskState:
             "model_incomplete_count": self.model_incomplete_count,
             "model_protocol_error_count": self.model_protocol_error_count,
             "model_transport_failure_count": self.model_transport_failure_count,
+            "model_duration_ms": self.model_duration_ms,
+            "tool_duration_ms": self.tool_duration_ms,
+            "provider_retry_count": self.provider_retry_count,
         }

@@ -10,6 +10,7 @@ from .checkpoint import (
 )
 from .completion import CompletionAdmission
 from .context_projection import ContextProjector
+from .execution_policy import classify_request
 from .progress import ProgressController
 from .providers.clients import ProviderResponseError
 from .session_store import SessionConflictError
@@ -86,7 +87,12 @@ class AgentLoop:
                 prompt_cache_retention=prompt_cache_retention,
             )
         except ProviderResponseError as exc:
+            model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
             completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
+            task_state.record_model_duration(
+                model_duration_ms,
+                completion_metadata.get("transport_retries", getattr(exc, "attempts", 1) - 1),
+            )
             prompt_metadata.update(completion_metadata)
             agent.last_completion_metadata = completion_metadata
             agent.last_prompt_metadata = prompt_metadata
@@ -104,7 +110,7 @@ class AgentLoop:
                     {
                         "kind": "retry",
                         "provider_error_code": exc.code,
-                        "duration_ms": int((time.monotonic() - model_started_at) * 1000),
+                        "duration_ms": model_duration_ms,
                         "purpose": purpose,
                     },
                 )
@@ -112,7 +118,12 @@ class AgentLoop:
             self._persist_model_failure(task_state, user_message, exc, run_started_at, prompt_metadata)
             raise
         except Exception as exc:
+            model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
             completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
+            task_state.record_model_duration(
+                model_duration_ms,
+                completion_metadata.get("transport_retries", getattr(exc, "attempts", 1) - 1),
+            )
             if completion_metadata:
                 prompt_metadata.update(completion_metadata)
             agent.last_completion_metadata = completion_metadata
@@ -123,6 +134,8 @@ class AgentLoop:
         if completion_metadata:
             prompt_metadata.update(completion_metadata)
         agent.last_completion_metadata = completion_metadata
+        model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
+        task_state.record_model_duration(model_duration_ms, completion_metadata.get("transport_retries", 0))
         agent.last_prompt_metadata = prompt_metadata
         raw = agent.redact_text(raw)
         kind, payload = agent.parse(raw)
@@ -132,7 +145,7 @@ class AgentLoop:
             {
                 "kind": kind,
                 "completion_metadata": completion_metadata,
-                "duration_ms": int((time.monotonic() - model_started_at) * 1000),
+                "duration_ms": model_duration_ms,
                 "purpose": purpose,
             },
         )
@@ -176,7 +189,12 @@ class AgentLoop:
                 reasoning_effort=turn_policy.reasoning_effort,
             )
         except Exception as exc:
+            model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
             completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
+            task_state.record_model_duration(
+                model_duration_ms,
+                completion_metadata.get("transport_retries", getattr(exc, "attempts", 1) - 1),
+            )
             prompt_metadata.update(completion_metadata)
             agent.last_completion_metadata = completion_metadata
             agent.last_prompt_metadata = prompt_metadata
@@ -185,6 +203,8 @@ class AgentLoop:
         completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
         prompt_metadata.update(completion_metadata)
         agent.last_completion_metadata = completion_metadata
+        model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
+        task_state.record_model_duration(model_duration_ms, completion_metadata.get("transport_retries", 0))
         agent.last_prompt_metadata = prompt_metadata
         agent.emit_trace(
             task_state,
@@ -192,7 +212,7 @@ class AgentLoop:
             {
                 "kind": turn.kind,
                 "completion_metadata": completion_metadata,
-                "duration_ms": int((time.monotonic() - model_started_at) * 1000),
+                "duration_ms": model_duration_ms,
                 "purpose": purpose,
                 "native_tools": True,
                 "response_status": turn.response_status,
@@ -213,7 +233,6 @@ class AgentLoop:
             task_state.stop("ready_for_review", final_answer=final)
         else:
             task_state.stop("workspace_conflict", final_answer=final)
-        agent.promote_durable_memory(user_message, final)
         checkpoint = agent.create_checkpoint(task_state, user_message, trigger="run_finished")
         agent.run_store.write_task_state(task_state)
         agent.emit_trace(
@@ -374,6 +393,17 @@ class AgentLoop:
                 "user_request": clip(user_message, 300),
             },
         )
+        promoted, rejected, superseded = agent.promote_durable_memory(user_message)
+        if promoted or rejected or superseded:
+            agent.emit_trace(
+                task_state,
+                "durable_memory_admitted",
+                {
+                    "promoted": promoted,
+                    "rejected": rejected,
+                    "superseded": superseded,
+                },
+            )
 
         attempts = 0
         budget_final = None
@@ -381,6 +411,8 @@ class AgentLoop:
         contract_failure_final = None
         contract_failures = 0
         model_notice = ""
+        request_profile = classify_request(user_message)
+        prompt_metadata_base = {"request_profile": request_profile}
         max_attempts = max(agent.max_steps * 3, agent.max_steps + 4)
 
         # 这是 agent 的主循环，可以按“感知 -> 决策 -> 行动 -> 记录”来理解：
@@ -419,6 +451,7 @@ class AgentLoop:
                         **controller.metrics(),
                     },
                 )
+            prompt_metadata.update(prompt_metadata_base)
             agent.emit_trace(
                 task_state,
                 "prompt_built",
@@ -473,6 +506,7 @@ class AgentLoop:
                 max_output_tokens=agent.max_new_tokens,
                 read_only=agent.read_only,
                 recovering=contract_failures > 0,
+                request_profile=request_profile,
             )
             if native_mode:
                 native_turn = self._request_native_model(
@@ -482,7 +516,14 @@ class AgentLoop:
                     prompt_metadata,
                     run_started_at,
                     purpose="action",
-                    tools=native_tool_definitions(agent.tools),
+                    tools=native_tool_definitions(
+                        {
+                            name: tool
+                            for name, tool in agent.tools.items()
+                            if request_profile != "simple_read_only"
+                            or name in {"list_files", "read_file", "read_files", "search"}
+                        }
+                    ),
                     turn_policy=turn_policy,
                 )
                 raw = agent.redact_text(native_turn.text)
@@ -529,6 +570,8 @@ class AgentLoop:
                 tool_started_at = time.monotonic()
                 tool_result = agent.execute_tool(name, args)
                 result = tool_result.content
+                tool_duration_ms = int((time.monotonic() - tool_started_at) * 1000)
+                task_state.record_tool_duration(tool_duration_ms)
                 if native_turn is not None:
                     model_events.append(
                         {"type": "function_call_output", "call_id": call_id, "output": result}
@@ -558,7 +601,7 @@ class AgentLoop:
                         "name": name,
                         "args": args,
                         "result": clip(result, 500),
-                        "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
+                        "duration_ms": tool_duration_ms,
                         **tool_metadata,
                     },
                 )
@@ -673,6 +716,7 @@ class AgentLoop:
                     max_output_tokens=agent.max_new_tokens,
                     read_only=agent.read_only,
                     recovering=False,
+                    request_profile=request_profile,
                 )
                 native_turn = self._request_native_model(
                     task_state,
@@ -723,7 +767,6 @@ class AgentLoop:
         if agent.transaction_context is not None:
             task_state.transaction_state = agent.transaction_context.workspace.state
         agent.record({"role": "assistant", "content": final, "created_at": now()})
-        agent.promote_durable_memory(user_message, final)
         agent.run_store.write_task_state(task_state)
         checkpoint = agent.create_checkpoint(task_state, user_message, trigger=task_state.stop_reason or "run_stopped")
         agent.emit_trace(

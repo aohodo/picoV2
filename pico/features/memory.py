@@ -6,6 +6,7 @@ session history 负责保存完整事件流；这个模块只保存更小的一�
 """
 
 import hashlib
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -61,6 +62,7 @@ class DurableMemoryStore:
         self.root = Path(root)
         self.index_path = self.root / "MEMORY.md"
         self.topics_dir = self.root / "topics"
+        self.records_path = self.root / "records.json"
 
     def topic_slugs(self):
         return [topic["topic"] for topic in self.load_index()]
@@ -94,7 +96,7 @@ class DurableMemoryStore:
                 current["tags"] = [tag.strip() for tag in tags_match.group(1).split(",") if tag.strip()]
         return topics
 
-    def load_topic_notes(self, topic):
+    def _load_legacy_topic_notes(self, topic):
         path = self.topics_dir / f"{topic}.md"
         if not path.exists():
             return []
@@ -123,6 +125,51 @@ class DurableMemoryStore:
                 )
         return notes
 
+    def load_records(self):
+        if self.records_path.exists():
+            try:
+                data = json.loads(self.records_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return []
+            return [dict(item) for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+        records = []
+        for topic in self.load_index():
+            slug = topic["topic"]
+            for note in self._load_legacy_topic_notes(slug):
+                text = note["text"]
+                created_at = note.get("created_at") or now()
+                records.append(
+                    {
+                        "id": hashlib.sha256(f"{slug}:{created_at}:{text}".encode()).hexdigest()[:16],
+                        "topic": slug,
+                        "subject": self._subject_key(text) or " ".join(sorted(_tokenize(text))[:8]),
+                        "text": text,
+                        "source": slug,
+                        "created_at": created_at,
+                        "status": "active",
+                        "supersedes": [],
+                    }
+                )
+        return records
+
+    def load_topic_notes(self, topic):
+        if not self.records_path.exists():
+            return self._load_legacy_topic_notes(topic)
+        meta = DURABLE_TOPIC_DEFAULTS.get(topic, {})
+        return [
+            {
+                "text": record.get("text", ""),
+                "tags": list(meta.get("tags", [])),
+                "source": record.get("source", topic),
+                "created_at": record.get("created_at", now()),
+                "kind": "durable",
+                "status": record.get("status", "active"),
+            }
+            for record in self.load_records()
+            if record.get("topic") == topic and record.get("status", "active") in {"active", "ambiguous"}
+        ]
+
     @staticmethod
     def _subject_key(text):
         text = str(text).strip()
@@ -131,8 +178,13 @@ class DurableMemoryStore:
             r"^(.+?)\s+are\s+.+$",
             r"^(.+?)\s+uses?\s+.+$",
             r"^(.+?)\s+should\s+.+$",
+            r"^(.+?)\s+must\s+.+$",
+            r"^(.+?)\s+prefers?\s+.+$",
             r"^(.+?)是.+$",
             r"^(.+?)使用.+$",
+            r"^(.+?)采用.+$",
+            r"^(.+?)应该.+$",
+            r"^(.+?)必须.+$",
         )
         for pattern in patterns:
             match = re.match(pattern, text, re.IGNORECASE)
@@ -144,8 +196,19 @@ class DurableMemoryStore:
     def retrieval_candidates(self, query, limit=3):
         query_tokens = _tokenize(query)
         ranked = []
-        for topic in self.load_index():
-            notes = self.load_topic_notes(topic["topic"])
+        topics = {topic["topic"]: topic for topic in self.load_index()}
+        for record in self.load_records():
+            if record.get("status", "active") not in {"active", "ambiguous"}:
+                continue
+            topic = topics.get(record.get("topic"), {})
+            notes = [{
+                "text": record.get("text", ""),
+                "tags": list(DURABLE_TOPIC_DEFAULTS.get(record.get("topic"), {}).get("tags", [])),
+                "source": record.get("source", record.get("topic", "")),
+                "created_at": record.get("created_at", ""),
+                "kind": "durable",
+                "status": record.get("status", "active"),
+            }]
             for note in notes:
                 note_tags = {tag.lower() for tag in note.get("tags", [])}
                 note_tokens = _tokenize(note.get("text", "")) | _tokenize(topic.get("title", "")) | note_tags
@@ -185,14 +248,30 @@ class DurableMemoryStore:
             lines.append(f"- {note}")
         (self.topics_dir / f"{topic}.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
+    def _write_records(self, records):
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.records_path.write_text(
+            json.dumps(records, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
     def promote(self, promotions):
         if not promotions:
             return [], []
         topics = {topic["topic"]: topic for topic in self.load_index()}
-        topic_notes = {slug: [note["text"] for note in self.load_topic_notes(slug)] for slug in topics}
+        records = self.load_records()
         results = []
         superseded = []
-        for topic, note_text in promotions:
+        for promotion in promotions:
+            if isinstance(promotion, dict):
+                topic = str(promotion["topic"])
+                note_text = str(promotion["text"])
+                subject = str(promotion.get("subject") or self._subject_key(note_text) or " ".join(sorted(_tokenize(note_text))[:8]))
+                source = str(promotion.get("source") or "user_explicit")
+            else:
+                topic, note_text = promotion
+                subject = self._subject_key(note_text) or " ".join(sorted(_tokenize(note_text))[:8])
+                source = "user_explicit"
             meta = DURABLE_TOPIC_DEFAULTS[topic]
             topics.setdefault(
                 topic,
@@ -203,23 +282,43 @@ class DurableMemoryStore:
                     "tags": list(meta["tags"]),
                 },
             )
-            existing = topic_notes.setdefault(topic, [])
-            if note_text in existing:
+            active = [
+                record for record in records
+                if record.get("topic") == topic and record.get("status", "active") == "active"
+            ]
+            if any(record.get("text") == note_text for record in active):
                 continue
-            new_subject = self._subject_key(note_text)
-            replaced = False
-            if new_subject:
-                for index, old_text in enumerate(list(existing)):
-                    if self._subject_key(old_text) == new_subject:
-                        superseded.append(f"{topic}: {old_text} -> {note_text}")
-                        existing[index] = note_text
-                        replaced = True
-                        break
-            if not replaced:
-                existing.append(note_text)
+            replaced_ids = []
+            for old_record in active:
+                if subject and old_record.get("subject") == subject:
+                    old_record["status"] = "superseded"
+                    old_record["superseded_at"] = now()
+                    replaced_ids.append(old_record.get("id", ""))
+                    superseded.append(f"{topic}: {old_record.get('text', '')} -> {note_text}")
+            created_at = now()
+            record_id = hashlib.sha256(
+                f"{topic}:{subject}:{created_at}:{note_text}".encode()
+            ).hexdigest()[:16]
+            records.append(
+                {
+                    "id": record_id,
+                    "topic": topic,
+                    "subject": subject,
+                    "text": note_text,
+                    "source": source,
+                    "created_at": created_at,
+                    "status": "active",
+                    "supersedes": [item for item in replaced_ids if item],
+                }
+            )
             results.append(f"{topic}: {note_text}")
         self._write_index([topics[slug] for slug in sorted(topics)])
-        for topic, notes in topic_notes.items():
+        self._write_records(records)
+        for topic in topics:
+            notes = [
+                record.get("text", "") for record in records
+                if record.get("topic") == topic and record.get("status", "active") in {"active", "ambiguous"}
+            ]
             self._write_topic(topic, notes)
         return results, superseded
 

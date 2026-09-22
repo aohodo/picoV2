@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .path_support import native_path
 from .workspace import IGNORED_PATH_NAMES, remove_workspace_tree
 
 TRANSACTION_SCHEMA_VERSION = "tsw-v1"
@@ -26,7 +27,7 @@ def _now():
 
 def _hash_file(path):
     digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
+    with native_path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -43,7 +44,7 @@ def _safe_relative(value):
 
 
 def _manifest(root, excludes=(), includes=None):
-    root = Path(root)
+    root = native_path(root)
     excluded = set(excludes)
     result = {}
     if not root.exists():
@@ -76,7 +77,7 @@ def _git_view_paths(root):
     """Return the Git working view: tracked plus non-ignored untracked files."""
     try:
         result = subprocess.run(
-            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            ["git", "-c", "core.longpaths=true", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
             cwd=root, capture_output=True, check=True, timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -107,7 +108,7 @@ def _is_git_workspace(root):
 def _git_user_owned(root):
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            ["git", "-c", "core.longpaths=true", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=root, capture_output=True, check=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
@@ -125,8 +126,8 @@ def _git_user_owned(root):
 
 
 def _copy_view(source, destination, includes=None):
-    source = Path(source)
-    destination = Path(destination)
+    source = native_path(source)
+    destination = native_path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     if includes is not None:
         for relative in sorted(includes):
@@ -284,6 +285,7 @@ class TransactionalWorkspace:
     def _initialize_shadow_git(self):
         commands = (
             ["git", "init"],
+            ["git", "config", "core.longpaths", "true"],
             ["git", "config", "user.email", "pico@localhost.invalid"],
             ["git", "config", "user.name", "Pico Shadow"],
             ["git", "add", "--all"],
@@ -304,7 +306,8 @@ class TransactionalWorkspace:
     def _scrub_registered_secrets(self):
         if not self.secret_boundary or not self.secret_boundary.registered_values:
             return
-        for path in self.execution_root.rglob("*"):
+        execution_root = native_path(self.execution_root)
+        for path in execution_root.rglob("*"):
             if not path.is_file() or path.is_symlink() or ".git" in path.parts:
                 continue
             try:
@@ -315,11 +318,11 @@ class TransactionalWorkspace:
             sanitized = self.secret_boundary.sanitize_text(text)
             if sanitized != text:
                 path.write_text(sanitized, encoding="utf-8")
-                self.protected_paths.add(path.relative_to(self.execution_root).as_posix())
+                self.protected_paths.add(path.relative_to(execution_root).as_posix())
 
     def _enforce_storage_limit(self):
         size = 0
-        for path in self.execution_root.rglob("*"):
+        for path in native_path(self.execution_root).rglob("*"):
             if path.is_file() and not path.is_symlink():
                 size += path.stat().st_size
                 if size > self.storage_limit_bytes:
@@ -416,7 +419,7 @@ class TransactionalWorkspace:
             "created_at": _now(),
         }
         self._write_json(self.journal_path, journal)
-        self.recovery_root.mkdir(parents=True, exist_ok=True)
+        native_path(self.recovery_root).mkdir(parents=True, exist_ok=True)
         try:
             for change in changes:
                 self._apply_change(change)
@@ -448,9 +451,9 @@ class TransactionalWorkspace:
 
     def _apply_change(self, change):
         relative = _safe_relative(change["path"])
-        source = self.source_root / relative
-        staged = self.execution_root / relative
-        recovery = self.recovery_root / relative
+        source = native_path(self.source_root / relative)
+        staged = native_path(self.execution_root / relative)
+        recovery = native_path(self.recovery_root / relative)
         if source.exists() or source.is_symlink():
             recovery.parent.mkdir(parents=True, exist_ok=True)
             if source.is_symlink():
@@ -477,8 +480,8 @@ class TransactionalWorkspace:
         for change in reversed(changes):
             if change["path"] not in completed:
                 continue
-            target = self.source_root / change["path"]
-            recovery = self.recovery_root / change["path"]
+            target = native_path(self.source_root / change["path"])
+            recovery = native_path(self.recovery_root / change["path"])
             try:
                 if change["before"] is None:
                     if target.exists() or target.is_symlink():

@@ -9,11 +9,22 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 
 class ExecutionRuntimeUnavailable(RuntimeError):
     code = "shell_runtime_unavailable"
+
+
+@dataclass(frozen=True)
+class ExecutionProfile:
+    argv_prefix: tuple
+    dialect: str
+    executable: str
+
+    def view(self):
+        return {"dialect": self.dialect, "executable": self.executable}
 
 
 class WorkspaceCommandRunner:
@@ -27,6 +38,13 @@ class WorkspaceCommandRunner:
         self.secret_boundary = secret_boundary
         self.env_allowlist = tuple(env_allowlist)
         self.started = False
+        self._profile = None
+        self._profile_error = ""
+        try:
+            prefix, dialect = self.shell()
+            self._profile = ExecutionProfile(tuple(prefix), dialect, str(prefix[0]))
+        except ExecutionRuntimeUnavailable as exc:
+            self._profile_error = str(exc)
 
     @staticmethod
     def _windows_shell():
@@ -65,9 +83,27 @@ class WorkspaceCommandRunner:
         self.started = True
         return self
 
+    def profile_view(self):
+        if self._profile is None:
+            return {"dialect": "unavailable", "executable": "", "error": self._profile_error}
+        return self._profile.view()
+
+    @staticmethod
+    def _prepend_runtime_path(env):
+        runtime_dir = str(Path(sys.executable).resolve().parent)
+        current = str(env.get("PATH", ""))
+        entries = [item for item in current.split(os.pathsep) if item]
+        if runtime_dir not in entries:
+            entries.insert(0, runtime_dir)
+        env["PATH"] = os.pathsep.join(entries)
+        return env
+
     def run(self, command, timeout=20):
         self.start()
-        prefix, shell_kind = self.shell()
+        if self._profile is None:
+            raise ExecutionRuntimeUnavailable(self._profile_error or "shell_runtime_unavailable")
+        prefix = list(self._profile.argv_prefix)
+        shell_kind = self._profile.dialect
         command = str(command)
         if shell_kind == "bash":
             host_python = str(Path(sys.executable).resolve())
@@ -75,8 +111,13 @@ class WorkspaceCommandRunner:
             command = "set -o pipefail\n" + command
         env = self.secret_boundary.build_sandbox_env(
             self.env_allowlist,
-            extra={"PWD": str(self.execution_root)},
+            extra={
+                "PWD": str(self.execution_root),
+                "PICO_AGENT": "1",
+                "PICO_SHELL_DIALECT": shell_kind,
+            },
         )
+        env = self._prepend_runtime_path(env)
         try:
             result = subprocess.run(
                 [*prefix, command],
@@ -92,6 +133,7 @@ class WorkspaceCommandRunner:
             "exit_code": result.returncode,
             "stdout": self.secret_boundary.sanitize_text(result.stdout.decode("utf-8", errors="replace")),
             "stderr": self.secret_boundary.sanitize_text(result.stderr.decode("utf-8", errors="replace")),
+            "shell_profile": self.profile_view(),
         }
 
     def stop(self):
@@ -112,8 +154,10 @@ class ExecutionLease:
 
 
 def format_shell_result(result):
+    profile = result.get("shell_profile") or {}
     return (
         f"exit_code: {result['exit_code']}\n"
+        f"shell: {profile.get('dialect', 'unknown')}\n"
         f"stdout:\n{result['stdout'].strip() or '(empty)'}\n"
         f"stderr:\n{result['stderr'].strip() or '(empty)'}"
     )

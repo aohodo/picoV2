@@ -17,9 +17,38 @@ OPENAI_COMPATIBLE_USER_AGENT = "pico/0.1"
 
 
 class ProviderResponseError(RuntimeError):
-    def __init__(self, code, message):
+    def __init__(self, code, message, retryable=False, attempts=1):
         super().__init__(message)
         self.code = str(code)
+        self.retryable = bool(retryable)
+        self.attempts = int(attempts)
+
+
+def _transport_error(exc, backend, attempts=1):
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, TimeoutError):
+        return ProviderResponseError(
+            "provider_timeout",
+            f"{backend} request timed out",
+            retryable=True,
+            attempts=attempts,
+        )
+    return ProviderResponseError(
+        "provider_connection_error",
+        f"Could not reach the {backend} backend",
+        retryable=True,
+        attempts=attempts,
+    )
+
+
+def _retryable_http_status(status):
+    return int(status) in {408, 409, 429} or int(status) >= 500
+
+
+def _backoff(attempt):
+    # Bounded exponential backoff.  Delays remain small because the provider
+    # timeout is already the dominant end-to-end deadline.
+    time.sleep(0.25 * (2 ** attempt))
 
 
 class FakeModelClient:
@@ -76,13 +105,8 @@ class OllamaModelClient:
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Ollama request failed with HTTP {exc.code}: {body}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(
-                "Could not reach Ollama.\n"
-                "Make sure `ollama serve` is running and the model is available.\n"
-                f"Host: {self.host}\n"
-                f"Model: {self.model}"
-            ) from exc
+        except (urllib.error.URLError, RemoteDisconnected, TimeoutError) as exc:
+            raise _transport_error(exc, "Ollama") from exc
 
         if data.get("error"):
             raise RuntimeError(f"Ollama error: {data['error']}")
@@ -272,18 +296,18 @@ class OpenAICompatibleModelClient:
                 break
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
-                if exc.code >= 500 and attempt < attempts - 1:
-                    time.sleep(0.5 * (attempt + 1))
+                if _retryable_http_status(exc.code) and attempt < attempts - 1:
+                    self.last_completion_metadata = {"transport_retries": attempt + 1}
+                    _backoff(attempt)
                     continue
                 raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
-            except (urllib.error.URLError, RemoteDisconnected) as exc:
+            except (urllib.error.URLError, RemoteDisconnected, TimeoutError) as exc:
                 if attempt < attempts - 1:
-                    time.sleep(0.5 * (attempt + 1))
+                    self.last_completion_metadata = {"transport_retries": attempt + 1}
+                    _backoff(attempt)
                     continue
-                raise RuntimeError(
-                    "Could not reach the OpenAI-compatible backend.\n"
-                    f"Base URL: {self.base_url}\nModel: {self.model}"
-                ) from exc
+                self.last_completion_metadata = {"transport_retries": attempt}
+                raise _transport_error(exc, "OpenAI-compatible", attempts=attempt + 1) from exc
 
         if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
             data = _extract_openai_response_from_sse(body_text)
@@ -297,6 +321,7 @@ class OpenAICompatibleModelClient:
         if data.get("error"):
             raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
         data = _validate_openai_response_envelope(data)
+        retries = int(self.last_completion_metadata.get("transport_retries", 0))
         self.last_completion_metadata = {
             "prompt_cache_supported": self.supports_prompt_cache,
             "prompt_cache_key": prompt_cache_key,
@@ -306,6 +331,8 @@ class OpenAICompatibleModelClient:
             "incomplete_reason": _incomplete_reason(data) if data["status"] == "incomplete" else "",
             "reasoning_effort": effective_effort,
         }
+        if retries:
+            self.last_completion_metadata["transport_retries"] = retries
         return data
 
     def complete_turn(
@@ -524,19 +551,18 @@ class AnthropicCompatibleModelClient:
                 break
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
-                if exc.code >= 500 and attempt < attempts - 1:
-                    time.sleep(0.5 * (attempt + 1))
+                if _retryable_http_status(exc.code) and attempt < attempts - 1:
+                    self.last_completion_metadata = {"transport_retries": attempt + 1}
+                    _backoff(attempt)
                     continue
                 raise RuntimeError(f"Anthropic-compatible request failed with HTTP {exc.code}: {body}") from exc
-            except (urllib.error.URLError, RemoteDisconnected) as exc:
+            except (urllib.error.URLError, RemoteDisconnected, TimeoutError) as exc:
                 if attempt < attempts - 1:
-                    time.sleep(0.5 * (attempt + 1))
+                    self.last_completion_metadata = {"transport_retries": attempt + 1}
+                    _backoff(attempt)
                     continue
-                raise RuntimeError(
-                    "Could not reach the Anthropic-compatible backend.\n"
-                    f"Base URL: {self.base_url}\n"
-                    f"Model: {self.model}"
-                ) from exc
+                self.last_completion_metadata = {"transport_retries": attempt}
+                raise _transport_error(exc, "Anthropic-compatible", attempts=attempt + 1) from exc
 
         try:
             data = json.loads(body_text)
@@ -546,7 +572,10 @@ class AnthropicCompatibleModelClient:
             ) from exc
         if data.get("error"):
             raise RuntimeError(f"Anthropic-compatible error: {data['error']}")
+        retries = int(self.last_completion_metadata.get("transport_retries", 0))
         self.last_completion_metadata = _extract_anthropic_metadata(data)
+        if retries:
+            self.last_completion_metadata["transport_retries"] = retries
         stop_reason = self.last_completion_metadata["stop_reason"] or "unknown"
         content_types = ",".join(self.last_completion_metadata["content_block_types"]) or "none"
         if stop_reason in {"max_tokens", "pause_turn"}:
