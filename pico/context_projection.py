@@ -28,6 +28,9 @@ class ContextProjector:
             "For repository changes, inspect only the files needed, make the requested change in the staged workspace, "
             "then run focused verification. Do not reread evidence already listed in Runtime state. "
             "Return a concise final answer only when the task is complete or concretely blocked. "
+            "The latest user request outranks memory. Follow the selected package layout and repository conventions. "
+            "Treat comparative requests proportionally, keep changes focused, preserve low coupling and high cohesion, "
+            "and extract named responsibilities instead of accumulating unrelated generic utilities. "
             + write_rule
             + " "
             + shell_rule
@@ -38,6 +41,7 @@ class ContextProjector:
     def build(self, user_message, events, controller, notice="", finalization=False):
         state = controller.runtime_state_view()
         state["memory"] = self.agent.memory_text()[:2400]
+        state["interaction"] = dict(getattr(self.agent, "current_interaction", {}) or {})
         checkpoint = self.agent.render_checkpoint_text()
         if checkpoint:
             state["checkpoint"] = checkpoint[:1600]

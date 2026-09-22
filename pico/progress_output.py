@@ -56,7 +56,11 @@ class ConsoleProgressRenderer:
         elif event == "run_finished":
             line = (
                 f"[pico] finished | {payload.get('stop_reason', 'unknown')}"
+                f" | changed {len(getattr(task_state, 'changed_paths', []))}"
+                f" | validation {getattr(task_state, 'validation_status', 'not_run')}"
                 f" | {payload.get('run_duration_ms', 0) / 1000:.2f}s"
             )
+        elif event == "run_interrupted":
+            line = f"[pico] interrupted | staged changes preserved | step {task_state.tool_steps}"
         if line:
             print(line, file=self.stream, flush=True)

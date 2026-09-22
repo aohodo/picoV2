@@ -4,7 +4,7 @@
 这个对象会被不断写入 task_state.json，供运行中观察和运行后复盘。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import uuid4
 
@@ -56,6 +56,13 @@ class TaskState:
     model_duration_ms: int = 0
     tool_duration_ms: int = 0
     provider_retry_count: int = 0
+    request_mode: str = ""
+    request_profile: str = ""
+    package_layout: str = ""
+    relative_adjustment: bool = False
+    changed_paths: list = field(default_factory=list)
+    validation_commands: list = field(default_factory=list)
+    validation_status: str = "not_run"
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -91,7 +98,35 @@ class TaskState:
             model_duration_ms=int(data.get("model_duration_ms", 0)),
             tool_duration_ms=int(data.get("tool_duration_ms", 0)),
             provider_retry_count=int(data.get("provider_retry_count", 0)),
+            request_mode=str(data.get("request_mode", "")),
+            request_profile=str(data.get("request_profile", "")),
+            package_layout=str(data.get("package_layout", "")),
+            relative_adjustment=bool(data.get("relative_adjustment", False)),
+            changed_paths=list(data.get("changed_paths", [])),
+            validation_commands=list(data.get("validation_commands", [])),
+            validation_status=str(data.get("validation_status", "not_run")),
         )
+
+    def set_interaction(self, contract):
+        self.request_mode = str(contract.get("mode", ""))
+        self.request_profile = str(contract.get("request_profile", ""))
+        self.package_layout = str(contract.get("package_layout", ""))
+        self.relative_adjustment = bool(contract.get("relative_adjustment", False))
+        return self
+
+    def record_tool_evidence(self, name, args, metadata):
+        for path in metadata.get("affected_paths", []):
+            path = str(path)
+            if path and path not in self.changed_paths:
+                self.changed_paths.append(path)
+        if metadata.get("validation"):
+            command = str((args or {}).get("command", "")).strip()
+            if command:
+                self.validation_commands.append(command)
+            self.validation_status = (
+                "passed" if metadata.get("tool_status") == "ok" else "failed"
+            )
+        return self
 
     def record_attempt(self):
         # attempt 统计的是“模型被调用了几轮”，不等于 tool_steps。
@@ -201,4 +236,11 @@ class TaskState:
             "model_duration_ms": self.model_duration_ms,
             "tool_duration_ms": self.tool_duration_ms,
             "provider_retry_count": self.provider_retry_count,
+            "request_mode": self.request_mode,
+            "request_profile": self.request_profile,
+            "package_layout": self.package_layout,
+            "relative_adjustment": self.relative_adjustment,
+            "changed_paths": list(self.changed_paths),
+            "validation_commands": list(self.validation_commands),
+            "validation_status": self.validation_status,
         }

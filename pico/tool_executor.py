@@ -118,6 +118,27 @@ class ToolExecutor:
                 ),
             ))
 
+        interaction = getattr(agent, "current_interaction", {}) or {}
+        if (
+            name in {"write_file", "patch_file"}
+            and interaction
+            and not interaction.get("mutation_allowed", True)
+        ):
+            return self._finalize(name, args, ToolExecutionResult(
+                content=(
+                    f"error: interaction_read_only for {name}; the current request was classified "
+                    "as explanation, review, planning, or discussion and does not authorize mutation. "
+                    "Ask the user for an explicit implementation request before changing the workspace."
+                ),
+                metadata=_metadata(
+                    "rejected",
+                    tool_error_code="interaction_read_only",
+                    security_event_type="read_only_block",
+                    risk_level="high",
+                    read_only=False,
+                ),
+            ))
+
         controller = getattr(agent, "progress_controller", None)
         if controller is not None and not controller.preflight_known_error(name, args):
             return self._finalize(name, args, ToolExecutionResult(

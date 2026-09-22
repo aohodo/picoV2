@@ -20,6 +20,12 @@ from .context_manager import ContextManager
 from .execution import ExecutionLease, WorkspaceCommandRunner
 from .execution_policy import ModelExecutionPolicy
 from .features import memory as memorylib
+from .interaction_policy import (
+    PACKAGE_LAYOUTS,
+    PreferenceError,
+    WorkspacePreferenceStore,
+    build_interaction_contract,
+)
 from .memory_admission import extract_explicit_memory
 from .path_support import logical_path, native_path
 from .prompt_prefix import build_prompt_prefix, tool_signature
@@ -90,6 +96,7 @@ class Pico:
         hard_discovery_limit=None,
         model_execution_policy="adaptive",
         progress_sink=None,
+        package_layout=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -135,6 +142,13 @@ class Pico:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
         fallback_state_root = Path(self.session_store.root).parent
+        preference_root = self.workspace_state.root if self.workspace_state else fallback_state_root
+        self.preference_store = WorkspacePreferenceStore(preference_root / "preferences.json")
+        self.package_layout_override = str(package_layout).strip() if package_layout else ""
+        if self.package_layout_override and self.package_layout_override not in PACKAGE_LAYOUTS:
+            choices = ", ".join(sorted(PACKAGE_LAYOUTS))
+            raise PreferenceError(f"package_layout must be one of: {choices}")
+        self.current_interaction = {}
         self.run_store = run_store or RunStore(
             self.workspace_state.runs if self.workspace_state else fallback_state_root / "runs"
         )
@@ -200,6 +214,32 @@ class Pico:
         }
         self._recover_orphaned_runs()
         self.session_path = self.session_store.save(self.session)
+
+    def effective_package_layout(self):
+        if self.package_layout_override:
+            return self.package_layout_override
+        return self.preference_store.load()["package_layout"]
+
+    def preferences_view(self):
+        stored = self.preference_store.load()
+        return {
+            "package_layout": self.effective_package_layout(),
+            "workspace_package_layout": stored["package_layout"],
+            "source": "command_line" if self.package_layout_override else "workspace",
+        }
+
+    def set_workspace_package_layout(self, value):
+        values = self.preference_store.set_package_layout(value)
+        self.package_layout_override = ""
+        return values
+
+    def reset_workspace_package_layout(self):
+        values = self.preference_store.reset_package_layout()
+        self.package_layout_override = ""
+        return values
+
+    def interaction_contract(self, user_message):
+        return build_interaction_contract(user_message, self.effective_package_layout())
 
     def _recover_orphaned_runs(self):
         for payload in self.run_store.claim_orphaned_runs():
@@ -819,6 +859,14 @@ class Pico:
     def build_report(self, task_state):
         # report 是一次运行的最终摘要；
         # 和 trace 的区别在于，trace 关注过程，report 关注结果与关键指标。
+        interaction = dict(self.current_interaction)
+        if not interaction or task_state.run_id != getattr(self.current_task_state, "run_id", ""):
+            interaction = {
+                "mode": task_state.request_mode,
+                "request_profile": task_state.request_profile,
+                "package_layout": task_state.package_layout,
+                "relative_adjustment": task_state.relative_adjustment,
+            }
         return {
             "run_id": task_state.run_id,
             "task_id": task_state.task_id,
@@ -853,6 +901,12 @@ class Pico:
             "execution_backend": "workspace-process",
             "execution_isolation": "deployment-boundary",
             "session_revision": int(self.session.get("revision", 0)),
+            "interaction": interaction,
+            "evidence": {
+                "changed_paths": list(task_state.changed_paths),
+                "validation_commands": list(task_state.validation_commands),
+                "validation_status": task_state.validation_status,
+            },
         }
 
     def tool_example(self, name):
@@ -902,6 +956,7 @@ class Pico:
             hard_discovery_limit=self.hard_discovery_limit,
             model_execution_policy=self.model_execution_policy.mode,
             progress_sink=self.progress_sink,
+            package_layout=self.effective_package_layout(),
         )
         # 委派的目标是“调查”，不是“放权执行”。
         # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。

@@ -14,6 +14,7 @@ import textwrap
 from pathlib import Path
 
 from .config import load_project_env, provider_env
+from .interaction_policy import PACKAGE_LAYOUTS, PreferenceError
 from .progress_output import ConsoleProgressRenderer
 from .providers.clients import (
     AnthropicCompatibleModelClient,
@@ -57,7 +58,12 @@ HELP_DETAILS = textwrap.dedent(
     /memory  Show the agent's distilled working memory.
     /session Show the path to the saved session file.
     /reset   Clear the current session history and memory.
+    /preferences                         Show workspace coding preferences.
+    /set package-layout <layout>         Set follow_repository, layer_first, or feature_first.
+    /unset package-layout                Restore follow_repository.
     /exit    Exit the agent.
+
+    Press Ctrl+C during a run to interrupt it and return to this prompt.
     """
 ).strip()
 
@@ -290,6 +296,7 @@ def build_agent(args):
             soft_discovery_limit=getattr(args, "soft_discovery_limit", None),
             hard_discovery_limit=getattr(args, "hard_discovery_limit", None),
             model_execution_policy=getattr(args, "model_execution_policy", "adaptive"),
+            package_layout=getattr(args, "package_layout", None),
         )
     return Pico(
         model_client=model,
@@ -304,6 +311,7 @@ def build_agent(args):
         soft_discovery_limit=getattr(args, "soft_discovery_limit", None),
         hard_discovery_limit=getattr(args, "hard_discovery_limit", None),
         model_execution_policy=getattr(args, "model_execution_policy", "adaptive"),
+        package_layout=getattr(args, "package_layout", None),
     )
 
 
@@ -342,6 +350,12 @@ def build_arg_parser():
         help="Per-turn thinking policy. An explicit --openai-reasoning-effort still takes precedence.",
     )
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
+    parser.add_argument(
+        "--package-layout",
+        choices=tuple(sorted(PACKAGE_LAYOUTS)),
+        default=None,
+        help="Per-process package layout override; workspace preference is used when omitted.",
+    )
     parser.add_argument("--approval", choices=("ask", "auto", "never"), default="ask", help="Approval policy for risky tools.")
     parser.add_argument(
         "--commit-policy",
@@ -417,7 +431,7 @@ def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     try:
         agent = build_agent(args)
-    except SessionError as exc:
+    except (SessionError, PreferenceError) as exc:
         print_safe(str(exc), file=sys.stderr)
         return 2
 
@@ -440,6 +454,9 @@ def main(argv=None):
             try:
                 print_safe(agent.ask(prompt))
                 review_transaction(agent)
+            except KeyboardInterrupt:
+                print_safe("\nRun interrupted; staged workspace was preserved for the next request.", file=sys.stderr)
+                return 130
             except RuntimeError as exc:
                 print_safe(str(exc), file=sys.stderr)
                 return 1
@@ -471,10 +488,30 @@ def main(argv=None):
             agent.reset()
             print("session reset")
             continue
+        if user_input == "/preferences":
+            try:
+                print_safe(json.dumps(agent.preferences_view(), ensure_ascii=False, indent=2))
+            except PreferenceError as exc:
+                print_safe(str(exc), file=sys.stderr)
+            continue
+        if user_input.startswith("/set package-layout "):
+            value = user_input.removeprefix("/set package-layout ").strip()
+            try:
+                agent.set_workspace_package_layout(value)
+                print_safe(f"package-layout set to {value}")
+            except PreferenceError as exc:
+                print_safe(str(exc), file=sys.stderr)
+            continue
+        if user_input == "/unset package-layout":
+            agent.reset_workspace_package_layout()
+            print_safe("package-layout reset to follow_repository")
+            continue
 
         print()
         try:
             print_safe(agent.ask(user_input))
             review_transaction(agent)
+        except KeyboardInterrupt:
+            print_safe("\nRun interrupted; staged workspace was preserved. Enter the next request.", file=sys.stderr)
         except RuntimeError as exc:
             print_safe(str(exc), file=sys.stderr)

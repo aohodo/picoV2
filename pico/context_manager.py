@@ -104,11 +104,34 @@ class ContextManager:
             memory_enabled = self.agent.feature_enabled("memory")
             relevant_memory_enabled = self.agent.feature_enabled("relevant_memory")
             context_reduction_enabled = self.agent.feature_enabled("context_reduction")
+        interaction = dict(getattr(self.agent, "current_interaction", {}) or {})
+        request_text = f"Current user request:\n{user_message}"
+        if interaction:
+            compact_interaction = {
+                key: interaction[key]
+                for key in (
+                    "mode",
+                    "mutation_allowed",
+                    "relative_adjustment",
+                    "override_scope",
+                    "package_layout",
+                )
+                if key in interaction
+            }
+            request_text = (
+                "Interaction contract:\n"
+                + json.dumps(compact_interaction, ensure_ascii=False, sort_keys=True)
+                + "\nGuidance: latest request outranks memory; ask if a durable conflict's scope is unclear. "
+                "Follow the selected layout and repository conventions; apply relative requests by one "
+                "reasonable step; keep scope focused, coupling low, cohesion high, and abstractions named."
+                + "\n\n"
+                + request_text
+            )
         section_texts = {
             "prefix": str(getattr(self.agent, "prefix", "")),
             "memory": "Memory:\n- disabled" if not memory_enabled else str(self.agent.memory_text()),
             "history": "",
-            CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
+            CURRENT_REQUEST_SECTION: request_text,
         }
         checkpoint_text = ""
         if hasattr(self.agent, "render_checkpoint_text"):

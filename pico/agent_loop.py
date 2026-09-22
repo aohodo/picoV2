@@ -10,7 +10,6 @@ from .checkpoint import (
 )
 from .completion import CompletionAdmission
 from .context_projection import ContextProjector
-from .execution_policy import classify_request
 from .progress import ProgressController
 from .providers.clients import ProviderResponseError
 from .session_store import SessionConflictError
@@ -356,6 +355,9 @@ class AgentLoop:
         run_started_at = time.monotonic()
         agent.current_run_started_at = run_started_at
         task_state = TaskState.create(run_id=agent.new_run_id(), task_id=agent.new_task_id(), user_request=user_message)
+        interaction = agent.interaction_contract(user_message)
+        agent.current_interaction = interaction
+        task_state.set_interaction(interaction)
         task_state.resume_status = agent.resume_state.get("status", CHECKPOINT_NONE_STATUS)
         agent.current_task_state = task_state
         agent.current_run_lease = agent.run_store.acquire_run_lease(task_state, blocking=True)
@@ -391,6 +393,7 @@ class AgentLoop:
             {
                 "task_id": task_state.task_id,
                 "user_request": clip(user_message, 300),
+                "interaction": interaction,
             },
         )
         promoted, rejected, superseded = agent.promote_durable_memory(user_message)
@@ -411,8 +414,12 @@ class AgentLoop:
         contract_failure_final = None
         contract_failures = 0
         model_notice = ""
-        request_profile = classify_request(user_message)
-        prompt_metadata_base = {"request_profile": request_profile}
+        request_profile = interaction["request_profile"]
+        prompt_metadata_base = {
+            "request_profile": request_profile,
+            "request_mode": interaction["mode"],
+            "package_layout": interaction["package_layout"],
+        }
         max_attempts = max(agent.max_steps * 3, agent.max_steps + 4)
 
         # 这是 agent 的主循环，可以按“感知 -> 决策 -> 行动 -> 记录”来理解：
@@ -520,7 +527,7 @@ class AgentLoop:
                         {
                             name: tool
                             for name, tool in agent.tools.items()
-                            if request_profile != "simple_read_only"
+                            if interaction["mutation_allowed"]
                             or name in {"list_files", "read_file", "read_files", "search"}
                         }
                     ),
@@ -578,6 +585,7 @@ class AgentLoop:
                     )
                     agent.record_model_events(model_events, execution_ledger=controller.ledger.to_dict())
                 tool_metadata = dict(tool_result.metadata or {})
+                task_state.record_tool_evidence(name, args, tool_metadata)
                 if tool_metadata.get("executed"):
                     task_state.record_tool(
                         name,
