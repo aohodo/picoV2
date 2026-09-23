@@ -12,8 +12,8 @@ NO_PROGRESS = "NO_PROGRESS"
 INTERVENTION_NORMAL = "NORMAL"
 INTERVENTION_SOFT = "SOFT_INTERVENTION"
 INTERVENTION_FORCED = "FORCED_DECISION"
-STABLE_READ_TOOLS = frozenset({"list_files", "read_file", "read_files", "search"})
-DISCOVERY_TOOLS = frozenset({"list_files", "read_file", "read_files", "search", "delegate"})
+STABLE_READ_TOOLS = frozenset({"list_files", "read_file", "read_files", "search", "inspect_repository"})
+DISCOVERY_TOOLS = frozenset({"list_files", "read_file", "read_files", "search", "inspect_repository", "delegate"})
 VALIDATION_COMMAND = re.compile(
     r"(?i)(^|[;&|]\s*|\s)(pytest|python\s+-m\s+pytest|mvn(?:\s+[^;&|]+)?\s+test|"
     r"gradle\w*\s+test|npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+test|"
@@ -86,6 +86,8 @@ class ExecutionLedger:
             self.observed_directories.add(str(args.get("path", ".")))
         elif tool_name == "search":
             self.searches.add((str(args.get("pattern", "")), str(args.get("path", "."))))
+        elif tool_name == "inspect_repository":
+            self.searches.add((str(args.get("query", "")), "<repository-graph>"))
 
     def view(self):
         return {
@@ -228,8 +230,8 @@ class ProgressController:
             if tool_name in DISCOVERY_TOOLS:
                 self.state.discovery_streak += 1
                 self.state.max_discovery_streak = max(self.state.max_discovery_streak, self.state.discovery_streak)
-            elif tool_name == "run_shell" and executed:
-                if is_validation_command(args.get("command", "")):
+            elif tool_name in {"run_shell", "run_verification"} and executed:
+                if tool_name == "run_verification" or is_validation_command(args.get("command", "")):
                     self.state.shell_count += 1
                 self.state.discovery_streak = 0
             else:
@@ -243,12 +245,17 @@ class ProgressController:
             if tool_name in STABLE_READ_TOOLS and status == "ok":
                 self.state.successful_reads.add(signature.key)
                 self.ledger.record_read(tool_name, args)
-            if tool_name == "run_shell":
-                validation = is_validation_command(args.get("command", ""))
+            if tool_name in {"run_shell", "run_verification"}:
+                validation = tool_name == "run_verification"
+                command = (
+                    " ".join(str(item) for item in args.get("argv", []))
+                    if validation
+                    else str(args.get("command", ""))
+                )
                 record = {
-                    "command": str(args.get("command", "")),
+                    "command": command,
                     "status": status,
-                    "kind": "validation" if validation else "execution",
+                    "kind": "validation" if validation else "shell_execution",
                 }
                 self.ledger.validations.append(record)
                 if validation and status == "ok":

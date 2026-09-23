@@ -25,37 +25,51 @@ from .interaction_policy import (
     PreferenceError,
     WorkspacePreferenceStore,
     build_interaction_contract,
+    path_matches_patterns,
 )
 from .memory_admission import extract_explicit_memory
+from .outcome import RunOutcome
 from .path_support import logical_path, native_path
 from .prompt_prefix import build_prompt_prefix, tool_signature
+from .repository_graph import RepositoryGraph
 from .run_store import RunStore
 from .security import REDACTED_VALUE, SecretBoundary
 from .session_store import SessionStore
 from .state_root import WorkspaceState
 from .task_state import TaskState
+from .text_document import TextDecodingError
 from .tool_context import ToolContext
 from .tool_executor import ToolExecutor
 from .transaction_context import TransactionContext
-from .transactional_workspace import TransactionalWorkspace
-from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
+from .transactional_workspace import COPY_EXCLUDES, TransactionalWorkspace
+from .workspace import MAX_HISTORY, WorkspaceContext, clip, now
 
 DEFAULT_SHELL_ENV_ALLOWLIST = (
+    "APPDATA",
     "COMSPEC",
     "HOME",
+    "GRADLE_HOME",
+    "JAVA_HOME",
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
+    "LOCALAPPDATA",
     "LOGNAME",
+    "MAVEN_HOME",
     "PATH",
+    "PATHEXT",
+    "PROGRAMDATA",
     "PWD",
     "SHELL",
+    "SYSTEMDRIVE",
     "SYSTEMROOT",
     "TERM",
     "TMPDIR",
     "TMP",
     "TEMP",
     "USER",
+    "USERPROFILE",
+    "WINDIR",
 )
 DEFAULT_FEATURE_FLAGS = {
     "memory": True,
@@ -206,7 +220,10 @@ class Pico:
         self.last_durable_rejections = []
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
-        self.last_shell_validation_succeeded = None
+        self.last_verification_succeeded = None
+        self.verification_stale = False
+        self.last_shell_validation_succeeded = None  # compatibility for persisted V1 state
+        self.last_run_outcome = None
         self.progress_controller = None
         self._last_prefix_refresh = {
             "workspace_changed": False,
@@ -240,6 +257,12 @@ class Pico:
 
     def interaction_contract(self, user_message):
         return build_interaction_contract(user_message, self.effective_package_layout())
+
+    def repository_evidence(self, user_message, limit=10):
+        try:
+            return clip(RepositoryGraph(self.root).query(user_message, limit=limit), 2400)
+        except (OSError, TextDecodingError, ValueError):
+            return ""
 
     def _recover_orphaned_runs(self):
         for payload in self.run_store.claim_orphaned_runs():
@@ -312,6 +335,8 @@ class Pico:
         self.root = transaction.execution_root
         self.workspace = WorkspaceContext.build(self.root, repo_root_override=self.root)
         self.session["active_transaction_id"] = transaction.transaction_id
+        self.last_verification_succeeded = None
+        self.verification_stale = False
         self.last_shell_validation_succeeded = None
         self.memory.workspace_root = self.root
         self.tools = self._apply_tool_allowlist(self.build_tools())
@@ -339,8 +364,23 @@ class Pico:
             return {"state": "COMMITTED", "changes": [], "conflicts": []}
         transaction = context.workspace
         changes = transaction.stage()
-        if self.last_shell_validation_succeeded is False:
-            conflicts = transaction.block_validation("last_shell_command_failed")
+        protected_paths = list((self.current_interaction or {}).get("protected_paths", []))
+        scope_violations = [
+            change["path"]
+            for change in changes
+            if path_matches_patterns(change["path"], protected_paths)
+        ]
+        if scope_violations:
+            conflicts = transaction.block_validation(
+                "scope_constraint_violation",
+                paths=scope_violations,
+            )
+            return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
+        if self.verification_stale:
+            conflicts = transaction.block_validation("verification_stale")
+            return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
+        if self.last_verification_succeeded is False:
+            conflicts = transaction.block_validation("verification_failed")
             return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
         conflicts = transaction.validate_commit()
         if conflicts:
@@ -352,6 +392,17 @@ class Pico:
             self._restore_source_view(clear_context=True)
             return result
         return {"state": transaction.state, "changes": changes, "conflicts": []}
+
+    def capture_run_outcome(self, task_state, staged_paths=(), delivered_paths=(), conflicts=()):
+        outcome = RunOutcome.from_task_state(
+            task_state,
+            staged_paths=staged_paths,
+            delivered_paths=delivered_paths,
+            conflicts=conflicts,
+        )
+        task_state.record_outcome(outcome)
+        self.last_run_outcome = outcome
+        return outcome
 
     def apply_transaction(self):
         if self.transaction_context is None:
@@ -365,6 +416,12 @@ class Pico:
         if self.current_task_state is not None:
             self.current_task_state.transaction_state = transaction.state
             self.current_task_state.finish_success(self.current_task_state.final_answer)
+            paths = [change["path"] for change in committed_changes]
+            self.capture_run_outcome(
+                self.current_task_state,
+                staged_paths=paths,
+                delivered_paths=paths,
+            )
             self.run_store.write_task_state(self.current_task_state)
             self.run_store.write_report(
                 self.current_task_state,
@@ -381,6 +438,7 @@ class Pico:
         if self.current_task_state is not None:
             self.current_task_state.transaction_state = transaction.state
             self.current_task_state.stop("transaction_discarded", final_answer=self.current_task_state.final_answer)
+            self.capture_run_outcome(self.current_task_state)
             self.run_store.write_task_state(self.current_task_state)
             self.run_store.write_report(
                 self.current_task_state,
@@ -461,6 +519,11 @@ class Pico:
             tools["run_shell"]["description"] = (
                 f"Run a {dialect} command in the transaction workspace. "
                 "Use `python -m pytest` for Python validation."
+            )
+        if "run_verification" in tools:
+            tools["run_verification"]["description"] = (
+                "Run one verification executable directly in the transaction workspace. "
+                "Pass argv as separate elements; its process exit status is authoritative."
             )
         return tools
 
@@ -658,7 +721,7 @@ class Pico:
                 relative_parts = path.relative_to(self.root).parts
             except ValueError:
                 continue
-            if any(part in IGNORED_PATH_NAMES for part in relative_parts):
+            if any(part in COPY_EXCLUDES for part in relative_parts):
                 continue
             if not path.is_file():
                 continue
@@ -885,6 +948,16 @@ class Pico:
             "redacted_env": self.detected_secret_env_summary(),
             "transaction_id": task_state.transaction_id,
             "transaction_state": task_state.transaction_state,
+            "run_outcome": (
+                self.last_run_outcome.to_dict()
+                if self.last_run_outcome is not None
+                and task_state.run_id == getattr(self.current_task_state, "run_id", "")
+                else RunOutcome.from_task_state(
+                    task_state,
+                    staged_paths=task_state.staged_paths,
+                    delivered_paths=task_state.delivered_paths,
+                ).to_dict()
+            ),
             "blocked_repeats": task_state.blocked_repeats,
             "intervention_count": task_state.intervention_count,
             "steps_to_first_mutation": task_state.steps_to_first_mutation,
@@ -976,8 +1049,14 @@ class Pico:
     def tool_search(self, args):
         return toolkit.tool_search(self.tool_context(), args)
 
+    def tool_inspect_repository(self, args):
+        return toolkit.tool_inspect_repository(self.tool_context(), args)
+
     def tool_run_shell(self, args):
         return toolkit.tool_run_shell(self.tool_context(), args)
+
+    def tool_run_verification(self, args):
+        return toolkit.tool_run_verification(self.tool_context(), args)
 
     def tool_write_file(self, args):
         return toolkit.tool_write_file(self.tool_context(), args)

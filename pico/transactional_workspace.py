@@ -395,10 +395,11 @@ class TransactionalWorkspace:
         self._persist(change_count=len(changes))
         return []
 
-    def block_validation(self, reason):
+    def block_validation(self, reason, paths=()):
         if self.state not in {"STAGED", "VALIDATING", "READY_FOR_REVIEW"}:
             raise RuntimeError(f"transaction cannot block validation from {self.state}")
-        conflicts = [{"path": "", "reason": str(reason)}]
+        paths = [str(path) for path in paths if str(path)] or [""]
+        conflicts = [{"path": path, "reason": str(reason)} for path in paths]
         self.state = "CONFLICTED"
         self._persist(conflicts=conflicts)
         return conflicts

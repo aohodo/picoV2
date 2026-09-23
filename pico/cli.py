@@ -427,6 +427,16 @@ def review_transaction(agent):
         print("staged transaction retained for resume")
 
 
+def run_exit_code(agent):
+    outcome = getattr(agent, "last_run_outcome", None)
+    if outcome is not None:
+        return int(outcome.exit_code)
+    task_state = getattr(agent, "current_task_state", None)
+    if task_state is None or task_state.exit_code is None:
+        return 1
+    return int(task_state.exit_code)
+
+
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     try:
@@ -460,7 +470,7 @@ def main(argv=None):
             except RuntimeError as exc:
                 print_safe(str(exc), file=sys.stderr)
                 return 1
-        return 0
+        return run_exit_code(agent)
 
     while True:
         # 交互模式：每次读取一条用户输入，交给同一个 agent，

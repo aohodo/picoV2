@@ -33,6 +33,7 @@ class AgentLoop:
         error_text = agent.redact_text(str(exc))
         final = f"Model request failed: {error_text}"
         task_state.stop_model_error(final)
+        agent.capture_run_outcome(task_state)
         agent.run_store.write_task_state(task_state)
         checkpoint = agent.create_checkpoint(task_state, user_message, trigger="model_error")
         agent.run_store.write_task_state(task_state)
@@ -223,15 +224,45 @@ class AgentLoop:
 
     def _finish_success(self, task_state, user_message, final, run_started_at):
         agent = self.agent
-        agent.record({"role": "assistant", "content": final, "created_at": now()})
+        # Perform the session compare-and-swap before crossing the workspace
+        # commit boundary. A stale concurrent session must not deliver code.
+        agent.session_path = agent.session_store.save(agent.session)
         outcome = agent.finalize_transaction()
         task_state.transaction_state = outcome["state"]
+        paths = [change["path"] for change in outcome.get("changes", [])]
+        conflicts = list(outcome.get("conflicts", []))
         if outcome["state"] == "COMMITTED":
             task_state.finish_success(final)
+            staged_paths = delivered_paths = paths
         elif outcome["state"] == "READY_FOR_REVIEW":
             task_state.stop("ready_for_review", final_answer=final)
+            staged_paths, delivered_paths = paths, []
         else:
-            task_state.stop("workspace_conflict", final_answer=final)
+            validation_failed = any(
+                item.get("reason") in {"verification_failed", "verification_stale"}
+                for item in conflicts
+            )
+            scope_violation = any(
+                item.get("reason") == "scope_constraint_violation" for item in conflicts
+            )
+            if validation_failed:
+                reason = "validation_failed"
+                final = "Run did not complete: validation failed and staged changes were not delivered."
+            elif scope_violation:
+                reason = "scope_constraint_violation"
+                final = "Run did not complete: staged changes violated an explicit no-modification constraint."
+            else:
+                reason = "workspace_conflict"
+                final = "Run did not complete: the staged changes conflict with the source workspace."
+            task_state.stop(reason, status="failed", final_answer=final)
+            staged_paths, delivered_paths = paths, []
+        agent.capture_run_outcome(
+            task_state,
+            staged_paths=staged_paths,
+            delivered_paths=delivered_paths,
+            conflicts=conflicts,
+        )
+        agent.record({"role": "assistant", "content": final, "created_at": now()})
         checkpoint = agent.create_checkpoint(task_state, user_message, trigger="run_finished")
         agent.run_store.write_task_state(task_state)
         agent.emit_trace(
@@ -275,13 +306,16 @@ class AgentLoop:
 
         close_errors = []
         transaction = getattr(agent, "transaction_context", None)
+        staged_paths = []
         if transaction is not None:
             try:
                 transaction.workspace.interrupt(stop_reason)
                 task_state.transaction_state = transaction.workspace.state
+                staged_paths = [change["path"] for change in transaction.workspace.diff()]
             except Exception as exc:  # noqa: BLE001 - preserve the original failure while closing audit state
                 close_errors.append(agent.redact_text(str(exc)))
 
+        agent.capture_run_outcome(task_state, staged_paths=staged_paths)
         agent.run_store.write_task_state(task_state)
         checkpoint = None
         if stop_reason != "session_revision_conflict":
@@ -367,6 +401,10 @@ class AgentLoop:
 
         if agent.transaction_context is None:
             agent.begin_transaction()
+        if interaction.get("mutation_allowed") and not agent.read_only:
+            evidence = agent.repository_evidence(user_message)
+            if evidence:
+                interaction["repository_evidence"] = evidence
         if agent.transaction_context is not None:
             task_state.transaction_id = agent.transaction_context.transaction_id
             task_state.transaction_state = agent.transaction_context.workspace.state
@@ -409,7 +447,6 @@ class AgentLoop:
             )
 
         attempts = 0
-        budget_final = None
         stuck_final = None
         contract_failure_final = None
         contract_failures = 0
@@ -528,7 +565,7 @@ class AgentLoop:
                             name: tool
                             for name, tool in agent.tools.items()
                             if interaction["mutation_allowed"]
-                            or name in {"list_files", "read_file", "read_files", "search"}
+                            or name in {"list_files", "read_file", "read_files", "search", "inspect_repository"}
                         }
                     ),
                     turn_policy=turn_policy,
@@ -751,10 +788,7 @@ class AgentLoop:
                 )
             if kind == "final":
                 final = (payload or raw).strip()
-                transaction = getattr(agent, "transaction_context", None)
-                if transaction is None or not transaction.workspace.diff():
-                    return self._finish_success(task_state, user_message, final, run_started_at)
-                budget_final = final
+                return self._finish_success(task_state, user_message, final, run_started_at)
 
         if stuck_final is not None:
             final = stuck_final
@@ -762,9 +796,6 @@ class AgentLoop:
         elif contract_failure_final is not None:
             final = contract_failure_final
             task_state.stop_retry_limit(final)
-        elif budget_final is not None:
-            final = budget_final
-            task_state.stop_step_limit(final)
         elif attempts >= max_attempts and task_state.tool_steps < agent.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
             task_state.stop_retry_limit(final)
@@ -774,6 +805,12 @@ class AgentLoop:
         agent.interrupt_transaction(task_state.stop_reason or "interrupted")
         if agent.transaction_context is not None:
             task_state.transaction_state = agent.transaction_context.workspace.state
+            staged_paths = [
+                change["path"] for change in agent.transaction_context.workspace.diff()
+            ]
+        else:
+            staged_paths = []
+        agent.capture_run_outcome(task_state, staged_paths=staged_paths)
         agent.record({"role": "assistant", "content": final, "created_at": now()})
         agent.run_store.write_task_state(task_state)
         checkpoint = agent.create_checkpoint(task_state, user_message, trigger=task_state.stop_reason or "run_stopped")

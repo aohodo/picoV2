@@ -63,6 +63,10 @@ class TaskState:
     changed_paths: list = field(default_factory=list)
     validation_commands: list = field(default_factory=list)
     validation_status: str = "not_run"
+    outcome_status: str = "running"
+    staged_paths: list = field(default_factory=list)
+    delivered_paths: list = field(default_factory=list)
+    exit_code: int | None = None
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -105,7 +109,18 @@ class TaskState:
             changed_paths=list(data.get("changed_paths", [])),
             validation_commands=list(data.get("validation_commands", [])),
             validation_status=str(data.get("validation_status", "not_run")),
+            outcome_status=str(data.get("outcome_status", data.get("status", "running"))),
+            staged_paths=list(data.get("staged_paths", [])),
+            delivered_paths=list(data.get("delivered_paths", [])),
+            exit_code=data.get("exit_code"),
         )
+
+    def record_outcome(self, outcome):
+        self.outcome_status = str(outcome.status)
+        self.staged_paths = list(outcome.staged_paths)
+        self.delivered_paths = list(outcome.delivered_paths)
+        self.exit_code = int(outcome.exit_code)
+        return self
 
     def set_interaction(self, contract):
         self.request_mode = str(contract.get("mode", ""))
@@ -115,17 +130,28 @@ class TaskState:
         return self
 
     def record_tool_evidence(self, name, args, metadata):
-        for path in metadata.get("affected_paths", []):
-            path = str(path)
-            if path and path not in self.changed_paths:
-                self.changed_paths.append(path)
+        workspace_changed = metadata.get("workspace_changed")
+        if workspace_changed is None:
+            workspace_changed = bool(metadata.get("affected_paths"))
+        if workspace_changed:
+            for path in metadata.get("affected_paths", []):
+                path = str(path)
+                if path and path not in self.changed_paths:
+                    self.changed_paths.append(path)
         if metadata.get("validation"):
-            command = str((args or {}).get("command", "")).strip()
+            raw_argv = (args or {}).get("argv")
+            command = (
+                " ".join(str(item) for item in raw_argv)
+                if isinstance(raw_argv, list)
+                else str((args or {}).get("command", "")).strip()
+            )
             if command:
                 self.validation_commands.append(command)
             self.validation_status = (
                 "passed" if metadata.get("tool_status") == "ok" else "failed"
             )
+        elif workspace_changed and self.validation_status in {"passed", "failed"}:
+            self.validation_status = "stale"
         return self
 
     def record_attempt(self):
@@ -137,7 +163,7 @@ class TaskState:
         # tool_steps 只统计真正进入执行阶段的工具调用次数。
         self.tool_steps += 1
         self.last_tool = str(name or "")
-        if self.last_tool == "run_shell" and self.steps_to_first_shell is None:
+        if self.last_tool in {"run_shell", "run_verification"} and self.steps_to_first_shell is None:
             self.steps_to_first_shell = self.tool_steps
         if workspace_changed and self.steps_to_first_mutation is None:
             self.steps_to_first_mutation = self.tool_steps
@@ -243,4 +269,8 @@ class TaskState:
             "changed_paths": list(self.changed_paths),
             "validation_commands": list(self.validation_commands),
             "validation_status": self.validation_status,
+            "outcome_status": self.outcome_status,
+            "staged_paths": list(self.staged_paths),
+            "delivered_paths": list(self.delivered_paths),
+            "exit_code": self.exit_code,
         }

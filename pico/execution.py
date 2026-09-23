@@ -6,6 +6,7 @@ environment; it does not claim to be a host security sandbox.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -134,6 +135,56 @@ class WorkspaceCommandRunner:
             "stdout": self.secret_boundary.sanitize_text(result.stdout.decode("utf-8", errors="replace")),
             "stderr": self.secret_boundary.sanitize_text(result.stderr.decode("utf-8", errors="replace")),
             "shell_profile": self.profile_view(),
+        }
+
+    def run_argv(self, argv, timeout=20):
+        """Run one executable directly so its exit status cannot be shell-masked."""
+        self.start()
+        argv = [str(item) for item in argv]
+        if not argv or not argv[0].strip():
+            raise ValueError("argv must contain an executable")
+        if argv[0].lower() in {"python", "python.exe", "python3", "python3.exe"}:
+            argv[0] = str(Path(sys.executable).resolve())
+        env = self.secret_boundary.build_sandbox_env(
+            self.env_allowlist,
+            extra={
+                "PWD": str(self.execution_root),
+                "PICO_AGENT": "1",
+                "PICO_SHELL_DIALECT": "direct",
+            },
+        )
+        env = self._prepend_runtime_path(env)
+        profile = {"dialect": "direct", "executable": argv[0]}
+        process_argv = argv
+        resolved_executable = shutil.which(argv[0], path=env.get("PATH"))
+        if os.name == "nt" and resolved_executable and Path(resolved_executable).suffix.casefold() in {".cmd", ".bat"}:
+            if any(re.search(r"[&|<>^\r\n]", item) for item in argv):
+                raise ValueError("batch verification argv contains shell metacharacters")
+            command_processor = env.get("COMSPEC") or shutil.which("cmd.exe")
+            if not command_processor:
+                raise ExecutionRuntimeUnavailable("verification_runtime_unavailable: cmd.exe was not found")
+            process_argv = [command_processor, "/d", "/s", "/c", subprocess.list2cmdline([resolved_executable, *argv[1:]])]
+            profile = {"dialect": "direct-batch", "executable": resolved_executable}
+        try:
+            result = subprocess.run(
+                process_argv,
+                cwd=self.execution_root,
+                env=env,
+                capture_output=True,
+                timeout=int(timeout),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"verification command timed out after {timeout}s") from exc
+        except OSError as exc:
+            raise ExecutionRuntimeUnavailable(
+                f"verification_runtime_unavailable: {exc}"
+            ) from exc
+        return {
+            "exit_code": result.returncode,
+            "stdout": self.secret_boundary.sanitize_text(result.stdout.decode("utf-8", errors="replace")),
+            "stderr": self.secret_boundary.sanitize_text(result.stderr.decode("utf-8", errors="replace")),
+            "shell_profile": profile,
         }
 
     def stop(self):

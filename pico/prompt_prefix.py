@@ -44,12 +44,13 @@ def build_prompt_prefix(workspace, tools, built_at=None):
     examples = (
         '<tool>{"name":"list_files","args":{"path":"."}}</tool>\n'
         '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>\n'
+        '<tool>{"name":"inspect_repository","args":{"query":"service implementation","limit":12}}</tool>\n'
         '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n'
         "    return -1\n</content></tool>\n"
         '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text>'
         "<new_text>return mid</new_text></tool>\n"
-        '<tool>{"name":"run_shell","args":{"command":"python -m pytest -q",'
-        '"timeout":20}}</tool>\n'
+        '<tool>{"name":"run_verification","args":{"argv":["python","-m","pytest","-q"],'
+        '"timeout":120}}</tool>\n'
         "<final>Done.</final>"
     )
     # prefix 可以理解成 agent 的“工作手册”：
@@ -71,10 +72,12 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         - Keep answers concise and concrete.
         - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
         - Before writing tests for existing code, read the implementation first.
+        - For cross-file Python or Java work, use inspect_repository to identify symbols and dependencies before broad file listing.
         - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
         - New files should be complete and runnable, including obvious imports.
         - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
-        - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
+        - Use run_verification, not run_shell, for tests, builds, lint, and type checks. It runs one argv directly and preserves the real exit status.
+        - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, run_verification, or delegate with args={{}}.
 
         Tools:
         {tool_text}

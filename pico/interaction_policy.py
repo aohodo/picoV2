@@ -1,5 +1,6 @@
 """Structured human-agent interaction policy and workspace preferences."""
 
+import fnmatch
 import json
 import os
 import re
@@ -36,6 +37,12 @@ _RELATIVE = re.compile(
 )
 _TEMPORARY = re.compile(r"(?i)\b(?:this\s+time|this\s+task|temporarily|for\s+now)\b|本次|这次|本轮|暂时|临时")
 _DURABLE = re.compile(r"(?i)\b(?:from\s+now\s+on|always|default|remember|long[- ]term)\b|以后|今后|默认|长期|记住")
+_PROTECTED_TARGET = re.compile(
+    r"(?i)(?:do\s+not|don't|must\s+not|never)\s+"
+    r"(?:modify|change|edit|write|touch|delete)\s+([^.;\n]+)|"
+    r"(?:不要|不得|禁止)(?:修改|更改|编辑|写入|触碰|删除)([^，。；\n]+)"
+)
+_PATH_TOKEN = re.compile(r"[\w./\\*?\[\]-]+\.[A-Za-z0-9*?]+")
 
 
 class PreferenceError(RuntimeError):
@@ -86,6 +93,23 @@ def classify_interaction(user_message):
         relative_adjustment=bool(_RELATIVE.search(text)),
         override_scope=override_scope,
     )
+
+
+def extract_protected_paths(user_message):
+    """Extract explicit task-local no-write constraints from the current request."""
+    patterns = set()
+    for match in _PROTECTED_TARGET.finditer(str(user_message or "")):
+        target = str(match.group(1) or match.group(2) or "").strip().casefold()
+        if re.search(r"\btests?\b|测试(?:文件|代码|目录)?", target):
+            patterns.update({"test*", "test*/**", "tests/**", "**/test*", "**/*test.java", "src/test/**"})
+        for token in _PATH_TOKEN.findall(target):
+            patterns.add(token.replace("\\", "/").lstrip("./"))
+    return sorted(patterns)
+
+
+def path_matches_patterns(path, patterns):
+    normalized = str(path or "").replace("\\", "/").lstrip("./").casefold()
+    return any(fnmatch.fnmatchcase(normalized, str(pattern).casefold()) for pattern in patterns or ())
 
 
 class WorkspacePreferenceStore:
@@ -153,6 +177,7 @@ def build_interaction_contract(user_message, package_layout):
     intent = classify_interaction(user_message)
     return {
         **intent.to_dict(),
+        "protected_paths": extract_protected_paths(user_message),
         "package_layout": package_layout,
         "instruction_priority": [
             "current_user_request",

@@ -21,12 +21,13 @@ class ContextProjector:
         shell_profile = self.agent.execution_profile_view()
         shell_rule = (
             f"Shell commands use the {shell_profile.get('dialect', 'unavailable')} dialect. "
-            "Use `python -m pytest` for Python tests so the active Pico interpreter is reused. "
+            "Use run_verification with argv elements for tests and builds; its direct process exit status is authoritative. "
         )
         return (
             "You are Pico, a local coding agent. Use the supplied function tools instead of inventing workspace facts. "
             "For repository changes, inspect only the files needed, make the requested change in the staged workspace, "
             "then run focused verification. Do not reread evidence already listed in Runtime state. "
+            "For cross-file Python or Java work, query inspect_repository for symbols and dependency direction before broad listing. "
             "Return a concise final answer only when the task is complete or concretely blocked. "
             "The latest user request outranks memory. Follow the selected package layout and repository conventions. "
             "Treat comparative requests proportionally, keep changes focused, preserve low coupling and high cohesion, "

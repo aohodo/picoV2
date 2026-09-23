@@ -8,6 +8,7 @@ from functools import partial
 
 from .execution import format_shell_result
 from .path_support import logical_path, native_path
+from .repository_graph import RepositoryGraph
 from .text_document import TextDecodingError, read_text_document, write_text_document
 from .workspace import IGNORED_PATH_NAMES
 
@@ -32,10 +33,26 @@ BASE_TOOL_SPECS = {
         "risky": False,
         "description": "Search the workspace with rg or a simple fallback.",
     },
+    "inspect_repository": {
+        "schema": {"query": "str", "limit": "int=12"},
+        "risky": False,
+        "description": (
+            "Find relevant Python/Java files using symbols, imports, and reverse dependencies. "
+            "Use before broad repository exploration."
+        ),
+    },
     "run_shell": {
         "schema": {"command": "str", "timeout": "int=20"},
         "risky": True,
         "description": "Run a command in the transaction workspace using the declared shell profile.",
+    },
+    "run_verification": {
+        "schema": {"argv": "list[str]", "timeout": "int=120"},
+        "risky": True,
+        "description": (
+            "Run one test, build, lint, or type-check executable directly and record its real exit status. "
+            "Use this instead of run_shell for verification."
+        ),
     },
     "write_file": {
         "schema": {"path": "str", "content": "str"},
@@ -64,7 +81,12 @@ TOOL_EXAMPLES = {
     "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
     "read_files": '<tool>{"name":"read_files","args":{"paths":["README.md","pyproject.toml"]}}</tool>',
     "search": '<tool>{"name":"search","args":{"pattern":"binary_search","path":"."}}</tool>',
+    "inspect_repository": '<tool>{"name":"inspect_repository","args":{"query":"UserService create user","limit":12}}</tool>',
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"python -m pytest -q","timeout":20}}</tool>',
+    "run_verification": (
+        '<tool>{"name":"run_verification","args":{"argv":["python","-m","pytest","-q"],'
+        '"timeout":120}}</tool>'
+    ),
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
     "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
@@ -100,10 +122,12 @@ def native_tool_definitions(tools):
                 schema = {"type": "array", "items": {"type": "string"}, "minItems": 1}
             else:
                 schema = {"type": "string"}
-            if name == "run_shell" and field == "timeout":
+            if name in {"run_shell", "run_verification"} and field == "timeout":
                 schema.update({"minimum": 1, "maximum": 120})
             elif name == "delegate" and field == "max_steps":
                 schema.update({"minimum": 1, "maximum": 12})
+            elif name == "inspect_repository" and field == "limit":
+                schema.update({"minimum": 1, "maximum": 30})
             properties[field] = schema
             if "=" not in spec:
                 required.append(field)
@@ -163,11 +187,34 @@ def validate_tool(context, name, args):
         context.path(args.get("path", "."))
         return
 
+    if name == "inspect_repository":
+        query = str(args.get("query", "")).strip()
+        if not query:
+            raise ValueError("query must not be empty")
+        limit = int(args.get("limit", 12))
+        if limit < 1 or limit > 30:
+            raise ValueError("limit must be in [1, 30]")
+        return
+
     if name == "run_shell":
         command = str(args.get("command", "")).strip()
         if not command:
             raise ValueError("command must not be empty")
         timeout = int(args.get("timeout", 20))
+        if timeout < 1 or timeout > 120:
+            raise ValueError("timeout must be in [1, 120]")
+        return
+
+    if name == "run_verification":
+        argv = args.get("argv")
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or len(argv) > 64
+            or any(not isinstance(item, str) or not item.strip() for item in argv)
+        ):
+            raise ValueError("argv must be a non-empty list of at most 64 non-empty strings")
+        timeout = int(args.get("timeout", 120))
         if timeout < 1 or timeout > 120:
             raise ValueError("timeout must be in [1, 120]")
         return
@@ -271,6 +318,13 @@ def tool_search(context, args):
     return "\n".join(matches) or "(no matches)"
 
 
+def tool_inspect_repository(context, args):
+    return RepositoryGraph(context.root).query(
+        str(args.get("query", "")),
+        limit=int(args.get("limit", 12)),
+    )
+
+
 def tool_run_shell(context, args):
     command = str(args.get("command", "")).strip()
     if not command:
@@ -281,6 +335,14 @@ def tool_run_shell(context, args):
     if context.command_runner is None:
         raise RuntimeError("shell_runtime_unavailable: no execution runtime is attached to this transaction")
     return format_shell_result(context.command_runner.run(command, timeout=timeout))
+
+
+def tool_run_verification(context, args):
+    argv = args.get("argv")
+    timeout = int(args.get("timeout", 120))
+    if context.command_runner is None:
+        raise RuntimeError("shell_runtime_unavailable: no execution runtime is attached to this transaction")
+    return format_shell_result(context.command_runner.run_argv(argv, timeout=timeout))
 
 
 def tool_write_file(context, args):
@@ -323,7 +385,9 @@ _TOOL_RUNNERS = {
     "read_file": tool_read_file,
     "read_files": tool_read_files,
     "search": tool_search,
+    "inspect_repository": tool_inspect_repository,
     "run_shell": tool_run_shell,
+    "run_verification": tool_run_verification,
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,
 }

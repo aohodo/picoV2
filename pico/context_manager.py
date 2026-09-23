@@ -127,6 +127,14 @@ class ContextManager:
                 + "\n\n"
                 + request_text
             )
+            repository_evidence = str(interaction.get("repository_evidence", "")).strip()
+            if repository_evidence:
+                request_text = (
+                    "Repository navigation evidence (generated from source symbols and imports):\n"
+                    + repository_evidence
+                    + "\nUse this evidence to choose focused reads; refresh with inspect_repository only if needed.\n\n"
+                    + request_text
+                )
         section_texts = {
             "prefix": str(getattr(self.agent, "prefix", "")),
             "memory": "Memory:\n- disabled" if not memory_enabled else str(self.agent.memory_text()),
@@ -137,7 +145,10 @@ class ContextManager:
         if hasattr(self.agent, "render_checkpoint_text"):
             checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
         if checkpoint_text:
-            section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
+            # Checkpoint state is live task evidence, not stable prefix material.
+            # Keep it beside the untruncated current request so tool growth cannot
+            # silently push resume state outside the prefix budget.
+            section_texts[CURRENT_REQUEST_SECTION] = checkpoint_text + "\n\n" + request_text
         selected_notes = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
             selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
