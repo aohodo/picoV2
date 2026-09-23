@@ -22,12 +22,20 @@ class ModelCapabilities:
 
 
 @dataclass(frozen=True)
+class ModelToolCall:
+    name: str
+    args: dict = field(default_factory=dict)
+    call_id: str = ""
+
+
+@dataclass(frozen=True)
 class ModelTurn:
     kind: str
     text: str = ""
     tool_name: str = ""
     tool_args: dict = field(default_factory=dict)
     call_id: str = ""
+    tool_calls: tuple[ModelToolCall, ...] = field(default_factory=tuple)
     response_id: str = ""
     output_items: tuple = field(default_factory=tuple)
     response_status: str = ""

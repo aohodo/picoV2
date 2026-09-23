@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 from http.client import RemoteDisconnected
 
-from ..model_contract import ModelCapabilities, ModelTurn
+from ..model_contract import ModelCapabilities, ModelToolCall, ModelTurn
 
 OPENAI_COMPATIBLE_USER_AGENT = "pico/0.1"
 MAX_PROVIDER_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -158,17 +158,20 @@ def _normalize_versioned_base_url(base_url):
 
 
 def _extract_openai_text(data):
-    if data.get("output_text"):
+    if isinstance(data.get("output_text"), str) and data["output_text"]:
         return data["output_text"]
 
+    message_parts = []
     for item in data.get("output") or []:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or item.get("type") not in {None, "message"}:
             continue
         for content in item.get("content") or []:
             if isinstance(content, dict):
                 text = content.get("text")
-                if text:
-                    return text
+                if isinstance(text, str) and text:
+                    message_parts.append(text)
+    if message_parts:
+        return "\n".join(message_parts)
 
     choices = data.get("choices") or []
     if choices:
@@ -259,6 +262,7 @@ def _extract_usage_cache_details(data):
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "reasoning_tokens": (usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
         "total_tokens": usage.get("total_tokens"),
         "cached_tokens": cached_tokens,
         "cache_hit": cached_tokens > 0,
@@ -364,7 +368,17 @@ class OpenAICompatibleModelClient:
                     }
                     _backoff(attempt)
                     continue
-                raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
+                code = (
+                    "provider_authentication_failed"
+                    if exc.code in {401, 403}
+                    else "provider_http_error"
+                )
+                raise ProviderResponseError(
+                    code,
+                    f"OpenAI-compatible request failed with HTTP {exc.code}: {body}",
+                    retryable=_retryable_http_status(exc.code),
+                    attempts=attempt + 1,
+                ) from exc
             except (urllib.error.URLError, RemoteDisconnected, TimeoutError) as exc:
                 if attempt < attempts - 1:
                     self.last_completion_metadata = {
@@ -385,11 +399,14 @@ class OpenAICompatibleModelClient:
             try:
                 data = json.loads(body_text)
             except json.JSONDecodeError as exc:
-                raise RuntimeError(
+                raise ProviderResponseError(
+                    "provider_invalid_envelope",
                     "OpenAI-compatible error: backend returned non-JSON content that could not be parsed"
                 ) from exc
-        if data.get("error"):
-            raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
+        if isinstance(data, dict) and data.get("error"):
+            raise ProviderResponseError(
+                "provider_failed", f"OpenAI-compatible error: {data['error']}"
+            )
         data = _validate_openai_response_envelope(data)
         retries = int(self.last_completion_metadata.get("transport_retries", 0))
         self.last_completion_metadata = {
@@ -426,6 +443,9 @@ class OpenAICompatibleModelClient:
             payload["max_output_tokens"] = int(max_new_tokens)
         if tools:
             payload["tool_choice"] = "auto"
+            # Prefer serial decisions, but treat this as a preference: some
+            # compatible gateways still return batches, which must be retained.
+            payload["parallel_tool_calls"] = False
         if instructions:
             payload["instructions"] = str(instructions)
         data = self._request_responses(
@@ -443,12 +463,13 @@ class OpenAICompatibleModelClient:
                 response_status="incomplete",
                 incomplete_reason=_incomplete_reason(data),
             )
-        for item in output:
-            if item.get("type") != "function_call":
-                continue
-            raw_args = item.get("arguments") or "{}"
+        calls = [item for item in output if item.get("type") == "function_call"]
+        parsed_calls = []
+        call_ids = set()
+        for item in calls:
+            raw_args = item.get("arguments", "{}")
             try:
-                args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
                 return ModelTurn(
                     kind="invalid",
@@ -458,6 +479,11 @@ class OpenAICompatibleModelClient:
                     protocol_error=f"function call arguments are invalid JSON: {exc}",
                 )
             name = str(item.get("name", "")).strip()
+            if not isinstance(args, dict):
+                return ModelTurn(
+                    kind="invalid", response_status="completed",
+                    protocol_error="function call arguments must be an object",
+                )
             if not name:
                 return ModelTurn(
                     kind="invalid",
@@ -466,11 +492,32 @@ class OpenAICompatibleModelClient:
                     response_status="completed",
                     protocol_error="function call omitted its name",
                 )
+            call_id = str(item.get("call_id") or item.get("id") or "")
+            if call_id and call_id in call_ids:
+                return ModelTurn(
+                    kind="invalid",
+                    response_id=str(data.get("id", "")),
+                    output_items=output,
+                    response_status="completed",
+                    protocol_error="function calls have duplicate call IDs",
+                )
+            call_ids.add(call_id)
+            parsed_calls.append(
+                ModelToolCall(
+                    name=name,
+                    args=args,
+                    call_id=call_id,
+                )
+            )
+        if parsed_calls:
+            first = parsed_calls[0]
             return ModelTurn(
-                kind="tool",
-                tool_name=name,
-                tool_args=args,
-                call_id=str(item.get("call_id") or item.get("id") or ""),
+                kind="tool" if len(parsed_calls) == 1 else "tool_batch",
+                text=_extract_openai_text(data),
+                tool_name=first.name if len(parsed_calls) == 1 else "",
+                tool_args=first.args if len(parsed_calls) == 1 else {},
+                call_id=first.call_id if len(parsed_calls) == 1 else "",
+                tool_calls=tuple(parsed_calls),
                 response_id=str(data.get("id", "")),
                 output_items=output,
                 response_status="completed",

@@ -8,6 +8,7 @@ environment; it does not claim to be a host security sandbox.
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -145,12 +146,18 @@ class WorkspaceCommandRunner:
 
     @staticmethod
     def _run_process(argv, cwd, env, timeout):
+        process_options = {}
+        if os.name == "nt":
+            process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            process_options["start_new_session"] = True
         process = subprocess.Popen(
             argv,
             cwd=cwd,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            **process_options,
         )
         stdout_capture = _BoundedCapture()
         stderr_capture = _BoundedCapture()
@@ -169,7 +176,21 @@ class WorkspaceCommandRunner:
         try:
             exit_code = process.wait(timeout=int(timeout))
         except subprocess.TimeoutExpired as exc:
-            process.kill()
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=10,
+                )
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if process.poll() is None:
+                process.kill()
             process.wait()
             stdout_thread.join()
             stderr_thread.join()
@@ -228,6 +249,14 @@ class WorkspaceCommandRunner:
             raise ValueError("argv must contain an executable")
         if argv[0].lower() in {"python", "python.exe", "python3", "python3.exe"}:
             argv[0] = str(Path(sys.executable).resolve())
+        # An unqualified shell name refers to this workspace's selected shell,
+        # not a different installation (e.g. the Windows WSL launcher).
+        # Explicit executable paths keep their caller-requested meaning.
+        if (
+            self._profile is not None
+            and argv[0].casefold() in {self._profile.dialect, self._profile.dialect + ".exe"}
+        ):
+            argv[0] = self._profile.executable
         env = self.secret_boundary.build_sandbox_env(
             self.env_allowlist,
             extra={

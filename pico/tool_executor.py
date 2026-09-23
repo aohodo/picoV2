@@ -3,6 +3,7 @@
 import re
 from dataclasses import dataclass
 
+from .features import memory as memorylib
 from .interaction_policy import path_matches_patterns
 from .text_document import TextDecodingError, read_text_document
 from .workspace import clip
@@ -89,6 +90,22 @@ class ToolExecutor:
                     "progress_reason": evidence.reason,
                 }
             )
+        self.agent.session["execution_ledger"] = controller.ledger.to_dict()
+        if result.metadata.get("workspace_changed"):
+            interaction = dict(getattr(self.agent, "current_interaction", {}) or {})
+            requirements = self.agent.session.setdefault("transaction_requirements", {})
+            requirements["validation_required"] = bool(
+                requirements.get("validation_required")
+                or interaction.get("validation_required")
+            )
+            requirements["test_artifact_required"] = bool(
+                requirements.get("test_artifact_required")
+                or interaction.get("test_artifact_required")
+            )
+            requirements["protected_paths"] = sorted(
+                set(requirements.get("protected_paths", ()))
+                | set(interaction.get("protected_paths", ()))
+            )
         result.metadata.update(controller.metrics())
         return result
 
@@ -120,7 +137,7 @@ class ToolExecutor:
 
         interaction = getattr(agent, "current_interaction", {}) or {}
         if (
-            name in {"write_file", "patch_file"}
+            tool["risky"]
             and interaction
             and not interaction.get("mutation_allowed", True)
         ):
@@ -233,7 +250,8 @@ class ToolExecutor:
                     if error_code == "broad_exploration_after_grounding"
                     else (
                         f"error: material_action_required for {name}; the exploration budget is "
-                        "exhausted. Use write_file/patch_file, finalize from existing evidence, "
+                        "exhausted. Complete related edits with write_file/patch_file, use "
+                        "run_verification, read missing source at known targets, finalize from existing evidence, "
                         "or identify a blocker."
                     )
                     if error_code == "material_action_required"
@@ -267,7 +285,8 @@ class ToolExecutor:
         before_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
-            content = agent.redact_text(clip(tool["run"](args)))
+            raw_result = tool["run"](args)
+            content = agent.redact_text(clip(raw_result))
             if agent.transaction_context is not None:
                 agent.transaction_context.workspace.enforce_storage_limit()
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
@@ -301,11 +320,23 @@ class ToolExecutor:
                 executed=True,
                 validation=(name == "run_verification"),
             )
+            if hasattr(raw_result, "coverage"):
+                metadata["read_coverage"] = [
+                    {
+                        **item,
+                        "freshness": memorylib.file_freshness(
+                            item.get("path", ""), agent.root
+                        ),
+                    }
+                    for item in raw_result.coverage
+                ]
             agent.record_process_note_for_tool(name, metadata)
             if metadata["validation"]:
-                agent.last_verification_succeeded = tool_status == "ok"
+                agent.last_verification_succeeded = (
+                    tool_status == "ok" if not workspace_changed else None
+                )
                 agent.last_shell_validation_succeeded = agent.last_verification_succeeded
-                agent.verification_stale = False
+                agent.verification_stale = workspace_changed
             return self._finalize(name, args, ToolExecutionResult(content=content, metadata=metadata), progress_args=progress_args)
         except Exception as exc:  # noqa: BLE001 - arbitrary tool implementations terminate at this boundary
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
@@ -335,7 +366,7 @@ class ToolExecutor:
             if metadata["validation"]:
                 agent.last_verification_succeeded = False
                 agent.last_shell_validation_succeeded = False
-                agent.verification_stale = False
+                agent.verification_stale = workspace_changed
             return self._finalize(
                 name,
                 args,

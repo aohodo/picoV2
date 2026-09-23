@@ -25,7 +25,7 @@ class RunOutcome:
 
     @property
     def successful(self):
-        return self.status == "committed" and self.exit_code == EXIT_SUCCESS
+        return self.status in {"committed", "completed_with_pending_changes"} and self.exit_code == EXIT_SUCCESS
 
     def to_dict(self):
         return {
@@ -46,6 +46,8 @@ class RunOutcome:
         stop_reason = str(task_state.stop_reason or "")
         if task_state.status == "completed" and transaction_state == "COMMITTED":
             status, exit_code = "committed", EXIT_SUCCESS
+        elif task_state.status == "completed" and transaction_state in {"ACTIVE", "INTERRUPTED"}:
+            status, exit_code = "completed_with_pending_changes", EXIT_SUCCESS
         elif transaction_state == "COMMITTED":
             # The commit journal can prove that source delivery completed even
             # when the process died before TaskState/final-answer persistence.

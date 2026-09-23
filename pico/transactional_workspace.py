@@ -15,6 +15,9 @@ from .workspace import IGNORED_PATH_NAMES, remove_workspace_tree
 
 TRANSACTION_SCHEMA_VERSION = "tsw-v1"
 TERMINAL_STATES = {"COMMITTED", "DISCARDED"}
+REPAIRABLE_VERIFICATION_FAILURES = {
+    "verification_failed", "verification_required", "verification_stale",
+}
 COPY_EXCLUDES = set(IGNORED_PATH_NAMES) | {
     ".pico", ".venv", "venv", "node_modules", "target", "build", "dist",
     ".ssh", ".aws", ".azure", ".docker", ".gnupg", ".netrc", "_netrc", ".npmrc", ".pypirc",
@@ -279,6 +282,19 @@ class TransactionalWorkspace:
         elif instance.state == "ACTIVE":
             instance.state = "INTERRUPTED"
             instance._persist(recovered_from=data["state"])
+        elif instance.state == "CONFLICTED":
+            conflicts = data.get("conflicts", [])
+            if conflicts and all(
+                isinstance(item, dict)
+                and item.get("reason") in REPAIRABLE_VERIFICATION_FAILURES
+                for item in conflicts
+            ):
+                instance.state = "INTERRUPTED"
+                instance._persist(
+                    recovered_from=data["state"],
+                    interrupt_reason="validation_failed",
+                    conflicts=conflicts,
+                )
         return instance
 
     def journal_state(self):
@@ -457,9 +473,19 @@ class TransactionalWorkspace:
         return changes
 
     def interrupt(self, reason="interrupted"):
-        if self.state not in TERMINAL_STATES:
+        if self.state in {"ACTIVE", "STAGED", "VALIDATING", "INTERRUPTED"}:
             self.state = "INTERRUPTED"
             self._persist(interrupt_reason=reason)
+
+    def resume_editing(self):
+        """Reopen a preserved shadow for a new repair turn."""
+        if self.state not in {"ACTIVE", "INTERRUPTED"}:
+            raise RuntimeError(f"transaction cannot resume editing from {self.state}")
+        if self.state != "ACTIVE":
+            previous = self.state
+            self.state = "ACTIVE"
+            self._persist(resumed_from=previous)
+        return self
 
     def validate_commit(self):
         if self.state not in {"STAGED", "VALIDATING", "READY_FOR_REVIEW"}:
@@ -467,6 +493,11 @@ class TransactionalWorkspace:
         self.state = "VALIDATING"
         self._persist()
         changes = self.diff()
+        staged = json.loads(self.staged_path.read_text(encoding="utf-8"))
+        if changes != staged.get("changes"):
+            # Review and verification describe the staged change set. Reusing
+            # their authorization after a shadow edit would deliver other code.
+            return self.block_validation("staged_workspace_changed")
         conflicts = []
         current_paths = _git_view_paths(self.source_root) if self.backend_name == "git-shadow" else None
         current = _manifest(
@@ -499,8 +530,10 @@ class TransactionalWorkspace:
             raise RuntimeError(f"transaction cannot block validation from {self.state}")
         paths = [str(path) for path in paths if str(path)] or [""]
         conflicts = [{"path": path, "reason": str(reason)} for path in paths]
-        self.state = "CONFLICTED"
-        self._persist(conflicts=conflicts)
+        self.state = (
+            "INTERRUPTED" if reason in REPAIRABLE_VERIFICATION_FAILURES else "CONFLICTED"
+        )
+        self._persist(conflicts=conflicts, interrupt_reason=str(reason))
         return conflicts
 
     def commit(self):
@@ -618,7 +651,7 @@ class TransactionalWorkspace:
                 self.state = "RECOVERY_REQUIRED"
 
     def discard(self):
-        if self.state in {"COMMITTING", "COMMITTED"}:
+        if self.state in {"COMMITTING", "COMMITTED", "RECOVERY_REQUIRED"}:
             raise RuntimeError(f"transaction cannot discard from {self.state}")
         self.state = "DISCARDED"
         self._persist(discarded_at=_now())

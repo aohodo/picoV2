@@ -10,10 +10,12 @@ from .checkpoint import (
 )
 from .completion import CompletionAdmission
 from .context_projection import ContextProjector
+from .model_contract import ModelTurn
 from .progress import ProgressController
 from .providers.clients import ProviderResponseError
 from .session_store import SessionConflictError
 from .task_state import TaskState
+from .tool_executor import ToolExecutionResult
 from .tools import native_tool_definitions
 from .workspace import clip, now
 
@@ -214,6 +216,45 @@ class AgentLoop:
                 prompt_cache_retention="in_memory",
                 reasoning_effort=turn_policy.reasoning_effort,
             )
+        except ProviderResponseError as exc:
+            model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
+            completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
+            completion_metadata["requested_output_tokens"] = turn_policy.max_output_tokens
+            task_state.record_model_duration(
+                model_duration_ms,
+                completion_metadata.get("transport_retries", getattr(exc, "attempts", 1) - 1),
+            )
+            prompt_metadata.update(completion_metadata)
+            agent.last_completion_metadata = completion_metadata
+            agent.model_execution_policy.observe(turn_policy, completion_metadata)
+            agent.session["model_usage_samples"] = agent.model_execution_policy.usage_snapshot()
+            agent.last_prompt_metadata = prompt_metadata
+            if exc.code in {
+                "provider_incomplete",
+                "provider_empty_output",
+                "provider_invalid_envelope",
+            }:
+                kind = "incomplete" if exc.code == "provider_incomplete" else "invalid"
+                reason = agent.redact_text(str(exc))
+                agent.emit_trace(
+                    task_state,
+                    "model_parsed",
+                    {
+                        "kind": kind,
+                        "provider_error_code": exc.code,
+                        "duration_ms": model_duration_ms,
+                        "purpose": purpose,
+                        "native_tools": True,
+                    },
+                )
+                return ModelTurn(
+                    kind=kind,
+                    response_status="incomplete" if kind == "incomplete" else "",
+                    incomplete_reason=reason if kind == "incomplete" else "",
+                    protocol_error=reason if kind == "invalid" else "",
+                )
+            self._persist_model_failure(task_state, user_message, exc, run_started_at, prompt_metadata)
+            raise
         except Exception as exc:
             model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
             completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
@@ -254,6 +295,130 @@ class AgentLoop:
         )
         return turn
 
+    def _execute_tool_call(
+        self,
+        task_state,
+        user_message,
+        controller,
+        model_events,
+        name,
+        args,
+        call_id="",
+        deferred_reason="",
+    ):
+        """Execute and persist one auditable member of a model tool batch."""
+        agent = self.agent
+        if call_id:
+            model_events.append(
+                {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": json.dumps(
+                        args, ensure_ascii=False, sort_keys=True
+                    ),
+                }
+            )
+        agent.emit_trace(
+            task_state,
+            "tool_started",
+            {
+                "name": name,
+                "args": agent.compact_tool_args(args),
+                "next_step": task_state.tool_steps + 1,
+            },
+        )
+        tool_started_at = time.monotonic()
+        tool_result = (
+            ToolExecutionResult(
+                content=f"error: batch_call_deferred: {deferred_reason}",
+                metadata={"executed": False, "tool_status": "rejected",
+                          "tool_error_code": "batch_call_deferred"},
+            )
+            if deferred_reason
+            else agent.execute_tool(name, args)
+        )
+        result = tool_result.content
+        tool_duration_ms = int((time.monotonic() - tool_started_at) * 1000)
+        task_state.record_tool_duration(tool_duration_ms)
+        if call_id:
+            model_events.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": result,
+                    "_read_evidence": tool_result.metadata.get(
+                        "read_evidence", []
+                    ),
+                }
+            )
+            agent.record_model_events(
+                model_events, execution_ledger=controller.ledger.to_dict()
+            )
+        tool_metadata = dict(tool_result.metadata or {})
+        task_state.record_tool_evidence(name, args, tool_metadata)
+        if tool_metadata.get("executed"):
+            task_state.record_tool(
+                name,
+                workspace_changed=tool_metadata.get("workspace_changed", False),
+            )
+        task_state.record_progress(controller.metrics())
+        agent.record(
+            {
+                "role": "tool",
+                "name": name,
+                "args": args,
+                "content": result,
+                "read_evidence": tool_metadata.get("read_evidence", []),
+                "created_at": now(),
+            }
+        )
+        agent.run_store.write_task_state(task_state)
+        agent.emit_trace(
+            task_state,
+            "tool_executed",
+            {
+                "name": name,
+                "args": agent.compact_tool_args(args),
+                "result": clip(result, 500),
+                "duration_ms": tool_duration_ms,
+                **tool_metadata,
+            },
+        )
+        agent.emit_trace(
+            task_state,
+            "progress_observed",
+            {
+                "name": name,
+                "evidence": tool_metadata.get("progress_evidence", ""),
+                "reason": tool_metadata.get("progress_reason", ""),
+                "executed": bool(tool_metadata.get("executed")),
+                **controller.metrics(),
+            },
+        )
+        if tool_metadata.get("tool_error_code") == "repeated_no_progress":
+            agent.emit_trace(
+                task_state,
+                "repeated_action_blocked",
+                {"name": name, "args": args, **controller.metrics()},
+            )
+        checkpoint_trigger = (
+            "tool_executed" if tool_metadata.get("executed") else "tool_rejected"
+        )
+        checkpoint = agent.create_checkpoint(
+            task_state, user_message, trigger=checkpoint_trigger
+        )
+        agent.run_store.write_task_state(task_state)
+        agent.emit_trace(
+            task_state,
+            "checkpoint_created",
+            {
+                "checkpoint_id": checkpoint["checkpoint_id"],
+                "trigger": checkpoint_trigger,
+            },
+        )
+        return tool_metadata
+
     def _finish_success(self, task_state, user_message, final, run_started_at):
         agent = self.agent
         if agent.progress_controller is not None:
@@ -261,11 +426,28 @@ class AgentLoop:
         # Perform the session compare-and-swap before crossing the workspace
         # commit boundary. A stale concurrent session must not deliver code.
         agent.session_path = agent.session_store.save(agent.session)
-        outcome = agent.finalize_transaction()
+        pending_read_only = bool(
+            agent.transaction_context is not None
+            and not (agent.current_interaction or {}).get("mutation_allowed", False)
+            and agent.transaction_context.workspace.diff()
+        )
+        if pending_read_only:
+            transaction = agent.transaction_context.workspace
+            transaction.interrupt("read_only_followup")
+            outcome = {
+                "state": transaction.state,
+                "changes": transaction.diff(),
+                "conflicts": [],
+            }
+        else:
+            outcome = agent.finalize_transaction()
         task_state.transaction_state = outcome["state"]
         paths = [change["path"] for change in outcome.get("changes", [])]
         conflicts = list(outcome.get("conflicts", []))
-        if outcome["state"] == "COMMITTED":
+        if pending_read_only:
+            task_state.finish_success(final)
+            staged_paths, delivered_paths = paths, []
+        elif outcome["state"] == "COMMITTED":
             task_state.finish_success(final)
             staged_paths = delivered_paths = paths
         elif outcome["state"] == "READY_FOR_REVIEW":
@@ -274,7 +456,12 @@ class AgentLoop:
         else:
             validation_failed = any(
                 item.get("reason")
-                in {"verification_failed", "verification_stale", "verification_required"}
+                in {
+                    "verification_failed",
+                    "verification_stale",
+                    "verification_required",
+                    "required_test_artifact_missing",
+                }
                 for item in conflicts
             )
             scope_violation = any(
@@ -283,8 +470,8 @@ class AgentLoop:
             if validation_failed:
                 reason = "validation_failed"
                 final = (
-                    "Run did not complete: validation failed because required validation was "
-                    "not passed or became stale; staged changes were not delivered."
+                    "Run did not complete: validation failed because authoritative verification "
+                    "was missing, failed, or stale; staged changes were not delivered."
                 )
             elif scope_violation:
                 reason = "scope_constraint_violation"
@@ -322,7 +509,8 @@ class AgentLoop:
             },
         )
         agent.run_store.write_report(task_state, agent.redact_artifact(agent.build_report(task_state)))
-        agent.record_model_events([], execution_ledger={})
+        if outcome["state"] == "COMMITTED":
+            agent.record_model_events([], execution_ledger={})
         agent.progress_controller = None
         return final
 
@@ -363,15 +551,27 @@ class AgentLoop:
         close_errors = []
         transaction = getattr(agent, "transaction_context", None)
         staged_paths = []
+        delivered_paths = []
         if transaction is not None:
             try:
                 transaction.workspace.interrupt(stop_reason)
                 task_state.transaction_state = transaction.workspace.state
-                staged_paths = [change["path"] for change in transaction.workspace.diff()]
+                if transaction.workspace.state == "COMMITTED":
+                    delivered_paths = [
+                        change["path"]
+                        for change in transaction.workspace.committed_changes()
+                    ]
+                    staged_paths = list(delivered_paths)
+                else:
+                    staged_paths = [change["path"] for change in transaction.workspace.diff()]
             except Exception as exc:  # noqa: BLE001 - preserve the original failure while closing audit state
                 close_errors.append(agent.redact_text(str(exc)))
 
-        agent.capture_run_outcome(task_state, staged_paths=staged_paths)
+        agent.capture_run_outcome(
+            task_state,
+            staged_paths=staged_paths,
+            delivered_paths=delivered_paths,
+        )
         agent.run_store.write_task_state(task_state)
         checkpoint = None
         if stop_reason != "session_revision_conflict":
@@ -469,6 +669,8 @@ class AgentLoop:
 
         if agent.transaction_context is None:
             agent.begin_transaction()
+        elif interaction.get("mutation_allowed"):
+            agent.transaction_context.workspace.resume_editing()
         if interaction.get("mutation_allowed") and not agent.read_only:
             evidence = agent.repository_evidence(user_message)
             if evidence:
@@ -486,6 +688,7 @@ class AgentLoop:
             hard_discovery_limit=agent.hard_discovery_limit,
             ledger=agent.session.get("execution_ledger", {}),
             repository_evidence=agent.last_repository_evidence,
+            delivery_requirements=interaction,
         )
         agent.progress_controller = controller
         native_mode = bool(
@@ -520,6 +723,7 @@ class AgentLoop:
         contract_failure_final = None
         contract_failures = 0
         contract_failure_reason = ""
+        completion_failure_reason = ""
         model_notice = ""
         request_profile = interaction["request_profile"]
         prompt_metadata_base = {
@@ -536,6 +740,7 @@ class AgentLoop:
         # 4. 记录：把结果写回 history / task_state / trace / memory
         # 然后进入下一轮，直到停机条件满足
         while task_state.tool_steps < agent.max_steps and attempts < max_attempts:
+            controller.set_remaining_steps(agent.max_steps - task_state.tool_steps)
             attempts += 1
             task_state.record_attempt()
             agent.run_store.write_task_state(task_state)
@@ -569,6 +774,7 @@ class AgentLoop:
                 prompt = ""
             else:
                 prompt, prompt_metadata = agent._build_prompt_and_metadata(user_message)
+                controller.set_visible_text_context(prompt)
             if combined_notice:
                 if not native_mode:
                     prompt += "\n\n" + combined_notice
@@ -664,8 +870,8 @@ class AgentLoop:
                     turn_policy=turn_policy,
                 )
                 raw = agent.redact_text(native_turn.text)
-                if native_turn.kind == "tool":
-                    kind = "tool"
+                if native_turn.kind in {"tool", "tool_batch"}:
+                    kind = native_turn.kind
                     payload = {
                         "name": native_turn.tool_name,
                         "args": agent.redact_artifact(native_turn.tool_args),
@@ -690,7 +896,7 @@ class AgentLoop:
                     turn_policy=turn_policy,
                 )
 
-            if kind == "tool":
+            if kind in {"tool", "tool_batch"}:
                 if contract_failures:
                     task_state.record_model_recovery()
                     agent.emit_trace(
@@ -699,100 +905,57 @@ class AgentLoop:
                         {
                             "previous_failure": contract_failure_reason,
                             "recovery_attempts": contract_failures,
-                            "kind": "tool",
+                            "kind": kind,
                         },
                     )
                 contract_failures = 0
                 contract_failure_reason = ""
-                name = payload.get("name", "")
-                args = payload.get("args", {})
-                call_id = ""
-                if native_turn is not None:
-                    call_id = native_turn.call_id or f"call_{attempts}"
-                    model_events.append(
-                        {
-                            "type": "function_call",
-                            "call_id": call_id,
-                            "name": name,
-                            "arguments": json.dumps(args, ensure_ascii=False, sort_keys=True),
-                        }
+                if native_turn is not None and raw.strip():
+                    # Preserve the assistant's public plan/preamble alongside
+                    # its actions. Never replay opaque provider reasoning items.
+                    model_events.append({"role": "assistant", "content": raw})
+                if native_turn is not None and native_turn.tool_calls:
+                    calls = [
+                        (
+                            call.name,
+                            agent.redact_artifact(call.args),
+                            call.call_id or f"call_{attempts}_{index}",
+                        )
+                        for index, call in enumerate(native_turn.tool_calls, 1)
+                    ]
+                else:
+                    calls = [
+                        (
+                            payload.get("name", ""),
+                            payload.get("args", {}),
+                            (
+                                native_turn.call_id or f"call_{attempts}"
+                                if native_turn is not None
+                                else ""
+                            ),
+                        )
+                    ]
+                deferred_reason = ""
+                for name, args, call_id in calls:
+                    if task_state.tool_steps >= agent.max_steps:
+                        deferred_reason = "the configured tool budget was exhausted"
+                    controller.set_remaining_steps(
+                        agent.max_steps - task_state.tool_steps
                     )
-                agent.emit_trace(
-                    task_state,
-                    "tool_started",
-                    {
-                        "name": name,
-                        "args": agent.compact_tool_args(args),
-                        "next_step": task_state.tool_steps + 1,
-                    },
-                )
-                tool_started_at = time.monotonic()
-                tool_result = agent.execute_tool(name, args)
-                result = tool_result.content
-                tool_duration_ms = int((time.monotonic() - tool_started_at) * 1000)
-                task_state.record_tool_duration(tool_duration_ms)
-                if native_turn is not None:
-                    model_events.append(
-                        {"type": "function_call_output", "call_id": call_id, "output": result}
-                    )
-                    agent.record_model_events(model_events, execution_ledger=controller.ledger.to_dict())
-                tool_metadata = dict(tool_result.metadata or {})
-                task_state.record_tool_evidence(name, args, tool_metadata)
-                if tool_metadata.get("executed"):
-                    task_state.record_tool(
-                        name,
-                        workspace_changed=tool_metadata.get("workspace_changed", False),
-                    )
-                task_state.record_progress(controller.metrics())
-                agent.record(
-                    {
-                        "role": "tool",
-                        "name": name,
-                        "args": args,
-                        "content": result,
-                        "created_at": now(),
-                    }
-                )
-                agent.run_store.write_task_state(task_state)
-                agent.emit_trace(
-                    task_state,
-                    "tool_executed",
-                    {
-                        "name": name,
-                        "args": agent.compact_tool_args(args),
-                        "result": clip(result, 500),
-                        "duration_ms": tool_duration_ms,
-                        **tool_metadata,
-                    },
-                )
-                agent.emit_trace(
-                    task_state,
-                    "progress_observed",
-                    {
-                        "name": name,
-                        "evidence": tool_metadata.get("progress_evidence", ""),
-                        "reason": tool_metadata.get("progress_reason", ""),
-                        "executed": bool(tool_metadata.get("executed")),
-                        **controller.metrics(),
-                    },
-                )
-                if tool_metadata.get("tool_error_code") == "repeated_no_progress":
-                    agent.emit_trace(
+                    metadata = self._execute_tool_call(
                         task_state,
-                        "repeated_action_blocked",
-                        {"name": name, "args": args, **controller.metrics()},
+                        user_message,
+                        controller,
+                        model_events,
+                        name,
+                        args,
+                        call_id=call_id,
+                        deferred_reason=deferred_reason,
                     )
-                checkpoint_trigger = "tool_executed" if tool_metadata.get("executed") else "tool_rejected"
-                checkpoint = agent.create_checkpoint(task_state, user_message, trigger=checkpoint_trigger)
-                agent.run_store.write_task_state(task_state)
-                agent.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": checkpoint_trigger,
-                    },
-                )
+                    if metadata.get("tool_status") != "ok":
+                        deferred_reason = (
+                            "an earlier call failed; inspect its result before requesting further actions"
+                        )
                 if controller.state.stuck_detected:
                     stuck_final = (
                         "Stopped because the agent continued without observable progress after "
@@ -801,7 +964,7 @@ class AgentLoop:
                     agent.emit_trace(
                         task_state,
                         "agent_stuck",
-                        {"name": name, **controller.metrics()},
+                        {"name": calls[-1][0], **controller.metrics()},
                     )
                     break
                 continue
@@ -865,7 +1028,7 @@ class AgentLoop:
                     break
                 model_notice = (
                     "Runtime notice: the previous model response was not complete and was rejected "
-                    f"({payload}). Produce exactly one complete function call or final answer."
+                    f"({payload}). Return complete function calls with valid arguments, or a final answer."
                 )
                 agent.record({"role": "assistant", "content": payload, "created_at": now()})
                 agent.run_store.write_task_state(task_state)
@@ -885,6 +1048,25 @@ class AgentLoop:
                 )
             contract_failure_reason = ""
             final = (payload or raw).strip()
+            if interaction.get("mutation_allowed") and not agent.read_only:
+                completion_failure_reason = agent.verification_failure_reason()
+                if completion_failure_reason:
+                    # A final message is a proposal, not a workspace commit.
+                    # Give the model the same authoritative failure the commit
+                    # boundary would return, while there is still room to act.
+                    model_notice = (
+                        "Runtime verification feedback: completion was not accepted "
+                        f"({completion_failure_reason}). Staged changes are preserved. "
+                        "Inspect the test results, repair failures if needed, and run "
+                        "the required verification on the current code before finishing."
+                    )
+                    agent.emit_trace(
+                        task_state,
+                        "completion_deferred",
+                        {"reason": completion_failure_reason},
+                    )
+                    agent.run_store.write_task_state(task_state)
+                    continue
             return self._finish_success(task_state, user_message, final, run_started_at)
 
         if task_state.tool_steps >= agent.max_steps:
@@ -1060,6 +1242,12 @@ class AgentLoop:
         elif contract_failure_final is not None:
             final = contract_failure_final
             task_state.stop_retry_limit(final)
+        elif completion_failure_reason:
+            final = (
+                "Run did not complete: authoritative verification remained "
+                f"unsatisfied ({completion_failure_reason}); staged changes were not delivered."
+            )
+            task_state.stop("validation_failed", status="failed", final_answer=final)
         elif attempts >= max_attempts and task_state.tool_steps < agent.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
             task_state.stop_retry_limit(final)

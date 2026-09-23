@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,9 +22,8 @@ JAVA_TYPE = re.compile(
     r"(?:class|interface|enum|record)\s+(\w+)"
 )
 JAVA_METHOD = re.compile(
-    r"(?m)^\s*(?:@[\w.]+(?:\([^\n]*\))?\s*)*"
-    r"(?:public|protected|private|static|final|synchronized|abstract|native|default|strictfp|\s)+"
-    r"[\w.$<>?,\[\]\s]+\s+(\w+)\s*\([^;{}]*\)\s*(?:throws\s+[^{]+)?\{"
+    r"(?m)^[ \t]*(?:[\w.$<>?,\[\]]+[ \t]+)+"
+    r"(\w+)[ \t]*\([^;{}]*\)[ \t]*(?:throws[ \t]+[^{;]+)?\{"
 )
 
 
@@ -33,6 +33,8 @@ class Symbol:
     kind: str
     line: int
     column: int = 0
+    end_line: int = 0
+    calls: tuple[str, ...] = ()
 
 
 @dataclass
@@ -58,6 +60,14 @@ class RepositoryGraphEvidence:
     truncated: bool
     matches: tuple[RankedSourceNode, ...]
     reverse: dict[str, frozenset[str]] = field(default_factory=dict, compare=False, repr=False)
+    definitions: tuple[tuple[str, str, int, int], ...] = ()
+
+    def relevant_symbols(self, node):
+        tokens = RepositoryGraph._query_tokens(self.query)
+        return sorted(node.symbols, key=lambda s: (
+            -sum(2 if token == s.name.casefold() else 1
+                 for token in tokens if token in s.name.casefold()), s.line
+        ))[:20]
 
     @property
     def paths(self):
@@ -82,10 +92,14 @@ class RepositoryGraphEvidence:
                 f"confidence={self.confidence} query={self.query!r}"
             )
         ]
+        if self.definitions:
+            lines.append("definition candidates (name matches, not proven dynamic dispatch; read these ranges):")
+            for name, path, start, end in self.definitions:
+                lines.append(f"  {name}: {path}:{start}-{end}")
         for item in self.matches:
             score, node = item.score, item.node
             symbols = ", ".join(
-                f"{symbol.kind}:{symbol.name}@{symbol.line}" for symbol in node.symbols[:20]
+                f"{symbol.kind}:{symbol.name}@{symbol.line}" for symbol in self.relevant_symbols(node)
             ) or "none"
             imports = ", ".join(node.imports[:12]) or "none"
             inbound = ", ".join(sorted(self.reverse.get(node.path, ()))[:12]) or "none"
@@ -128,31 +142,52 @@ class RepositoryGraph:
         selected = [(score, node) for score, node in ranked if score > 0][: max(1, min(int(limit), 30))]
         if not selected:
             selected = ranked[: max(1, min(int(limit), 30))]
+        # Follow calls only from symbols explicitly named by the query. A file
+        # match alone does not justify expanding every function in that file.
+        called_names = set()
+        for _, node in selected:
+            for symbol in node.symbols:
+                if symbol.name.casefold() in tokens:
+                    called_names.update(symbol.calls)
+        definitions = []
+        for node in nodes:
+            for symbol in node.symbols:
+                if symbol.name in called_names or symbol.name.casefold() in tokens:
+                    definitions.append((symbol.name, node.path, symbol.line,
+                                        symbol.end_line or symbol.line))
         return RepositoryGraphEvidence(
             query=query,
             total_files=len(nodes),
             truncated=truncated,
             matches=tuple(RankedSourceNode(score, node) for score, node in selected),
             reverse={path: frozenset(items) for path, items in reverse.items()},
+            definitions=tuple(definitions[:max(1, min(int(limit), 30))]),
         )
 
     def _build(self):
         paths = []
         truncated = False
-        for path in sorted(self.root.rglob("*"), key=lambda item: item.as_posix().casefold()):
-            if not path.is_file() or path.suffix.casefold() not in SOURCE_SUFFIXES:
-                continue
-            relative = path.relative_to(self.root)
-            if any(part in IGNORED_PATH_NAMES or part in {"target", "build", "dist", "node_modules"} for part in relative.parts):
-                continue
-            if len(paths) >= self.max_files:
-                truncated = True
+        excluded = IGNORED_PATH_NAMES | {"target", "build", "dist", "node_modules"}
+        for directory, directories, files in os.walk(self.root, followlinks=False):
+            directories[:] = sorted(
+                (name for name in directories if name not in excluded
+                 and not (Path(directory) / name).is_symlink()), key=str.casefold
+            )
+            for name in sorted(files, key=str.casefold):
+                path = Path(directory) / name
+                if path.suffix.casefold() not in SOURCE_SUFFIXES:
+                    continue
+                if len(paths) >= self.max_files:
+                    truncated = True
+                    break
+                try:
+                    path.resolve().relative_to(self.root)
+                    if path.stat().st_size <= MAX_SOURCE_BYTES:
+                        paths.append(path)
+                except (OSError, ValueError):
+                    continue
+            if truncated:
                 break
-            try:
-                if path.stat().st_size <= MAX_SOURCE_BYTES:
-                    paths.append(path)
-            except OSError:
-                continue
         nodes = []
         for path in paths:
             try:
@@ -191,6 +226,13 @@ class RepositoryGraph:
                         kind,
                         int(item.lineno),
                         column if column >= 0 else int(item.col_offset),
+                        int(item.end_lineno or item.lineno),
+                        tuple(sorted({
+                            call.func.attr if isinstance(call.func, ast.Attribute) else call.func.id
+                            for call in ast.walk(item)
+                            if isinstance(call, ast.Call)
+                            and isinstance(call.func, (ast.Name, ast.Attribute))
+                        })) if kind == "function" else (),
                     )
                 )
             elif isinstance(item, ast.Import):
@@ -208,26 +250,38 @@ class RepositoryGraph:
         package = package_match.group(1) if package_match else ""
         node = SourceNode(path=relative, language="java", module=package)
         node.imports = sorted(set(JAVA_IMPORT.findall(text)))
+        # Blank comments and literals while preserving positions/line numbers.
+        syntax = re.sub(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
+                        lambda match: re.sub(r'[^\n]', ' ', match[0]), text)
         for match in JAVA_TYPE.finditer(text):
             line_start = text.rfind("\n", 0, match.start(1)) + 1
             node.symbols.append(
                 Symbol(
                     match.group(1),
                     "type",
-                    text.count("\n", 0, match.start()) + 1,
+                    text.count("\n", 0, match.start(1)) + 1,
                     match.start(1) - line_start,
                 )
             )
-        for match in JAVA_METHOD.finditer(text):
+        for match in JAVA_METHOD.finditer(syntax):
             name = match.group(1)
             if name not in {"if", "for", "while", "switch", "catch", "return", "new"}:
                 line_start = text.rfind("\n", 0, match.start(1)) + 1
+                opening = match.end() - 1
+                depth, closing = 1, opening + 1
+                while closing < len(syntax) and depth:
+                    depth += (syntax[closing] == "{") - (syntax[closing] == "}")
+                    closing += 1
+                calls = tuple(sorted(set(re.findall(r"\b([A-Za-z_$][\w$]*)\s*\(", syntax[opening + 1:closing]))
+                                     - {"if", "for", "while", "switch", "catch", "synchronized"}))
                 node.symbols.append(
                     Symbol(
                         name,
                         "method",
-                        text.count("\n", 0, match.start()) + 1,
+                        text.count("\n", 0, match.start(1)) + 1,
                         match.start(1) - line_start,
+                        text.count("\n", 0, closing) + 1,
+                        calls,
                     )
                 )
         node.symbols.sort(key=lambda symbol: (symbol.line, symbol.name))
@@ -236,6 +290,7 @@ class RepositoryGraph:
     @staticmethod
     def _query_tokens(query):
         tokens = {token.casefold() for token in TOKEN_PATTERN.findall(query) if len(token) > 1}
+        tokens.update(token.rsplit(".", 1)[-1] for token in tuple(tokens) if "." in token)
         return tokens or {query.casefold()}
 
     @staticmethod

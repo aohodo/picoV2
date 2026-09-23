@@ -207,6 +207,8 @@ class TaskState:
         return self
 
     def record_progress(self, metrics):
+        if metrics.get("validation_status"):
+            self.validation_status = str(metrics["validation_status"])
         self.blocked_repeats = int(metrics.get("blocked_repeats", self.blocked_repeats))
         self.intervention_count = int(metrics.get("intervention_count", self.intervention_count))
         self.max_discovery_streak = int(metrics.get("max_discovery_streak", self.max_discovery_streak))

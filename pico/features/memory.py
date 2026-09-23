@@ -607,6 +607,12 @@ def invalidate_file_summary(state, path, workspace_root=None):
     if not path:
         return state
     state["file_summaries"].pop(path, None)
+    state["episodic_notes"] = [
+        item
+        for item in state["episodic_notes"]
+        if item.get("source") != path and path not in item.get("tags", [])
+    ]
+    state["notes"] = [item["text"] for item in state["episodic_notes"]]
     return state
 
 
@@ -619,6 +625,12 @@ def invalidate_stale_file_summaries(state, workspace_root=None):
             continue
         invalidated.append(path)
         state["file_summaries"].pop(path, None)
+        state["episodic_notes"] = [
+            item
+            for item in state["episodic_notes"]
+            if item.get("source") != path and path not in item.get("tags", [])
+        ]
+    state["notes"] = [item["text"] for item in state["episodic_notes"]]
     return state, invalidated
 
 

@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from .features import memory as memorylib
+
 DEFAULT_TOTAL_BUDGET = 12000
 DEFAULT_SECTION_BUDGETS = {
     "prefix": 3600,
@@ -95,6 +97,7 @@ class ContextManager:
         的最后一道组装工序。`WorkspaceContext` 提供稳定前缀，`LayeredMemory`
         提供工作记忆，这个函数则把它们和当前请求合成一份可控大小的 prompt。
         """
+        self.agent.invalidate_stale_memory()
         user_message = str(user_message)
         self.section_floors = self._compute_section_floors()
         memory_enabled = True
@@ -328,7 +331,7 @@ class ContextManager:
         return max(1, usable // note_count)
 
     def _render_history_section(self, budget):
-        history = list(getattr(self.agent, "session", {}).get("history", []))
+        history = self._current_history()
         raw = self._raw_history_text(history)
         if not history:
             rendered = "Transcript:\n- empty"
@@ -390,6 +393,31 @@ class ContextManager:
                 **history_details,
             },
         )
+
+    def _current_history(self):
+        history = list(getattr(self.agent, "session", {}).get("history", []))
+        current = []
+        for item in history:
+            if item.get("role") != "tool" or item.get("name") not in {
+                "read_file",
+                "read_files",
+            }:
+                current.append(item)
+                continue
+            evidence = item.get("read_evidence")
+            if not evidence:
+                continue
+            if any(
+                record.get("freshness") is None
+                or record.get("freshness")
+                != memorylib.file_freshness(
+                    record.get("path", ""), self.agent.root
+                )
+                for record in evidence
+            ):
+                continue
+            current.append(item)
+        return current
 
     def _compressed_history_entries(self, history, recent_start):
         entries = []

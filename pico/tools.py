@@ -4,12 +4,15 @@
 如何做参数校验，以及最终如何执行，都是在这里定义的。
 """
 
+import re
 from functools import partial
 
 from .execution import format_shell_result
 from .path_support import logical_path, native_path
+from .progress import is_repository_read_argv
+from .read_observation import render_reads
 from .text_document import TextDecodingError, read_text_document, write_text_document
-from .workspace import IGNORED_PATH_NAMES
+from .workspace import IGNORED_PATH_NAMES, MAX_TOOL_OUTPUT
 
 BASE_TOOL_SPECS = {
     "list_files": {
@@ -30,7 +33,7 @@ BASE_TOOL_SPECS = {
     "search": {
         "schema": {"pattern": "str", "path": "str='.'"},
         "risky": False,
-        "description": "Search the workspace with rg or a simple fallback.",
+        "description": "Search using a case-insensitive Python regular expression. Escape punctuation for literal matching. Returns file:line evidence.",
     },
     "inspect_repository": {
         "schema": {"query": "str", "limit": "int=12"},
@@ -50,7 +53,7 @@ BASE_TOOL_SPECS = {
         "risky": True,
         "description": (
             "Run one test, build, lint, or type-check executable directly and record its real exit status. "
-            "Use this instead of run_shell for verification."
+            "Use this instead of run_shell for verification; repository inspection commands are rejected."
         ),
     },
     "write_file": {
@@ -183,6 +186,10 @@ def validate_tool(context, name, args):
         pattern = str(args.get("pattern", "")).strip()
         if not pattern:
             raise ValueError("pattern must not be empty")
+        try:
+            re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            raise ValueError(f"invalid regular expression: {exc}") from exc
         context.path(args.get("path", "."))
         return
 
@@ -213,6 +220,11 @@ def validate_tool(context, name, args):
             or any(not isinstance(item, str) or not item.strip() for item in argv)
         ):
             raise ValueError("argv must be a non-empty list of at most 64 non-empty strings")
+        if is_repository_read_argv(argv):
+            raise ValueError(
+                "argv is a repository inspection command, not verification; use list_files, "
+                "read_file, read_files, search, or inspect_repository"
+            )
         timeout = int(args.get("timeout", 120))
         if timeout < 1 or timeout > 120:
             raise ValueError("timeout must be in [1, 120]")
@@ -278,24 +290,28 @@ def tool_read_file(context, args):
         raise ValueError("invalid line range")
     document = read_text_document(path)
     lines = document.text.splitlines()
-    body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
-    return f"# {path.relative_to(context.root)} [encoding={document.encoding}]\n{body}"
+    return render_reads([(path.relative_to(context.root).as_posix(), document.encoding,
+                          lines, start, end)], MAX_TOOL_OUTPUT)
 
 
 def tool_read_files(context, args):
     paths = args.get("paths")
     if not isinstance(paths, list) or not paths or len(paths) > 12:
         raise ValueError("paths must be a non-empty list with at most 12 items")
-    return "\n\n".join(
-        tool_read_file(context, {"path": raw_path, "start": 1, "end": 500})
-        for raw_path in paths
-    )
+    documents = []
+    for raw_path in paths:
+        path = context.path(raw_path)
+        document = read_text_document(path)
+        documents.append((path.relative_to(context.root).as_posix(), document.encoding,
+                          document.text.splitlines(), 1, 500))
+    return render_reads(documents, MAX_TOOL_OUTPUT)
 
 
 def tool_search(context, args):
     pattern = str(args.get("pattern", "")).strip()
     if not pattern:
         raise ValueError("pattern must not be empty")
+    expression = re.compile(pattern, re.IGNORECASE)
     path = context.path(args.get("path", "."))
 
     matches = []
@@ -310,7 +326,7 @@ def tool_search(context, args):
         except (OSError, TextDecodingError):
             continue
         for number, line in enumerate(document.text.splitlines(), start=1):
-            if pattern.lower() in line.lower():
+            if expression.search(line):
                 matches.append(f"{file_path.relative_to(context.root)}:{number}:{line}")
                 if len(matches) >= 200:
                     return "\n".join(matches)

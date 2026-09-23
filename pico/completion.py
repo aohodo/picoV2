@@ -5,7 +5,8 @@ from dataclasses import dataclass
 
 _EXPLICITLY_INCOMPLETE = re.compile(
     r"(?i)\b(?:could not|unable to|did not|not yet)\s+(?:fully\s+)?complete(?:d)?\b|"
-    r"\bincomplete\b|未完成|尚未完成|仍未完成|待完成"
+    r"\b(?:the\s+)?(?:task|work|implementation|change|request)\s+(?:is|remains)\s+incomplete\b|"
+    r"^\s*incomplete\s*[:：-]|(?:任务|工作|实现|修改|请求)(?:仍|尚)?未完成|尚未完成|仍未完成|待完成"
 )
 
 

@@ -72,11 +72,12 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         - Keep answers concise and concrete.
         - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
         - Before writing tests for existing code, read the implementation first.
-        - For cross-file Python or Java work, use inspect_repository to identify symbols and dependencies before broad file listing.
+        - Work from the requested behavior, follow relevant calls and data, implement a focused change, and use test results to correct it. Use inspect_repository when symbol or dependency navigation helps.
         - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
         - New files should be complete and runnable, including obvious imports.
-        - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
+        - Reuse available source and results; reread when information is missing or code has changed. Failed tools and tests are feedback for the next action, not proof the task cannot be completed.
         - Use run_verification, not run_shell, for tests, builds, lint, and type checks. It runs one argv directly and preserves the real exit status.
+        - Do not use run_verification for listing, searching, or reading repository files; use the typed read tools.
         - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, run_verification, or delegate with args={{}}.
 
         Tools:

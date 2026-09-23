@@ -17,7 +17,7 @@ from . import security as securitylib
 from . import tools as toolkit
 from .checkpoint import CHECKPOINT_NONE_STATUS
 from .context_manager import ContextManager
-from .context_projection import project_model_events
+from .context_projection import ContextProjector, project_model_events
 from .execution import ExecutionLease, WorkspaceCommandRunner
 from .execution_policy import ModelExecutionPolicy
 from .features import memory as memorylib
@@ -293,7 +293,26 @@ class Pico:
         return values
 
     def interaction_contract(self, user_message):
-        return build_interaction_contract(user_message, self.effective_package_layout())
+        contract = build_interaction_contract(
+            user_message, self.effective_package_layout()
+        )
+        continuation = str(user_message or "").strip().casefold() in {
+            "continue", "continue.", "继续", "继续吧", "好的，继续", "ok, continue",
+        }
+        requirements = dict(self.session.get("transaction_requirements", {}) or {})
+        if continuation and self.transaction_context is not None and requirements:
+            contract["mode"] = "implement"
+            contract["mutation_allowed"] = True
+            contract["validation_required"] = bool(
+                requirements.get("validation_required")
+            )
+            contract["test_artifact_required"] = bool(
+                requirements.get("test_artifact_required")
+            )
+            contract["protected_paths"] = list(
+                requirements.get("protected_paths", ())
+            )
+        return contract
 
     def repository_evidence(self, user_message, limit=10):
         try:
@@ -456,6 +475,8 @@ class Pico:
                 context.execution_lease.stop()
             self.transaction_context = None
             self.session.pop("active_transaction_id", None)
+            self.session.pop("transaction_requirements", None)
+            self.session["execution_ledger"] = {}
         self.tools = self._apply_tool_allowlist(self.build_tools())
         self._apply_prefix_state(self.build_prefix())
         self.session_path = self.session_store.save(self.session)
@@ -466,7 +487,11 @@ class Pico:
             return {"state": "COMMITTED", "changes": [], "conflicts": []}
         transaction = context.workspace
         changes = transaction.stage()
-        protected_paths = list((self.current_interaction or {}).get("protected_paths", []))
+        requirements = dict(self.session.get("transaction_requirements", {}) or {})
+        protected_paths = sorted(
+            set(requirements.get("protected_paths", ()))
+            | set((self.current_interaction or {}).get("protected_paths", ()))
+        )
         scope_violations = [
             change["path"]
             for change in changes
@@ -478,18 +503,9 @@ class Pico:
                 paths=scope_violations,
             )
             return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
-        if self.verification_stale:
-            conflicts = transaction.block_validation("verification_stale")
-            return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
-        if self.last_verification_succeeded is False:
-            conflicts = transaction.block_validation("verification_failed")
-            return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
-        if (
-            changes
-            and (self.current_interaction or {}).get("validation_required")
-            and self.last_verification_succeeded is not True
-        ):
-            conflicts = transaction.block_validation("verification_required")
+        verification_error = self.verification_failure_reason(changes)
+        if verification_error:
+            conflicts = transaction.block_validation(verification_error)
             return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
         conflicts = transaction.validate_commit()
         if conflicts:
@@ -501,6 +517,51 @@ class Pico:
             self._restore_source_view(clear_context=True)
             return result
         return {"state": transaction.state, "changes": changes, "conflicts": []}
+
+    def verification_failure_reason(self, changes=None):
+        """Inspect delivery evidence without staging or closing the repair cycle."""
+        if self.transaction_context is None or not self.transaction_context.owns_context:
+            return ""
+        if changes is None:
+            changes = self.transaction_context.workspace.diff()
+        requirements = dict(self.session.get("transaction_requirements", {}) or {})
+        ledger = (
+            self.progress_controller.ledger
+            if self.progress_controller is not None
+            else ExecutionLedger.from_dict(self.session.get("execution_ledger", {}))
+        )
+        validation_records = [
+            item
+            for item in ledger.validations
+            if item.get("kind") == "validation"
+        ]
+        unresolved_failures = bool(
+            ledger.unresolved_failures or ledger.unresolved_failure_count
+        )
+        unverified_changes = bool(
+            ledger.unverified_changes or ledger.unverified_change_count
+        )
+        validation_passed = bool(
+            any(item.get("status") == "ok" for item in validation_records)
+            and not unresolved_failures
+            and not unverified_changes
+        )
+        if unresolved_failures:
+            return "verification_failed"
+        if self.verification_stale or (validation_records and unverified_changes):
+            return "verification_stale"
+        if self.last_verification_succeeded is False:
+            return "verification_failed"
+        if (
+            changes
+            and (
+                requirements.get("validation_required")
+                or (self.current_interaction or {}).get("validation_required")
+            )
+            and not (validation_passed or self.last_verification_succeeded is True)
+        ):
+            return "verification_required"
+        return ""
 
     def capture_run_outcome(self, task_state, staged_paths=(), delivered_paths=(), conflicts=()):
         outcome = RunOutcome.from_task_state(
@@ -591,6 +652,12 @@ class Pico:
                     item["args"] = self.compact_tool_args(
                         raw_args if isinstance(raw_args, dict) else {}
                     )
+                    raw_evidence = item.get("read_evidence", [])
+                    item["read_evidence"] = [
+                        dict(record)
+                        for record in raw_evidence
+                        if isinstance(record, dict)
+                    ]
                 normalized_history.append(item)
             self.session["history"] = normalized_history
         memory = self.session.setdefault("memory", memorylib.default_memory_state())
@@ -601,7 +668,9 @@ class Pico:
             self.session["model_events"] = []
         else:
             self.session["model_events"], _ = project_model_events(
-                model_events, event_limit=24
+                model_events,
+                event_limit=None,
+                char_budget=ContextProjector(self).event_char_budget,
             )
         usage_samples = self.session.setdefault("model_usage_samples", [])
         if not isinstance(usage_samples, list):
@@ -809,7 +878,11 @@ class Pico:
         return compact
 
     def record_model_events(self, events, execution_ledger=None):
-        projected, _ = project_model_events(events, event_limit=24)
+        projected, _ = project_model_events(
+            events,
+            event_limit=None,
+            char_budget=ContextProjector(self).event_char_budget,
+        )
         self.session["model_events"] = self.redact_artifact(projected)
         if execution_ledger is not None:
             self.session["execution_ledger"] = self.redact_artifact(execution_ledger)
@@ -1091,7 +1164,7 @@ class Pico:
         if direct_transaction and self.commit_policy == "auto" and result.metadata.get("read_only") is False:
             if result.metadata.get("tool_status") == "ok":
                 outcome = self.finalize_transaction()
-                if outcome["state"] == "CONFLICTED":
+                if outcome.get("conflicts"):
                     return "error: workspace conflict: " + json.dumps(outcome["conflicts"], ensure_ascii=False)
             else:
                 self.interrupt_transaction(result.metadata.get("tool_error_code") or "tool_failed")

@@ -86,6 +86,9 @@ class RepositoryEvidenceBundle:
     @property
     def paths(self):
         paths = list(self.graph.paths)
+        for _, path, _, _ in self.graph.definitions:
+            if path not in paths:
+                paths.append(path)
         for location in self.semantic.locations:
             if location.path not in paths:
                 paths.append(location.path)
@@ -103,6 +106,13 @@ class RepositoryEvidenceBundle:
             "confidence": self.confidence,
             "semantic_backend": self.semantic.backend,
             "semantic_status": self.semantic.status,
+            "definition_candidates": [
+                {"symbol": name, "path": path, "start": start, "end": end}
+                for name, path, start, end in self.graph.definitions
+            ] + [
+                {"symbol": "", "path": item.path, "start": item.line, "end": item.line}
+                for item in self.semantic.locations if item.relation == "definition"
+            ],
         }
 
     def render(self):

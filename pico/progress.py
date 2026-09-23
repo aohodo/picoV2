@@ -1,10 +1,16 @@
-"""Execution ledger and deterministic progress control."""
+"""Execution evidence and advisory progress reporting.
+
+Tool permissions and execution budgets are enforced at their respective
+boundaries. This ledger describes progress; it does not decide the model's
+next action or replace fresh tool feedback.
+"""
 
 import hashlib
 import json
-import math
 import re
 from dataclasses import dataclass, field
+
+from .read_observation import ranges_cover, visible_read_coverage
 
 NEW_EVIDENCE = "NEW_EVIDENCE"
 MATERIAL_PROGRESS = "MATERIAL_PROGRESS"
@@ -76,6 +82,14 @@ def is_repository_read_command(command):
     return bool(commands) and all(command in REPOSITORY_READ_COMMANDS for command in commands)
 
 
+def is_repository_read_argv(argv):
+    """Recognize a direct-process invocation that only inspects repository data."""
+    if not isinstance(argv, list) or not argv:
+        return False
+    executable = str(argv[0]).strip().replace("\\", "/").rsplit("/", 1)[-1]
+    return executable.casefold() in REPOSITORY_READ_COMMANDS
+
+
 @dataclass(frozen=True)
 class ActionSignature:
     tool_name: str
@@ -101,6 +115,7 @@ class ProgressEvidence:
 
 @dataclass
 class ExecutionLedger:
+    definition_candidates: list = field(default_factory=list)
     path_revisions: dict = field(default_factory=dict)
     observed_files: dict = field(default_factory=dict)
     observed_directories: set = field(default_factory=set)
@@ -131,6 +146,8 @@ class ExecutionLedger:
     def mark_mutation(self, paths):
         for path in paths:
             key = str(path)
+            self.observed_files.pop(key, None)
+            self.definition_candidates = [item for item in self.definition_candidates if item["path"] != key]
             # Reinsert updated revisions so the persisted bounded map retains
             # the most recently touched paths across resume cycles.
             previous_revision = self.path_revision(key)
@@ -146,8 +163,10 @@ class ExecutionLedger:
             if len(self.unverified_changes) > MAX_LEDGER_UNVERIFIED_CHANGES:
                 self.unverified_changes.discard(min(self.unverified_changes))
 
-    def record_read(self, tool_name, args):
-        if tool_name == "read_file":
+    def record_read(self, tool_name, args, coverage=None):
+        if coverage is not None:
+            items = [item for item in coverage if item.get("delivered")]
+        elif tool_name == "read_file":
             items = [args]
         elif tool_name == "read_files":
             items = args.get("files", [])
@@ -191,6 +210,13 @@ class ExecutionLedger:
 
     def seed_repository_evidence(self, evidence):
         evidence = evidence or {}
+        candidates = {(item["path"], item["start"], item.get("symbol", "")): item
+                      for item in self.definition_candidates}
+        for item in evidence.get("definition_candidates", []):
+            key = (item["path"], item["start"], item.get("symbol", ""))
+            candidates.pop(key, None)
+            candidates[key] = item
+        self.definition_candidates = list(candidates.values())[-MAX_LEDGER_GROUNDING_PATHS:]
         paths = {
             str(path) for path in evidence.get("paths", []) if str(path).strip()
         }
@@ -203,6 +229,11 @@ class ExecutionLedger:
     def view(self):
         observed_items = list(self.observed_files.items())[-MAX_LEDGER_OBSERVED_FILES:]
         return {
+            "pending_definition_candidates": [
+                item for item in self.definition_candidates
+                if not any(start <= item["start"] <= end
+                           for start, end in self.observed_files.get(item["path"], []))
+            ],
             "observed_files": {
                 path: [list(item) for item in ranges[-MAX_LEDGER_RANGES_PER_FILE:]]
                 for path, ranges in sorted(observed_items)
@@ -244,12 +275,18 @@ class ExecutionLedger:
 
     def to_dict(self):
         recent_revisions = list(self.path_revisions.items())[-MAX_LEDGER_PATH_REVISIONS:]
-        return {"path_revisions": dict(recent_revisions), **self.view()}
+        return {"path_revisions": dict(recent_revisions),
+                "definition_candidates": self.definition_candidates, **self.view(),
+                # Failure identity is delivery authority, not a display sample.
+                # Keep it until this exact verification succeeds. The model
+                # projection in view() remains bounded independently.
+                "unresolved_failures": list(self.unresolved_failures)}
 
     @classmethod
     def from_dict(cls, data):
         data = data or {}
         ledger = cls()
+        ledger.definition_candidates = list(data.get("definition_candidates", []))[:MAX_LEDGER_GROUNDING_PATHS]
         ledger.path_revisions = {
             str(k): int(v)
             for k, v in list(data.get("path_revisions", {}).items())[
@@ -270,9 +307,7 @@ class ExecutionLedger:
         }
         ledger.mutations = list(data.get("mutations", [])[-MAX_LEDGER_MUTATIONS:])
         ledger.validations = list(data.get("validations", [])[-MAX_LEDGER_VALIDATIONS:])
-        ledger.unresolved_failures = list(
-            data.get("unresolved_failures", [])[-MAX_LEDGER_FAILURES:]
-        )
+        ledger.unresolved_failures = list(data.get("unresolved_failures", []))
         ledger.unverified_changes = set(
             data.get("unverified_changes", [])[-MAX_LEDGER_UNVERIFIED_CHANGES:]
         )
@@ -342,30 +377,27 @@ class ProgressController:
         hard_discovery_limit=None,
         ledger=None,
         repository_evidence=None,
+        delivery_requirements=None,
     ):
         self.max_steps = max(1, int(max_steps))
         self.read_only = bool(read_only)
-        default_hard = max(6, math.ceil(self.max_steps * 0.50))
-        if not self.read_only:
-            # Leave an execution reserve for at least one edit, one
-            # verification, and one correction. Discovery must not consume
-            # the complete tool budget before FORCED_DECISION can take effect.
-            default_hard = min(default_hard, max(2, self.max_steps - 3))
-        default_soft = min(
-            max(4, math.ceil(self.max_steps * 0.33)),
-            max(1, default_hard - 1),
-        )
-        evidence_confidence = str((repository_evidence or {}).get("confidence", "none"))
-        if evidence_confidence == "high" and not self.read_only:
-            default_soft = min(default_soft, 4)
-            default_hard = min(default_hard, 6)
-        self.soft_discovery_limit = int(soft_discovery_limit or default_soft)
-        self.hard_discovery_limit = int(hard_discovery_limit or default_hard)
-        if self.soft_discovery_limit < 1:
+        # Accept legacy configuration for compatibility, but do not turn
+        # exploration counts into tool restrictions or task termination.
+        self.soft_discovery_limit = soft_discovery_limit
+        self.hard_discovery_limit = hard_discovery_limit
+        if soft_discovery_limit is not None and int(soft_discovery_limit) < 1:
             raise ValueError("soft_discovery_limit must be positive")
-        if self.hard_discovery_limit < self.soft_discovery_limit:
+        if hard_discovery_limit is not None and int(hard_discovery_limit) < 1:
+            raise ValueError("hard_discovery_limit must be positive")
+        if (soft_discovery_limit is not None and hard_discovery_limit is not None
+                and int(hard_discovery_limit) < int(soft_discovery_limit)):
             raise ValueError("hard_discovery_limit must be >= soft_discovery_limit")
         self.state = ProgressState()
+        self.remaining_steps = self.max_steps
+        self._read_contents = {}
+        self._visible_outputs = None
+        self._visible_reads = None
+        self.delivery_requirements = dict(delivery_requirements or {})
         self.ledger = ExecutionLedger.from_dict(ledger)
         if repository_evidence:
             self.ledger.seed_repository_evidence(repository_evidence)
@@ -388,71 +420,46 @@ class ProgressController:
     def signature(self, tool_name, args):
         return ActionSignature.create(tool_name, args, self._revision_for(tool_name, args))
 
+    def set_visible_tool_outputs(self, events):
+        self._visible_outputs = {
+            str(item.get("output", "")) for item in events
+            if item.get("type") == "function_call_output"
+        }
+        self._visible_reads = [
+            record for event in events
+            if event.get("type") == "function_call_output"
+            for record in event.get("_read_evidence", [])
+        ]
+
+    def set_visible_text_context(self, prompt):
+        self._visible_outputs = {content for content in self._read_contents.values() if content in prompt}
+        self._visible_reads = None
+
+    def _read_is_visible(self, tool_name, args):
+        if self._visible_reads is None:
+            return False
+        items = [args] if tool_name == "read_file" else args.get("files", [])
+        return bool(items) and all(
+            ranges_cover(self._visible_reads, item.get("path", ""),
+                         self.ledger.path_revision(item.get("path", "")),
+                         int(item.get("start", 1)), int(item.get("end", 200)))
+            for item in items
+        )
+
     def preflight(self, tool_name, args):
-        signature = self.signature(tool_name, args)
-        if tool_name == "run_shell" and is_repository_read_command(args.get("command", "")):
-            self.state.blocked_repeats += 1
-            self.state.no_progress_streak += 1
-            self._maybe_intervene()
-            return {
-                "allowed": False,
-                "signature": signature,
-                "evidence": ProgressEvidence(
-                    NO_PROGRESS, "", "typed_repository_read_required"
-                ),
-            }
-        if self.requires_material_action() and tool_name not in self.admissible_tools(
-            {tool_name}
-        ):
-            self.state.blocked_repeats += 1
-            self.state.no_progress_streak += 1
-            self.state.post_hard_no_progress += 1
-            self.state.pending_notices.append(self._forced_notice())
-            self._detect_stuck()
-            return {
-                "allowed": False,
-                "signature": signature,
-                "evidence": ProgressEvidence(
-                    NO_PROGRESS, "", "material_action_required"
-                ),
-            }
-        if (
-            self._is_broad_exploration(tool_name, args)
-            and self.ledger.grounding_confidence == "high"
-            and self.ledger.grounding_paths
-            and self.ledger.targeted_read_count == 0
-            and self.ledger.broad_exploration_count >= 2
-        ):
-            self.state.blocked_repeats += 1
-            self.state.no_progress_streak += 1
-            self.state.pending_notices.append(self._grounding_notice())
-            self._maybe_intervene()
-            return {
-                "allowed": False,
-                "signature": signature,
-                "evidence": ProgressEvidence(NO_PROGRESS, "", "broad_exploration_after_grounding"),
-            }
-        if tool_name not in STABLE_READ_TOOLS or signature.key not in self.state.successful_reads:
-            return {"allowed": True, "signature": signature}
-        self.state.blocked_repeats += 1
-        self.state.no_progress_streak += 1
-        self.state.steps_since_material_progress += 1
-        if self.state.intervention_level == INTERVENTION_FORCED:
-            self.state.post_hard_no_progress += 1
-            self._detect_stuck()
-        self._maybe_intervene()
-        return {"allowed": False, "signature": signature, "evidence": ProgressEvidence(NO_PROGRESS, "", "repeated_no_progress")}
+        # Exploration is model-directed. Permissions, path boundaries and
+        # approval are enforced by ToolExecutor; total run limits bound work.
+        return {"allowed": True, "signature": self.signature(tool_name, args)}
 
     def requires_material_action(self):
-        return self.state.intervention_level == INTERVENTION_FORCED
+        return False
+
+    def set_remaining_steps(self, remaining):
+        self.remaining_steps = max(0, int(remaining))
 
     def admissible_tools(self, tool_names):
-        names = set(tool_names)
-        if not self.requires_material_action():
-            return names
-        if self.read_only:
-            return set()
-        return names & {"write_file", "patch_file"}
+        # Keep the tool interface stable while the model repairs failed work.
+        return set(tool_names)
 
     @staticmethod
     def action_key(tool_name, args):
@@ -460,13 +467,8 @@ class ProgressController:
         return f"{tool_name}:{canonical}"
 
     def preflight_known_error(self, tool_name, args):
-        key = self.action_key(tool_name, args)
-        if key not in self.state.rejected_actions:
-            return True
-        self.state.blocked_repeats += 1
-        self.state.no_progress_streak += 1
-        self._maybe_intervene()
-        return False
+        # Return fresh validation feedback even for a repeated bad request.
+        return True
 
     def record_rejected_action(self, tool_name, args):
         self.state.rejected_actions.add(self.action_key(tool_name, args))
@@ -478,6 +480,14 @@ class ProgressController:
         status = str(metadata.get("tool_status", ""))
         executed = bool(metadata.get("executed", False))
         changed = bool(metadata.get("workspace_changed", False))
+        read_evidence = None
+        if executed and status == "ok" and "read_coverage" in metadata:
+            read_evidence = visible_read_coverage(content, metadata["read_coverage"])
+            read_evidence = [
+                {**item, "revision": self.ledger.path_revision(item["path"])}
+                for item in read_evidence
+            ]
+            metadata["read_evidence"] = read_evidence
 
         if changed:
             affected_paths = list(metadata.get("affected_paths", []))
@@ -488,16 +498,38 @@ class ProgressController:
             self.state.workspace_revision += 1
             self.state.mutation_count += 1
             self.state.discovery_streak = self.state.steps_since_material_progress = 0
-            self.state.no_progress_streak = self.state.post_hard_no_progress = 0
             self.state.intervention_level = INTERVENTION_NORMAL
+            self.state.no_progress_streak = self.state.post_hard_no_progress = 0
             self.state.pending_notices.clear()
+            self.state.pending_notices.append(
+                "Runtime notice: the workspace changed and needs verification. "
+                "Complete the related implementation and tests, then use run_verification. "
+                "A successful file write is not evidence that the code builds or passes tests. "
+                "Reuse known file locations instead of restarting repository exploration."
+            )
             self.state.stuck_detected = False
             # Argument validation failures belong to the workspace revision in
             # which they occurred. A successful mutation may make the exact
             # same operation valid, so failures must not poison later phases.
             self.state.rejected_actions.clear()
         else:
-            if executed and identity not in self.state.observations and status in {"ok", "partial_success", "error"}:
+            if read_evidence is not None and self._visible_reads is not None:
+                novel = any(not ranges_cover(
+                    self._visible_reads, item["path"], item["revision"], item["start"], item["end"]
+                ) for item in read_evidence)
+                historical = all(ranges_cover(
+                    [{"path": item["path"], "revision": item["revision"], "start": start, "end": end}
+                     for start, end in self.ledger.observed_files.get(item["path"], [])],
+                    item["path"], item["revision"], item["start"], item["end"]
+                ) for item in read_evidence)
+                reason = ("context_restored" if historical else "missing_source_delivered") if novel else "source_already_visible"
+                evidence = ProgressEvidence(NEW_EVIDENCE if novel else NO_PROGRESS, observation_hash, reason)
+                self.state.no_progress_streak = 0 if novel else self.state.no_progress_streak + 1
+            elif (executed and status == "ok" and tool_name in {"read_file", "read_files"}
+                  and self._visible_outputs is not None and str(content) not in self._visible_outputs):
+                evidence = ProgressEvidence(NEW_EVIDENCE, observation_hash, "context_restored")
+                self.state.no_progress_streak = 0
+            elif executed and identity not in self.state.observations and status in {"ok", "partial_success", "error"}:
                 evidence = ProgressEvidence(NEW_EVIDENCE, observation_hash, "new_observation")
                 self.state.no_progress_streak = 0
             else:
@@ -515,26 +547,25 @@ class ProgressController:
                     self.state.shell_count += 1
                     self.state.discovery_streak = 0
                 else:
-                    # A shell command with no workspace effect and no
-                    # verification is still exploration. Treating it as
-                    # progress lets `cat`/`rg` bypass the discovery budget.
+                    # A shell command without a workspace effect or a test
+                    # result is observation, not an implementation change.
                     self.state.discovery_streak += 1
                     self.state.max_discovery_streak = max(
                         self.state.max_discovery_streak,
                         self.state.discovery_streak,
                     )
-            # Rejected actions and non-mutating write attempts are not phase
-            # progress. Preserve the exploration streak instead of letting an
-            # invalid write reset the forced-decision budget.
-            if self.state.intervention_level == INTERVENTION_FORCED:
-                self.state.post_hard_no_progress = self.state.post_hard_no_progress + 1 if evidence.kind == NO_PROGRESS else 0
-                self._detect_stuck()
+            # Failed writes do not reset the discovery metrics: only an
+            # actual workspace change or verification result does that.
 
         if executed:
             self.state.observations.add(identity)
             if tool_name in STABLE_READ_TOOLS and status == "ok":
                 self.state.successful_reads.add(signature.key)
-                self.ledger.record_read(tool_name, args)
+                if tool_name in {"read_file", "read_files"}:
+                    self._read_contents[signature.key] = str(content)
+                    while len(self._read_contents) > MAX_LEDGER_OBSERVED_FILES * MAX_LEDGER_RANGES_PER_FILE:
+                        del self._read_contents[next(iter(self._read_contents))]
+                self.ledger.record_read(tool_name, args, read_evidence if read_evidence is not None else metadata.get("read_coverage"))
                 if self._is_broad_exploration(tool_name, args):
                     self.ledger.broad_exploration_count += 1
                     if (
@@ -558,33 +589,50 @@ class ProgressController:
                 self.ledger.validations.append(record)
                 self.ledger.validation_count += 1
                 del self.ledger.validations[:-MAX_LEDGER_VALIDATIONS]
-                if validation and status == "ok":
+                if validation and not changed:
+                    # Even a failed check yields actionable feedback. Reopen the
+                    # repair cycle, but never consider that failure verified.
+                    self.state.discovery_streak = self.state.steps_since_material_progress = 0
+                    self.state.intervention_level = INTERVENTION_NORMAL
+                    self.state.post_hard_no_progress = 0
+                    self.state.pending_notices.clear()
+                    self.state.stuck_detected = False
+                if validation and status == "ok" and not changed:
                     self.ledger.unverified_changes.clear()
                     self.ledger.unverified_change_count = 0
+                    resolved = sum(item.get("command") == command for item in self.ledger.unresolved_failures)
+                    self.ledger.unresolved_failures = [
+                        item for item in self.ledger.unresolved_failures if item.get("command") != command
+                    ]
+                    self.ledger.unresolved_failure_count = max(0, self.ledger.unresolved_failure_count - resolved)
                 elif validation:
-                    self.ledger.unresolved_failures.append(record)
-                    self.ledger.unresolved_failure_count += 1
-                    del self.ledger.unresolved_failures[:-MAX_LEDGER_FAILURES]
+                    previous = [
+                        item for item in self.ledger.unresolved_failures
+                        if item.get("command") == command
+                    ]
+                    self.ledger.unresolved_failures = [
+                        item for item in self.ledger.unresolved_failures
+                        if item.get("command") != command
+                    ]
+                    # ToolExecutor has already bounded and redacted content.
+                    # Keep the latest actionable failure until this check
+                    # passes, independently of ordinary history eviction.
+                    self.ledger.unresolved_failures.append({**record, "output": str(content)})
+                    if not previous:
+                        self.ledger.unresolved_failure_count += 1
+                    elif len(previous) > 1:
+                        self.ledger.unresolved_failure_count -= len(previous) - 1
         self._maybe_intervene()
         return evidence
 
     def _maybe_intervene(self):
         if (
-            self.state.discovery_streak >= self.hard_discovery_limit
-            and self.state.intervention_level != INTERVENTION_FORCED
+            self.state.intervention_level == INTERVENTION_NORMAL
+            and self.state.no_progress_streak >= 2
         ):
-            self.state.intervention_level = INTERVENTION_FORCED
-            self.state.intervention_count += 1
-            self.state.post_hard_no_progress = 0
-            self.state.pending_notices.append(self._forced_notice())
-        elif self.state.intervention_level == INTERVENTION_NORMAL and (self.state.discovery_streak >= self.soft_discovery_limit or self.state.no_progress_streak >= 2):
             self.state.intervention_level = INTERVENTION_SOFT
             self.state.intervention_count += 1
             self.state.pending_notices.append(self._soft_notice())
-
-    def _detect_stuck(self):
-        if self.state.post_hard_no_progress >= 2:
-            self.state.stuck_detected = True
 
     def consume_notice(self):
         return self.state.pending_notices.pop(0) if self.state.pending_notices else ""
@@ -599,17 +647,6 @@ class ProgressController:
             action = "choose one genuinely new target, modify, verify, finalize, or identify a blocker."
         return "Runtime notice: Recent actions are not advancing the task. Reuse prior observations and " + action
 
-    def _forced_notice(self):
-        if self.read_only:
-            action = "Finalize from existing evidence or identify a blocker."
-        else:
-            action = "Modify with write_file/patch_file, finalize, or identify a blocker."
-        return (
-            "Runtime notice: the exploration budget is exhausted; further reads, searches, "
-            "delegation, and shell exploration are unavailable until a workspace mutation. "
-            + action
-        )
-
     def _grounding_notice(self):
         candidates = ", ".join(sorted(self.ledger.grounding_paths)[:6])
         return (
@@ -618,12 +655,28 @@ class ProgressController:
         )
 
     def metrics(self):
+        validation_records = [
+            item
+            for item in self.ledger.validations
+            if item.get("kind") == "validation"
+        ]
+        if self.ledger.unresolved_failure_count or self.ledger.unresolved_failures:
+            validation_status = "failed"
+        elif validation_records and (self.ledger.unverified_change_count or self.ledger.unverified_changes):
+            validation_status = "stale"
+        elif validation_records:
+            validation_status = "passed"
+        elif self.ledger.unverified_change_count or self.ledger.unverified_changes:
+            validation_status = "not_run"
+        else:
+            validation_status = "not_required"
         return {
             "workspace_revision": self.state.workspace_revision,
             "blocked_repeats": self.state.blocked_repeats,
             "intervention_count": self.state.intervention_count,
             "max_discovery_streak": self.state.max_discovery_streak,
             "stuck_detected": self.state.stuck_detected,
+            "validation_status": validation_status,
             "discovery_streak": self.state.discovery_streak,
             "no_progress_streak": self.state.no_progress_streak,
             "intervention_level": self.state.intervention_level,

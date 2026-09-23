@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 from .file_lock import FileLock
 
 SESSION_SCHEMA_VERSION = 1
+SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class SessionError(RuntimeError):
@@ -42,9 +44,15 @@ class SessionStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def path(self, session_id):
+        session_id = str(session_id)
+        if not SESSION_ID_PATTERN.fullmatch(session_id):
+            raise SessionLoadError(self.root / "<invalid-session-id>", "session id is invalid")
         return self.root / f"{session_id}.json"
 
     def lock_path(self, session_id):
+        session_id = str(session_id)
+        if not SESSION_ID_PATTERN.fullmatch(session_id):
+            raise SessionLoadError(self.root / "<invalid-session-id>", "session id is invalid")
         return self.root / f"{session_id}.lock"
 
     @staticmethod
@@ -74,6 +82,7 @@ class SessionStore:
             "runtime_identity": dict,
             "resume_state": dict,
             "active_transaction_id": str,
+            "transaction_requirements": dict,
         }
         for field, expected_type in expected_types.items():
             if field in payload and not isinstance(payload[field], expected_type):

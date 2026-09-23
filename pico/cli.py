@@ -414,13 +414,13 @@ def build_arg_parser():
         "--soft-discovery-limit",
         type=int,
         default=None,
-        help="Exploratory tool streak that triggers a soft progress intervention.",
+        help="Deprecated compatibility option; progress advice no longer depends on a discovery quota.",
     )
     parser.add_argument(
         "--hard-discovery-limit",
         type=int,
         default=None,
-        help="Exploratory tool streak that triggers a forced-decision intervention.",
+        help="Deprecated compatibility option; exploration no longer restricts tools or forces a phase transition.",
     )
     parser.add_argument(
         "--max-output-cap",

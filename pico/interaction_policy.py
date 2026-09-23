@@ -25,6 +25,13 @@ _READ_ONLY_CONSTRAINT = re.compile(
     r"(?:modify|change|write|edit|delete|remove)\b(?:\s+(?:any\s+)?files?)?|"
     r"(?:不要|不得|无需)(?:对[^，。；\n]{0,20})?(?:修改|更改|写入|编辑|删除)(?:任何)?文件"
 )
+_GLOBAL_READ_ONLY_CONSTRAINT = re.compile(
+    r"(?i)\b(?:do\s+not|don't|without)\s+(?:make\s+\w+\s+)?"
+    r"(?:modify|change|write|edit|delete|remove)\s+(?:any\s+)?"
+    r"(?:files?|code|workspace|repository|repo)\b|"
+    r"(?:不要|不得|无需|禁止)(?:修改|更改|写入|编辑|删除)(?:任何)?"
+    r"(?:文件|代码|工作区|仓库|项目)"
+)
 _PLAN = re.compile(r"(?i)\b(plan|design|proposal|approach)\b|方案|设计|规划|怎么做|如何实现")
 _REVIEW = re.compile(r"(?i)\b(review|audit|assess|evaluate)\b|评审|审查|检查代码|评估")
 _EXPLAIN = re.compile(
@@ -39,6 +46,10 @@ _VALIDATION_REQUIRED = re.compile(
     r"(?i)\b(?:run|execute)\s+(?:the\s+)?(?:tests?|build|verification|checks?)\b|"
     r"\bverify\b|(?:运行|执行|跑)(?:[^，。；\n]{0,24})?(?:测试|构建|校验|验证)|"
     r"(?:测试|构建)(?:[^，。；\n]{0,12})?(?:通过|成功)"
+)
+_TEST_ARTIFACT_REQUIRED = re.compile(
+    r"(?i)\b(?:add|create|write|implement|update)\b[^.\n]{0,48}\btests?\b|"
+    r"(?:新增|添加|创建|编写|实现|更新)[^，。；\n]{0,24}(?:测试|用例)"
 )
 _TEMPORARY = re.compile(r"(?i)\b(?:this\s+time|this\s+task|temporarily|for\s+now)\b|本次|这次|本轮|暂时|临时")
 _DURABLE = re.compile(r"(?i)\b(?:from\s+now\s+on|always|default|remember|long[- ]term)\b|以后|今后|默认|长期|记住")
@@ -69,7 +80,9 @@ class InteractionIntent:
 def classify_interaction(user_message):
     text = str(user_message or "").strip()
     intent_text = _READ_ONLY_CONSTRAINT.sub("", text)
-    mutation_allowed = bool(_MUTATION.search(intent_text))
+    mutation_allowed = bool(_MUTATION.search(intent_text)) and not bool(
+        _GLOBAL_READ_ONLY_CONSTRAINT.search(text)
+    )
     if mutation_allowed:
         mode = "implement"
     elif _REVIEW.search(text):
@@ -115,6 +128,21 @@ def extract_protected_paths(user_message):
 def path_matches_patterns(path, patterns):
     normalized = str(path or "").replace("\\", "/").lstrip("./").casefold()
     return any(fnmatch.fnmatchcase(normalized, str(pattern).casefold()) for pattern in patterns or ())
+
+
+def is_test_artifact_path(path):
+    """Return whether a changed path is conventionally an executable test artifact."""
+    normalized = str(path or "").replace("\\", "/").strip("/").casefold()
+    if not normalized:
+        return False
+    name = normalized.rsplit("/", 1)[-1]
+    return (
+        normalized.startswith(("test/", "tests/", "src/test/"))
+        or "/test/" in normalized
+        or "/tests/" in normalized
+        or name.startswith("test_")
+        or name.endswith(("_test.py", "test.java", "tests.java", "spec.js", "spec.ts"))
+    )
 
 
 class WorkspacePreferenceStore:
@@ -183,6 +211,9 @@ def build_interaction_contract(user_message, package_layout):
     return {
         **intent.to_dict(),
         "validation_required": bool(_VALIDATION_REQUIRED.search(str(user_message or ""))),
+        "test_artifact_required": bool(
+            _TEST_ARTIFACT_REQUIRED.search(str(user_message or ""))
+        ),
         "protected_paths": extract_protected_paths(user_message),
         "package_layout": package_layout,
         "instruction_priority": [
