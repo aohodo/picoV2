@@ -46,6 +46,12 @@ class RunOutcome:
         stop_reason = str(task_state.stop_reason or "")
         if task_state.status == "completed" and transaction_state == "COMMITTED":
             status, exit_code = "committed", EXIT_SUCCESS
+        elif transaction_state == "COMMITTED":
+            # The commit journal can prove that source delivery completed even
+            # when the process died before TaskState/final-answer persistence.
+            # Do not mislabel that crash window as either a clean completion or
+            # an ordinary stopped run.
+            status, exit_code = "committed_unconfirmed", EXIT_STOPPED
         elif transaction_state == "READY_FOR_REVIEW" or stop_reason == "ready_for_review":
             status, exit_code = "ready_for_review", EXIT_STOPPED
         elif stop_reason == "validation_failed":

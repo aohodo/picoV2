@@ -10,8 +10,52 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+
+MAX_CAPTURE_BYTES_PER_STREAM = 256 * 1024
+
+
+class _BoundedCapture:
+    def __init__(self, limit=MAX_CAPTURE_BYTES_PER_STREAM):
+        self.limit = int(limit)
+        self.head_limit = (self.limit * 3) // 4
+        self.tail_limit = self.limit - self.head_limit
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.total = 0
+
+    def add(self, chunk):
+        chunk = bytes(chunk)
+        self.total += len(chunk)
+        missing_head = max(0, self.head_limit - len(self.head))
+        if missing_head:
+            self.head.extend(chunk[:missing_head])
+            chunk = chunk[missing_head:]
+        if chunk:
+            self.tail.extend(chunk)
+            if len(self.tail) > self.tail_limit:
+                del self.tail[:-self.tail_limit]
+
+    @property
+    def truncated(self):
+        return self.total > self.limit
+
+    def value(self):
+        if not self.truncated:
+            return bytes(self.head + self.tail)
+        omitted = self.total - len(self.head) - len(self.tail)
+        marker = f"\n...[stream capture omitted {omitted} bytes]...\n".encode()
+        return bytes(self.head) + marker + bytes(self.tail)
+
+
+def _drain_stream(stream, capture):
+    try:
+        for chunk in iter(lambda: stream.read(64 * 1024), b""):
+            capture.add(chunk)
+    finally:
+        stream.close()
 
 
 class ExecutionRuntimeUnavailable(RuntimeError):
@@ -99,6 +143,49 @@ class WorkspaceCommandRunner:
         env["PATH"] = os.pathsep.join(entries)
         return env
 
+    @staticmethod
+    def _run_process(argv, cwd, env, timeout):
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stdout_capture = _BoundedCapture()
+        stderr_capture = _BoundedCapture()
+        stdout_thread = threading.Thread(
+            target=_drain_stream,
+            args=(process.stdout, stdout_capture),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=_drain_stream,
+            args=(process.stderr, stderr_capture),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+        try:
+            exit_code = process.wait(timeout=int(timeout))
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            process.wait()
+            stdout_thread.join()
+            stderr_thread.join()
+            raise TimeoutError(f"command timed out after {timeout}s") from exc
+        stdout_thread.join()
+        stderr_thread.join()
+        return {
+            "exit_code": exit_code,
+            "stdout": stdout_capture.value(),
+            "stderr": stderr_capture.value(),
+            "stdout_bytes": stdout_capture.total,
+            "stderr_bytes": stderr_capture.total,
+            "stdout_truncated": stdout_capture.truncated,
+            "stderr_truncated": stderr_capture.truncated,
+        }
+
     def run(self, command, timeout=20):
         self.start()
         if self._profile is None:
@@ -119,21 +206,17 @@ class WorkspaceCommandRunner:
             },
         )
         env = self._prepend_runtime_path(env)
-        try:
-            result = subprocess.run(
-                [*prefix, command],
-                cwd=self.execution_root,
-                env=env,
-                capture_output=True,
-                timeout=int(timeout),
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(f"shell command timed out after {timeout}s") from exc
+        result = self._run_process(
+            [*prefix, command], self.execution_root, env, timeout
+        )
         return {
-            "exit_code": result.returncode,
-            "stdout": self.secret_boundary.sanitize_text(result.stdout.decode("utf-8", errors="replace")),
-            "stderr": self.secret_boundary.sanitize_text(result.stderr.decode("utf-8", errors="replace")),
+            **result,
+            "stdout": self.secret_boundary.sanitize_text(
+                result["stdout"].decode("utf-8", errors="replace")
+            ),
+            "stderr": self.secret_boundary.sanitize_text(
+                result["stderr"].decode("utf-8", errors="replace")
+            ),
             "shell_profile": self.profile_view(),
         }
 
@@ -166,24 +249,21 @@ class WorkspaceCommandRunner:
             process_argv = [command_processor, "/d", "/s", "/c", subprocess.list2cmdline([resolved_executable, *argv[1:]])]
             profile = {"dialect": "direct-batch", "executable": resolved_executable}
         try:
-            result = subprocess.run(
-                process_argv,
-                cwd=self.execution_root,
-                env=env,
-                capture_output=True,
-                timeout=int(timeout),
-                check=False,
+            result = self._run_process(
+                process_argv, self.execution_root, env, timeout
             )
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(f"verification command timed out after {timeout}s") from exc
         except OSError as exc:
             raise ExecutionRuntimeUnavailable(
                 f"verification_runtime_unavailable: {exc}"
             ) from exc
         return {
-            "exit_code": result.returncode,
-            "stdout": self.secret_boundary.sanitize_text(result.stdout.decode("utf-8", errors="replace")),
-            "stderr": self.secret_boundary.sanitize_text(result.stderr.decode("utf-8", errors="replace")),
+            **result,
+            "stdout": self.secret_boundary.sanitize_text(
+                result["stdout"].decode("utf-8", errors="replace")
+            ),
+            "stderr": self.secret_boundary.sanitize_text(
+                result["stderr"].decode("utf-8", errors="replace")
+            ),
             "shell_profile": profile,
         }
 

@@ -19,10 +19,61 @@ VALIDATION_COMMAND = re.compile(
     r"gradle\w*\s+test|npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+test|"
     r"cargo\s+test|go\s+test|make\s+test)(\s|$)"
 )
+SHELL_SEGMENT = re.compile(r"\s*(?:&&|\|\||[;|])\s*")
+REPOSITORY_READ_COMMANDS = frozenset(
+    {
+        "cat",
+        "cd",
+        "dir",
+        "echo",
+        "find",
+        "findstr",
+        "gc",
+        "get-childitem",
+        "get-content",
+        "grep",
+        "head",
+        "ls",
+        "more",
+        "popd",
+        "pushd",
+        "rg",
+        "set-location",
+        "tail",
+        "type",
+    }
+)
+MAX_LEDGER_OBSERVED_FILES = 48
+MAX_LEDGER_RANGES_PER_FILE = 8
+MAX_LEDGER_DIRECTORIES = 24
+MAX_LEDGER_SEARCHES = 24
+MAX_LEDGER_MUTATIONS = 24
+MAX_LEDGER_VALIDATIONS = 12
+MAX_LEDGER_FAILURES = 12
+MAX_LEDGER_UNVERIFIED_CHANGES = 48
+MAX_LEDGER_GROUNDING_PATHS = 24
+MAX_LEDGER_PATH_REVISIONS = 256
 
 
 def is_validation_command(command):
     return bool(VALIDATION_COMMAND.search(str(command or "")))
+
+
+def is_repository_read_command(command):
+    """Recognize shell pipelines that only duplicate typed repository reads."""
+    text = str(command or "").strip()
+    if not text or is_validation_command(text):
+        return False
+    segments = [item.strip() for item in SHELL_SEGMENT.split(text) if item.strip()]
+    if not segments:
+        return False
+    commands = []
+    for segment in segments:
+        match = re.match(r"(?i)^(?:&\s*)?([\w.-]+)", segment)
+        if match is None:
+            return False
+        commands.append(match.group(1).casefold())
+    return bool(commands) and all(command in REPOSITORY_READ_COMMANDS for command in commands)
 
 
 @dataclass(frozen=True)
@@ -58,6 +109,21 @@ class ExecutionLedger:
     validations: list = field(default_factory=list)
     unresolved_failures: list = field(default_factory=list)
     unverified_changes: set = field(default_factory=set)
+    grounding_paths: set = field(default_factory=set)
+    grounding_confidence: str = "none"
+    semantic_backend: str = "none"
+    semantic_status: str = "not_requested"
+    broad_exploration_count: int = 0
+    targeted_read_count: int = 0
+    file_read_count: int = 0
+    observed_file_count: int = 0
+    observed_directory_count: int = 0
+    search_count: int = 0
+    mutation_path_count: int = 0
+    validation_count: int = 0
+    unresolved_failure_count: int = 0
+    unverified_change_count: int = 0
+    grounding_path_count: int = 0
 
     def path_revision(self, path):
         return int(self.path_revisions.get(str(path), 0))
@@ -65,9 +131,20 @@ class ExecutionLedger:
     def mark_mutation(self, paths):
         for path in paths:
             key = str(path)
-            self.path_revisions[key] = self.path_revision(key) + 1
+            # Reinsert updated revisions so the persisted bounded map retains
+            # the most recently touched paths across resume cycles.
+            previous_revision = self.path_revision(key)
+            self.path_revisions.pop(key, None)
+            self.path_revisions[key] = previous_revision + 1
             self.mutations.append(key)
+            self.mutation_path_count += 1
+            if len(self.mutations) > MAX_LEDGER_MUTATIONS:
+                del self.mutations[:-MAX_LEDGER_MUTATIONS]
+            if key not in self.unverified_changes:
+                self.unverified_change_count += 1
             self.unverified_changes.add(key)
+            if len(self.unverified_changes) > MAX_LEDGER_UNVERIFIED_CHANGES:
+                self.unverified_changes.discard(min(self.unverified_changes))
 
     def record_read(self, tool_name, args):
         if tool_name == "read_file":
@@ -78,46 +155,161 @@ class ExecutionLedger:
             items = []
         for item in items:
             path = str(item.get("path", ""))
+            self.file_read_count += 1
+            if path in self.grounding_paths:
+                self.targeted_read_count += 1
             coverage = (int(item.get("start", 1)), int(item.get("end", 0)))
+            if path not in self.observed_files:
+                self.observed_file_count += 1
             ranges = self.observed_files.setdefault(path, [])
             if coverage not in ranges:
                 ranges.append(coverage)
+                del ranges[:-MAX_LEDGER_RANGES_PER_FILE]
+            while len(self.observed_files) > MAX_LEDGER_OBSERVED_FILES:
+                del self.observed_files[next(iter(self.observed_files))]
         if tool_name == "list_files":
-            self.observed_directories.add(str(args.get("path", ".")))
+            path = str(args.get("path", "."))
+            if path not in self.observed_directories:
+                self.observed_directory_count += 1
+            self.observed_directories.add(path)
+            while len(self.observed_directories) > MAX_LEDGER_DIRECTORIES:
+                self.observed_directories.discard(min(self.observed_directories))
         elif tool_name == "search":
-            self.searches.add((str(args.get("pattern", "")), str(args.get("path", "."))))
+            search = (str(args.get("pattern", "")), str(args.get("path", ".")))
+            if search not in self.searches:
+                self.search_count += 1
+            self.searches.add(search)
+            while len(self.searches) > MAX_LEDGER_SEARCHES:
+                self.searches.discard(min(self.searches))
         elif tool_name == "inspect_repository":
-            self.searches.add((str(args.get("query", "")), "<repository-graph>"))
+            search = (str(args.get("query", "")), "<repository-graph>")
+            if search not in self.searches:
+                self.search_count += 1
+            self.searches.add(search)
+            while len(self.searches) > MAX_LEDGER_SEARCHES:
+                self.searches.discard(min(self.searches))
+
+    def seed_repository_evidence(self, evidence):
+        evidence = evidence or {}
+        paths = {
+            str(path) for path in evidence.get("paths", []) if str(path).strip()
+        }
+        self.grounding_path_count = len(paths)
+        self.grounding_paths = set(sorted(paths)[-MAX_LEDGER_GROUNDING_PATHS:])
+        self.grounding_confidence = str(evidence.get("confidence", "none"))
+        self.semantic_backend = str(evidence.get("semantic_backend", "none"))
+        self.semantic_status = str(evidence.get("semantic_status", "not_requested"))
 
     def view(self):
+        observed_items = list(self.observed_files.items())[-MAX_LEDGER_OBSERVED_FILES:]
         return {
-            "observed_files": {path: [list(r) for r in ranges] for path, ranges in sorted(self.observed_files.items())},
-            "observed_directories": sorted(self.observed_directories),
-            "searches": [list(item) for item in sorted(self.searches)],
-            "mutations": list(self.mutations[-12:]),
-            "validations": list(self.validations[-8:]),
-            "unresolved_failures": list(self.unresolved_failures[-8:]),
-            "unverified_changes": sorted(self.unverified_changes),
+            "observed_files": {
+                path: [list(item) for item in ranges[-MAX_LEDGER_RANGES_PER_FILE:]]
+                for path, ranges in sorted(observed_items)
+            },
+            "observed_file_count": max(self.observed_file_count, len(self.observed_files)),
+            "observed_directories": sorted(self.observed_directories)[-MAX_LEDGER_DIRECTORIES:],
+            "observed_directory_count": max(
+                self.observed_directory_count, len(self.observed_directories)
+            ),
+            "searches": [
+                list(item) for item in sorted(self.searches)[-MAX_LEDGER_SEARCHES:]
+            ],
+            "search_count": max(self.search_count, len(self.searches)),
+            "mutations": list(self.mutations[-MAX_LEDGER_MUTATIONS:]),
+            "mutation_path_count": max(self.mutation_path_count, len(self.mutations)),
+            "validations": list(self.validations[-MAX_LEDGER_VALIDATIONS:]),
+            "validation_count": max(self.validation_count, len(self.validations)),
+            "unresolved_failures": list(
+                self.unresolved_failures[-MAX_LEDGER_FAILURES:]
+            ),
+            "unresolved_failure_count": max(
+                self.unresolved_failure_count, len(self.unresolved_failures)
+            ),
+            "unverified_changes": sorted(self.unverified_changes)[
+                -MAX_LEDGER_UNVERIFIED_CHANGES:
+            ],
+            "unverified_change_count": max(
+                self.unverified_change_count, len(self.unverified_changes)
+            ),
+            "grounding_paths": sorted(self.grounding_paths)[-MAX_LEDGER_GROUNDING_PATHS:],
+            "grounding_path_count": max(self.grounding_path_count, len(self.grounding_paths)),
+            "grounding_confidence": self.grounding_confidence,
+            "semantic_backend": self.semantic_backend,
+            "semantic_status": self.semantic_status,
+            "broad_exploration_count": self.broad_exploration_count,
+            "targeted_read_count": self.targeted_read_count,
+            "file_read_count": self.file_read_count,
         }
 
     def to_dict(self):
-        return {"path_revisions": dict(self.path_revisions), **self.view()}
+        recent_revisions = list(self.path_revisions.items())[-MAX_LEDGER_PATH_REVISIONS:]
+        return {"path_revisions": dict(recent_revisions), **self.view()}
 
     @classmethod
     def from_dict(cls, data):
         data = data or {}
         ledger = cls()
-        ledger.path_revisions = {str(k): int(v) for k, v in data.get("path_revisions", {}).items()}
-        ledger.observed_files = {
-            str(path): [tuple(item) for item in ranges]
-            for path, ranges in data.get("observed_files", {}).items()
+        ledger.path_revisions = {
+            str(k): int(v)
+            for k, v in list(data.get("path_revisions", {}).items())[
+                -MAX_LEDGER_PATH_REVISIONS:
+            ]
         }
-        ledger.observed_directories = set(data.get("observed_directories", []))
-        ledger.searches = {tuple(item) for item in data.get("searches", [])}
-        ledger.mutations = list(data.get("mutations", []))
-        ledger.validations = list(data.get("validations", []))
-        ledger.unresolved_failures = list(data.get("unresolved_failures", []))
-        ledger.unverified_changes = set(data.get("unverified_changes", []))
+        ledger.observed_files = {
+            str(path): [tuple(item) for item in ranges[-MAX_LEDGER_RANGES_PER_FILE:]]
+            for path, ranges in list(data.get("observed_files", {}).items())[
+                -MAX_LEDGER_OBSERVED_FILES:
+            ]
+        }
+        ledger.observed_directories = set(
+            data.get("observed_directories", [])[-MAX_LEDGER_DIRECTORIES:]
+        )
+        ledger.searches = {
+            tuple(item) for item in data.get("searches", [])[-MAX_LEDGER_SEARCHES:]
+        }
+        ledger.mutations = list(data.get("mutations", [])[-MAX_LEDGER_MUTATIONS:])
+        ledger.validations = list(data.get("validations", [])[-MAX_LEDGER_VALIDATIONS:])
+        ledger.unresolved_failures = list(
+            data.get("unresolved_failures", [])[-MAX_LEDGER_FAILURES:]
+        )
+        ledger.unverified_changes = set(
+            data.get("unverified_changes", [])[-MAX_LEDGER_UNVERIFIED_CHANGES:]
+        )
+        ledger.grounding_paths = set(
+            data.get("grounding_paths", [])[-MAX_LEDGER_GROUNDING_PATHS:]
+        )
+        ledger.grounding_confidence = str(data.get("grounding_confidence", "none"))
+        ledger.semantic_backend = str(data.get("semantic_backend", "none"))
+        ledger.semantic_status = str(data.get("semantic_status", "not_requested"))
+        ledger.broad_exploration_count = int(data.get("broad_exploration_count", 0))
+        ledger.targeted_read_count = int(data.get("targeted_read_count", 0))
+        ledger.file_read_count = int(data.get("file_read_count", 0))
+        ledger.observed_file_count = max(
+            len(ledger.observed_files), int(data.get("observed_file_count", 0))
+        )
+        ledger.observed_directory_count = max(
+            len(ledger.observed_directories),
+            int(data.get("observed_directory_count", 0)),
+        )
+        ledger.search_count = max(len(ledger.searches), int(data.get("search_count", 0)))
+        ledger.mutation_path_count = max(
+            len(ledger.mutations), int(data.get("mutation_path_count", 0))
+        )
+        ledger.validation_count = max(
+            len(ledger.validations), int(data.get("validation_count", 0))
+        )
+        ledger.unresolved_failure_count = max(
+            len(ledger.unresolved_failures),
+            int(data.get("unresolved_failure_count", 0)),
+        )
+        ledger.unverified_change_count = max(
+            len(ledger.unverified_changes),
+            int(data.get("unverified_change_count", 0)),
+        )
+        ledger.grounding_path_count = max(
+            len(ledger.grounding_paths), int(data.get("grounding_path_count", 0))
+        )
         return ledger
 
 
@@ -142,17 +334,45 @@ class ProgressState:
 
 
 class ProgressController:
-    def __init__(self, max_steps, read_only=False, soft_discovery_limit=None, hard_discovery_limit=None, ledger=None):
+    def __init__(
+        self,
+        max_steps,
+        read_only=False,
+        soft_discovery_limit=None,
+        hard_discovery_limit=None,
+        ledger=None,
+        repository_evidence=None,
+    ):
         self.max_steps = max(1, int(max_steps))
         self.read_only = bool(read_only)
-        self.soft_discovery_limit = int(soft_discovery_limit or max(4, math.ceil(self.max_steps * 0.33)))
-        self.hard_discovery_limit = int(hard_discovery_limit or max(6, math.ceil(self.max_steps * 0.50)))
+        default_hard = max(6, math.ceil(self.max_steps * 0.50))
+        if not self.read_only:
+            # Leave an execution reserve for at least one edit, one
+            # verification, and one correction. Discovery must not consume
+            # the complete tool budget before FORCED_DECISION can take effect.
+            default_hard = min(default_hard, max(2, self.max_steps - 3))
+        default_soft = min(
+            max(4, math.ceil(self.max_steps * 0.33)),
+            max(1, default_hard - 1),
+        )
+        evidence_confidence = str((repository_evidence or {}).get("confidence", "none"))
+        if evidence_confidence == "high" and not self.read_only:
+            default_soft = min(default_soft, 4)
+            default_hard = min(default_hard, 6)
+        self.soft_discovery_limit = int(soft_discovery_limit or default_soft)
+        self.hard_discovery_limit = int(hard_discovery_limit or default_hard)
         if self.soft_discovery_limit < 1:
             raise ValueError("soft_discovery_limit must be positive")
         if self.hard_discovery_limit < self.soft_discovery_limit:
             raise ValueError("hard_discovery_limit must be >= soft_discovery_limit")
         self.state = ProgressState()
         self.ledger = ExecutionLedger.from_dict(ledger)
+        if repository_evidence:
+            self.ledger.seed_repository_evidence(repository_evidence)
+
+    @staticmethod
+    def _is_broad_exploration(tool_name, args):
+        return tool_name in {"list_files", "search"} and str(args.get("path", ".")) in {"", "."}
 
     def _revision_for(self, tool_name, args):
         if tool_name == "read_file":
@@ -170,6 +390,48 @@ class ProgressController:
 
     def preflight(self, tool_name, args):
         signature = self.signature(tool_name, args)
+        if tool_name == "run_shell" and is_repository_read_command(args.get("command", "")):
+            self.state.blocked_repeats += 1
+            self.state.no_progress_streak += 1
+            self._maybe_intervene()
+            return {
+                "allowed": False,
+                "signature": signature,
+                "evidence": ProgressEvidence(
+                    NO_PROGRESS, "", "typed_repository_read_required"
+                ),
+            }
+        if self.requires_material_action() and tool_name not in self.admissible_tools(
+            {tool_name}
+        ):
+            self.state.blocked_repeats += 1
+            self.state.no_progress_streak += 1
+            self.state.post_hard_no_progress += 1
+            self.state.pending_notices.append(self._forced_notice())
+            self._detect_stuck()
+            return {
+                "allowed": False,
+                "signature": signature,
+                "evidence": ProgressEvidence(
+                    NO_PROGRESS, "", "material_action_required"
+                ),
+            }
+        if (
+            self._is_broad_exploration(tool_name, args)
+            and self.ledger.grounding_confidence == "high"
+            and self.ledger.grounding_paths
+            and self.ledger.targeted_read_count == 0
+            and self.ledger.broad_exploration_count >= 2
+        ):
+            self.state.blocked_repeats += 1
+            self.state.no_progress_streak += 1
+            self.state.pending_notices.append(self._grounding_notice())
+            self._maybe_intervene()
+            return {
+                "allowed": False,
+                "signature": signature,
+                "evidence": ProgressEvidence(NO_PROGRESS, "", "broad_exploration_after_grounding"),
+            }
         if tool_name not in STABLE_READ_TOOLS or signature.key not in self.state.successful_reads:
             return {"allowed": True, "signature": signature}
         self.state.blocked_repeats += 1
@@ -180,6 +442,17 @@ class ProgressController:
             self._detect_stuck()
         self._maybe_intervene()
         return {"allowed": False, "signature": signature, "evidence": ProgressEvidence(NO_PROGRESS, "", "repeated_no_progress")}
+
+    def requires_material_action(self):
+        return self.state.intervention_level == INTERVENTION_FORCED
+
+    def admissible_tools(self, tool_names):
+        names = set(tool_names)
+        if not self.requires_material_action():
+            return names
+        if self.read_only:
+            return set()
+        return names & {"write_file", "patch_file"}
 
     @staticmethod
     def action_key(tool_name, args):
@@ -219,6 +492,10 @@ class ProgressController:
             self.state.intervention_level = INTERVENTION_NORMAL
             self.state.pending_notices.clear()
             self.state.stuck_detected = False
+            # Argument validation failures belong to the workspace revision in
+            # which they occurred. A successful mutation may make the exact
+            # same operation valid, so failures must not poison later phases.
+            self.state.rejected_actions.clear()
         else:
             if executed and identity not in self.state.observations and status in {"ok", "partial_success", "error"}:
                 evidence = ProgressEvidence(NEW_EVIDENCE, observation_hash, "new_observation")
@@ -231,11 +508,24 @@ class ProgressController:
                 self.state.discovery_streak += 1
                 self.state.max_discovery_streak = max(self.state.max_discovery_streak, self.state.discovery_streak)
             elif tool_name in {"run_shell", "run_verification"} and executed:
-                if tool_name == "run_verification" or is_validation_command(args.get("command", "")):
+                validation = tool_name == "run_verification" or is_validation_command(
+                    args.get("command", "")
+                )
+                if validation:
                     self.state.shell_count += 1
-                self.state.discovery_streak = 0
-            else:
-                self.state.discovery_streak = 0
+                    self.state.discovery_streak = 0
+                else:
+                    # A shell command with no workspace effect and no
+                    # verification is still exploration. Treating it as
+                    # progress lets `cat`/`rg` bypass the discovery budget.
+                    self.state.discovery_streak += 1
+                    self.state.max_discovery_streak = max(
+                        self.state.max_discovery_streak,
+                        self.state.discovery_streak,
+                    )
+            # Rejected actions and non-mutating write attempts are not phase
+            # progress. Preserve the exploration streak instead of letting an
+            # invalid write reset the forced-decision budget.
             if self.state.intervention_level == INTERVENTION_FORCED:
                 self.state.post_hard_no_progress = self.state.post_hard_no_progress + 1 if evidence.kind == NO_PROGRESS else 0
                 self._detect_stuck()
@@ -245,6 +535,14 @@ class ProgressController:
             if tool_name in STABLE_READ_TOOLS and status == "ok":
                 self.state.successful_reads.add(signature.key)
                 self.ledger.record_read(tool_name, args)
+                if self._is_broad_exploration(tool_name, args):
+                    self.ledger.broad_exploration_count += 1
+                    if (
+                        self.ledger.grounding_confidence == "high"
+                        and self.ledger.grounding_paths
+                        and self.ledger.targeted_read_count == 0
+                    ):
+                        self.state.pending_notices.append(self._grounding_notice())
             if tool_name in {"run_shell", "run_verification"}:
                 validation = tool_name == "run_verification"
                 command = (
@@ -258,16 +556,23 @@ class ProgressController:
                     "kind": "validation" if validation else "shell_execution",
                 }
                 self.ledger.validations.append(record)
+                self.ledger.validation_count += 1
+                del self.ledger.validations[:-MAX_LEDGER_VALIDATIONS]
                 if validation and status == "ok":
                     self.ledger.unverified_changes.clear()
+                    self.ledger.unverified_change_count = 0
                 elif validation:
                     self.ledger.unresolved_failures.append(record)
+                    self.ledger.unresolved_failure_count += 1
+                    del self.ledger.unresolved_failures[:-MAX_LEDGER_FAILURES]
         self._maybe_intervene()
         return evidence
 
     def _maybe_intervene(self):
-        no_effects = self.state.mutation_count == 0 and self.state.shell_count == 0
-        if no_effects and self.state.discovery_streak >= self.hard_discovery_limit and self.state.intervention_level != INTERVENTION_FORCED:
+        if (
+            self.state.discovery_streak >= self.hard_discovery_limit
+            and self.state.intervention_level != INTERVENTION_FORCED
+        ):
             self.state.intervention_level = INTERVENTION_FORCED
             self.state.intervention_count += 1
             self.state.post_hard_no_progress = 0
@@ -296,10 +601,21 @@ class ProgressController:
 
     def _forced_notice(self):
         if self.read_only:
-            action = "Produce new evidence, finalize, or identify a blocker."
+            action = "Finalize from existing evidence or identify a blocker."
         else:
-            action = "Modify, verify, finalize, or identify a blocker."
-        return "Runtime notice: the exploration budget is exhausted; broad exploration must stop. " + action
+            action = "Modify with write_file/patch_file, finalize, or identify a blocker."
+        return (
+            "Runtime notice: the exploration budget is exhausted; further reads, searches, "
+            "delegation, and shell exploration are unavailable until a workspace mutation. "
+            + action
+        )
+
+    def _grounding_notice(self):
+        candidates = ", ".join(sorted(self.ledger.grounding_paths)[:6])
+        return (
+            "Runtime notice: repository evidence already identified high-confidence candidate files "
+            f"({candidates}). Read those targets before another repository-wide listing or search."
+        )
 
     def metrics(self):
         return {
@@ -311,4 +627,15 @@ class ProgressController:
             "discovery_streak": self.state.discovery_streak,
             "no_progress_streak": self.state.no_progress_streak,
             "intervention_level": self.state.intervention_level,
+            "initial_evidence_count": len(self.ledger.grounding_paths),
+            "grounding_confidence": self.ledger.grounding_confidence,
+            "semantic_backend": self.ledger.semantic_backend,
+            "semantic_status": self.ledger.semantic_status,
+            "broad_exploration_count": self.ledger.broad_exploration_count,
+            "targeted_read_count": self.ledger.targeted_read_count,
+            "evidence_hit_rate": (
+                self.ledger.targeted_read_count / self.ledger.file_read_count
+                if self.ledger.file_read_count
+                else 0.0
+            ),
         }

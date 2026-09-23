@@ -61,7 +61,16 @@ class AgentLoop:
         agent.run_store.write_report(task_state, agent.redact_artifact(agent.build_report(task_state)))
         agent.progress_controller = None
 
-    def _request_model(self, task_state, user_message, prompt, prompt_metadata, run_started_at, purpose):
+    def _request_model(
+        self,
+        task_state,
+        user_message,
+        prompt,
+        prompt_metadata,
+        run_started_at,
+        purpose,
+        turn_policy,
+    ):
         agent = self.agent
         agent.emit_trace(
             task_state,
@@ -71,6 +80,9 @@ class AgentLoop:
                 "tool_steps": task_state.tool_steps,
                 "prompt_cache_key": prompt_metadata.get("prompt_cache_key"),
                 "purpose": purpose,
+                "reasoning_effort": turn_policy.reasoning_effort,
+                "max_output_tokens": turn_policy.max_output_tokens,
+                "budget_decision": turn_policy.decision_reason,
             },
         )
         prompt_cache_key = None
@@ -82,19 +94,26 @@ class AgentLoop:
         try:
             raw = agent.model_client.complete(
                 prompt,
-                agent.max_new_tokens,
+                turn_policy.max_output_tokens,
                 prompt_cache_key=prompt_cache_key,
                 prompt_cache_retention=prompt_cache_retention,
             )
         except ProviderResponseError as exc:
             model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
             completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
+            completion_metadata["requested_output_tokens"] = (
+                turn_policy.max_output_tokens
+            )
             task_state.record_model_duration(
                 model_duration_ms,
                 completion_metadata.get("transport_retries", getattr(exc, "attempts", 1) - 1),
             )
             prompt_metadata.update(completion_metadata)
             agent.last_completion_metadata = completion_metadata
+            agent.model_execution_policy.observe(turn_policy, completion_metadata)
+            agent.session["model_usage_samples"] = (
+                agent.model_execution_policy.usage_snapshot()
+            )
             agent.last_prompt_metadata = prompt_metadata
             if exc.code in {
                 "provider_incomplete",
@@ -131,9 +150,14 @@ class AgentLoop:
             self._persist_model_failure(task_state, user_message, exc, run_started_at, prompt_metadata)
             raise
         completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
+        completion_metadata["requested_output_tokens"] = turn_policy.max_output_tokens
         if completion_metadata:
             prompt_metadata.update(completion_metadata)
         agent.last_completion_metadata = completion_metadata
+        agent.model_execution_policy.observe(turn_policy, completion_metadata)
+        agent.session["model_usage_samples"] = (
+            agent.model_execution_policy.usage_snapshot()
+        )
         model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
         task_state.record_model_duration(model_duration_ms, completion_metadata.get("transport_retries", 0))
         agent.last_prompt_metadata = prompt_metadata
@@ -147,6 +171,7 @@ class AgentLoop:
                 "completion_metadata": completion_metadata,
                 "duration_ms": model_duration_ms,
                 "purpose": purpose,
+                "budget_decision": turn_policy.decision_reason,
             },
         )
         return raw, kind, payload
@@ -173,6 +198,7 @@ class AgentLoop:
                 "native_tools": True,
                 "reasoning_effort": turn_policy.reasoning_effort,
                 "max_output_tokens": turn_policy.max_output_tokens,
+                "budget_decision": turn_policy.decision_reason,
             },
         )
         model_started_at = time.monotonic()
@@ -201,8 +227,13 @@ class AgentLoop:
             self._persist_model_failure(task_state, user_message, exc, run_started_at, prompt_metadata)
             raise
         completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
+        completion_metadata["requested_output_tokens"] = turn_policy.max_output_tokens
         prompt_metadata.update(completion_metadata)
         agent.last_completion_metadata = completion_metadata
+        agent.model_execution_policy.observe(turn_policy, completion_metadata)
+        agent.session["model_usage_samples"] = (
+            agent.model_execution_policy.usage_snapshot()
+        )
         model_duration_ms = int((time.monotonic() - model_started_at) * 1000)
         task_state.record_model_duration(model_duration_ms, completion_metadata.get("transport_retries", 0))
         agent.last_prompt_metadata = prompt_metadata
@@ -218,12 +249,15 @@ class AgentLoop:
                 "response_status": turn.response_status,
                 "incomplete_reason": turn.incomplete_reason,
                 "protocol_error": turn.protocol_error,
+                "budget_decision": turn_policy.decision_reason,
             },
         )
         return turn
 
     def _finish_success(self, task_state, user_message, final, run_started_at):
         agent = self.agent
+        if agent.progress_controller is not None:
+            task_state.record_progress(agent.progress_controller.metrics())
         # Perform the session compare-and-swap before crossing the workspace
         # commit boundary. A stale concurrent session must not deliver code.
         agent.session_path = agent.session_store.save(agent.session)
@@ -239,7 +273,8 @@ class AgentLoop:
             staged_paths, delivered_paths = paths, []
         else:
             validation_failed = any(
-                item.get("reason") in {"verification_failed", "verification_stale"}
+                item.get("reason")
+                in {"verification_failed", "verification_stale", "verification_required"}
                 for item in conflicts
             )
             scope_violation = any(
@@ -247,7 +282,10 @@ class AgentLoop:
             )
             if validation_failed:
                 reason = "validation_failed"
-                final = "Run did not complete: validation failed and staged changes were not delivered."
+                final = (
+                    "Run did not complete: validation failed because required validation was "
+                    "not passed or became stale; staged changes were not delivered."
+                )
             elif scope_violation:
                 reason = "scope_constraint_violation"
                 final = "Run did not complete: staged changes violated an explicit no-modification constraint."
@@ -291,7 +329,25 @@ class AgentLoop:
     def _close_aborted_run(self, user_message, stop_reason, error_text=""):
         agent = self.agent
         task_state = agent.current_task_state
-        if task_state is None or task_state.status != "running":
+        if task_state is None:
+            return
+        if task_state.status != "running":
+            # A Session CAS can fail after the irreversible workspace commit
+            # but before final history/checkpoint persistence. Delivery state
+            # is already authoritative; close the audit record without
+            # rewriting the successful task as failed or pretending the
+            # Session update succeeded.
+            agent.run_store.write_task_state(task_state)
+            agent.emit_trace(
+                task_state,
+                "post_completion_persistence_failed",
+                {"stop_reason": stop_reason, "error": error_text},
+            )
+            agent.run_store.write_report(
+                task_state,
+                agent.redact_artifact(agent.build_report(task_state)),
+            )
+            agent.progress_controller = None
             return
         final = {
             "interrupted": "Run interrupted; the staged workspace was preserved for resume.",
@@ -388,6 +444,18 @@ class AgentLoop:
         user_message = agent.redact_text(user_message)
         run_started_at = time.monotonic()
         agent.current_run_started_at = run_started_at
+        # These fields describe one run, not the Session or the active Shadow
+        # transaction. Reset them at the run boundary so an early failure or a
+        # read-only follow-up cannot inherit evidence/report metadata from the
+        # preceding request.
+        agent.last_prompt_metadata = {}
+        agent.last_completion_metadata = {}
+        agent.last_durable_promotions = []
+        agent.last_durable_rejections = []
+        agent.last_durable_superseded = []
+        agent.last_run_outcome = None
+        agent.last_repository_evidence = {}
+        agent._last_tool_result_metadata = {}
         task_state = TaskState.create(run_id=agent.new_run_id(), task_id=agent.new_task_id(), user_request=user_message)
         interaction = agent.interaction_contract(user_message)
         agent.current_interaction = interaction
@@ -413,10 +481,11 @@ class AgentLoop:
         agent.record({"role": "user", "content": user_message, "created_at": now()})
         controller = ProgressController(
             max_steps=agent.max_steps,
-            read_only=agent.read_only,
+            read_only=agent.read_only or not interaction.get("mutation_allowed", False),
             soft_discovery_limit=agent.soft_discovery_limit,
             hard_discovery_limit=agent.hard_discovery_limit,
             ledger=agent.session.get("execution_ledger", {}),
+            repository_evidence=agent.last_repository_evidence,
         )
         agent.progress_controller = controller
         native_mode = bool(
@@ -450,6 +519,7 @@ class AgentLoop:
         stuck_final = None
         contract_failure_final = None
         contract_failures = 0
+        contract_failure_reason = ""
         model_notice = ""
         request_profile = interaction["request_profile"]
         prompt_metadata_base = {
@@ -475,10 +545,26 @@ class AgentLoop:
                 notice for notice in (progress_notice, model_notice) if notice
             )
             model_notice = ""
+            turn_policy = agent.model_execution_policy.for_turn(
+                purpose="action",
+                max_output_tokens=agent.max_new_tokens,
+                read_only=controller.read_only,
+                recovering=contract_failures > 0,
+                request_profile=request_profile,
+                recovery_reason=contract_failure_reason,
+                completion_metadata=agent.last_completion_metadata,
+                recovery_attempt=contract_failures,
+                capabilities=getattr(agent.model_client, "capabilities", None),
+            )
             if native_mode:
                 agent.refresh_prefix()
                 input_items, prompt_metadata = projector.build(
-                    user_message, model_events, controller, notice=combined_notice
+                    user_message,
+                    model_events,
+                    controller,
+                    notice=combined_notice,
+                    input_token_budget=turn_policy.max_input_tokens,
+                    chars_per_token=agent.model_execution_policy.chars_per_input_token(),
                 )
                 prompt = ""
             else:
@@ -545,13 +631,6 @@ class AgentLoop:
                     },
                 )
             native_turn = None
-            turn_policy = agent.model_execution_policy.for_turn(
-                purpose="action",
-                max_output_tokens=agent.max_new_tokens,
-                read_only=agent.read_only,
-                recovering=contract_failures > 0,
-                request_profile=request_profile,
-            )
             if native_mode:
                 native_turn = self._request_native_model(
                     task_state,
@@ -564,8 +643,22 @@ class AgentLoop:
                         {
                             name: tool
                             for name, tool in agent.tools.items()
-                            if interaction["mutation_allowed"]
-                            or name in {"list_files", "read_file", "read_files", "search", "inspect_repository"}
+                            if name
+                            in controller.admissible_tools(
+                                {
+                                    candidate
+                                    for candidate in agent.tools
+                                    if interaction["mutation_allowed"]
+                                    or candidate
+                                    in {
+                                        "list_files",
+                                        "read_file",
+                                        "read_files",
+                                        "search",
+                                        "inspect_repository",
+                                    }
+                                }
+                            )
                         }
                     ),
                     turn_policy=turn_policy,
@@ -594,10 +687,23 @@ class AgentLoop:
                     prompt_metadata,
                     run_started_at,
                     purpose="action",
+                    turn_policy=turn_policy,
                 )
 
             if kind == "tool":
+                if contract_failures:
+                    task_state.record_model_recovery()
+                    agent.emit_trace(
+                        task_state,
+                        "model_recovered",
+                        {
+                            "previous_failure": contract_failure_reason,
+                            "recovery_attempts": contract_failures,
+                            "kind": "tool",
+                        },
+                    )
                 contract_failures = 0
+                contract_failure_reason = ""
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 call_id = ""
@@ -611,6 +717,15 @@ class AgentLoop:
                             "arguments": json.dumps(args, ensure_ascii=False, sort_keys=True),
                         }
                     )
+                agent.emit_trace(
+                    task_state,
+                    "tool_started",
+                    {
+                        "name": name,
+                        "args": agent.compact_tool_args(args),
+                        "next_step": task_state.tool_steps + 1,
+                    },
+                )
                 tool_started_at = time.monotonic()
                 tool_result = agent.execute_tool(name, args)
                 result = tool_result.content
@@ -644,7 +759,7 @@ class AgentLoop:
                     "tool_executed",
                     {
                         "name": name,
-                        "args": args,
+                        "args": agent.compact_tool_args(args),
                         "result": clip(result, 500),
                         "duration_ms": tool_duration_ms,
                         **tool_metadata,
@@ -693,6 +808,7 @@ class AgentLoop:
 
             if kind == "retry":
                 contract_failures += 1
+                contract_failure_reason = str(payload)
                 task_state.record_model_contract_failure(
                     "incomplete"
                     if (
@@ -711,7 +827,37 @@ class AgentLoop:
                         "response_status": getattr(native_turn, "response_status", ""),
                     },
                 )
-                if contract_failures > turn_policy.max_contract_retries:
+                failure_kind = (
+                    "incomplete"
+                    if (
+                        native_turn is not None
+                        and native_turn.kind == "incomplete"
+                        or prompt_metadata.get("contract_failure_kind")
+                        == "incomplete"
+                    )
+                    else "invalid"
+                )
+                if failure_kind == "incomplete":
+                    next_policy = agent.model_execution_policy.for_turn(
+                        purpose="action",
+                        max_output_tokens=agent.max_new_tokens,
+                        read_only=controller.read_only,
+                        recovering=True,
+                        request_profile=request_profile,
+                        recovery_reason=contract_failure_reason,
+                        completion_metadata=agent.last_completion_metadata,
+                        recovery_attempt=contract_failures,
+                        capabilities=getattr(
+                            agent.model_client, "capabilities", None
+                        ),
+                    )
+                    retry_permitted = next_policy.recovery_permitted
+                else:
+                    # Malformed protocol does not improve with additional
+                    # output space. One regeneration is enough to distinguish
+                    # a transient formatting error from a repeating failure.
+                    retry_permitted = contract_failures == 1
+                if not retry_permitted:
                     contract_failure_final = (
                         "Stopped because the model failed to produce a complete typed response "
                         f"after bounded recovery: {payload}"
@@ -726,69 +872,187 @@ class AgentLoop:
                 continue
 
             contract_failures = 0
+            if contract_failure_reason:
+                task_state.record_model_recovery()
+                agent.emit_trace(
+                    task_state,
+                    "model_recovered",
+                    {
+                        "previous_failure": contract_failure_reason,
+                        "recovery_attempts": 1,
+                        "kind": "final",
+                    },
+                )
+            contract_failure_reason = ""
             final = (payload or raw).strip()
             return self._finish_success(task_state, user_message, final, run_started_at)
 
         if task_state.tool_steps >= agent.max_steps:
-            task_state.record_attempt()
-            agent.run_store.write_task_state(task_state)
-            prompt_started_at = time.monotonic()
-            if native_mode:
-                input_items, prompt_metadata = projector.build(
-                    user_message, model_events, controller, finalization=True
-                )
-                prompt = ""
-            else:
-                prompt, prompt_metadata = agent._build_prompt_and_metadata(user_message)
-                prompt += (
-                    "\n\nRuntime notice: the tool budget is exhausted. Do not call another tool. "
-                    "Use the evidence already present in the tool history and return exactly one "
-                    "non-empty <final>...</final> answer."
-                )
-            prompt_metadata["finalization"] = True
-            agent.emit_trace(
-                task_state,
-                "prompt_built",
-                {
-                    "prompt_metadata": prompt_metadata,
-                    "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
-                    "purpose": "finalization",
-                },
-            )
-            if native_mode:
+            finalization_failures = 0
+            finalization_reason = ""
+            while attempts < max_attempts:
+                attempts += 1
+                task_state.record_attempt()
+                agent.run_store.write_task_state(task_state)
+                prompt_started_at = time.monotonic()
+                recovery_notice = ""
+                if finalization_failures:
+                    recovery_notice = (
+                        "Runtime notice: finalization was incomplete and rejected "
+                        f"({finalization_reason}). Regenerate one complete final answer "
+                        "from existing evidence. Do not call or describe another tool."
+                    )
                 turn_policy = agent.model_execution_policy.for_turn(
                     purpose="finalization",
                     max_output_tokens=agent.max_new_tokens,
-                    read_only=agent.read_only,
-                    recovering=False,
+                    read_only=controller.read_only,
+                    recovering=finalization_failures > 0,
                     request_profile=request_profile,
+                    recovery_reason=finalization_reason,
+                    completion_metadata=agent.last_completion_metadata,
+                    recovery_attempt=finalization_failures,
+                    capabilities=getattr(agent.model_client, "capabilities", None),
                 )
-                native_turn = self._request_native_model(
+                if native_mode:
+                    input_items, prompt_metadata = projector.build(
+                        user_message,
+                        model_events,
+                        controller,
+                        notice=recovery_notice,
+                        finalization=True,
+                        input_token_budget=turn_policy.max_input_tokens,
+                        chars_per_token=agent.model_execution_policy.chars_per_input_token(),
+                    )
+                    prompt = ""
+                else:
+                    prompt, prompt_metadata = agent._build_prompt_and_metadata(
+                        user_message
+                    )
+                    prompt += (
+                        "\n\nRuntime notice: finalization mode is active. Do not call "
+                        "another tool. Use existing evidence and return exactly one "
+                        "non-empty <final>...</final> answer."
+                    )
+                    if recovery_notice:
+                        prompt += "\n" + recovery_notice
+                prompt_metadata["finalization"] = True
+                agent.emit_trace(
                     task_state,
-                    user_message,
-                    input_items,
-                    prompt_metadata,
-                    run_started_at,
-                    purpose="finalization",
-                    tools=[],
-                    turn_policy=turn_policy,
+                    "prompt_built",
+                    {
+                        "prompt_metadata": prompt_metadata,
+                        "duration_ms": int(
+                            (time.monotonic() - prompt_started_at) * 1000
+                        ),
+                        "purpose": "finalization",
+                    },
                 )
-                raw = agent.redact_text(native_turn.text)
-                decision = CompletionAdmission.evaluate(native_turn)
-                kind = "final" if decision.accepted else "retry"
-                payload = decision.text if decision.accepted else decision.reason
-            else:
-                raw, kind, payload = self._request_model(
+                native_turn = None
+                if native_mode:
+                    native_turn = self._request_native_model(
+                        task_state,
+                        user_message,
+                        input_items,
+                        prompt_metadata,
+                        run_started_at,
+                        purpose="finalization",
+                        tools=[],
+                        turn_policy=turn_policy,
+                    )
+                    raw = agent.redact_text(native_turn.text)
+                    decision = CompletionAdmission.evaluate(native_turn)
+                    kind = "final" if decision.accepted else "retry"
+                    payload = (
+                        decision.text
+                        if decision.accepted
+                        else (
+                            native_turn.incomplete_reason
+                            or native_turn.protocol_error
+                            or decision.reason
+                        )
+                    )
+                else:
+                    raw, kind, payload = self._request_model(
+                        task_state,
+                        user_message,
+                        prompt,
+                        prompt_metadata,
+                        run_started_at,
+                        purpose="finalization",
+                        turn_policy=turn_policy,
+                    )
+                if kind == "final":
+                    if finalization_failures:
+                        task_state.record_model_recovery()
+                        agent.emit_trace(
+                            task_state,
+                            "model_recovered",
+                            {
+                                "previous_failure": finalization_reason,
+                                "recovery_attempts": finalization_failures,
+                                "kind": "final",
+                                "purpose": "finalization",
+                            },
+                        )
+                    final = (payload or raw).strip()
+                    return self._finish_success(
+                        task_state, user_message, final, run_started_at
+                    )
+
+                finalization_failures += 1
+                finalization_reason = str(payload)
+                failure_kind = (
+                    "incomplete"
+                    if (
+                        native_turn is not None
+                        and native_turn.kind == "incomplete"
+                        or prompt_metadata.get("contract_failure_kind")
+                        == "incomplete"
+                    )
+                    else "invalid"
+                )
+                task_state.record_model_contract_failure(failure_kind)
+                agent.emit_trace(
                     task_state,
-                    user_message,
-                    prompt,
-                    prompt_metadata,
-                    run_started_at,
-                    purpose="finalization",
+                    "model_contract_rejected",
+                    {
+                        "reason": finalization_reason,
+                        "consecutive_failures": finalization_failures,
+                        "purpose": "finalization",
+                        "response_status": getattr(
+                            native_turn, "response_status", ""
+                        ),
+                    },
                 )
-            if kind == "final":
-                final = (payload or raw).strip()
-                return self._finish_success(task_state, user_message, final, run_started_at)
+                if failure_kind == "incomplete":
+                    next_policy = agent.model_execution_policy.for_turn(
+                        purpose="finalization",
+                        max_output_tokens=agent.max_new_tokens,
+                        read_only=controller.read_only,
+                        recovering=True,
+                        request_profile=request_profile,
+                        recovery_reason=finalization_reason,
+                        completion_metadata=agent.last_completion_metadata,
+                        recovery_attempt=finalization_failures,
+                        capabilities=getattr(
+                            agent.model_client, "capabilities", None
+                        ),
+                    )
+                    retry_permitted = next_policy.recovery_permitted
+                else:
+                    retry_permitted = finalization_failures == 1
+                if not retry_permitted:
+                    contract_failure_final = (
+                        "Stopped because finalization did not produce a complete "
+                        f"typed answer after bounded recovery: {payload}"
+                    )
+                    break
+
+            if finalization_failures and contract_failure_final is None:
+                contract_failure_final = (
+                    "Stopped because finalization exhausted the remaining request "
+                    f"budget: {finalization_reason}"
+                )
 
         if stuck_final is not None:
             final = stuck_final
@@ -802,6 +1066,7 @@ class AgentLoop:
         else:
             final = "Stopped after reaching the step limit without a final answer."
             task_state.stop_step_limit(final)
+        task_state.record_progress(controller.metrics())
         agent.interrupt_transaction(task_state.stop_reason or "interrupted")
         if agent.transaction_context is not None:
             task_state.transaction_state = agent.transaction_context.workspace.state

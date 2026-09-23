@@ -17,6 +17,7 @@ from . import security as securitylib
 from . import tools as toolkit
 from .checkpoint import CHECKPOINT_NONE_STATUS
 from .context_manager import ContextManager
+from .context_projection import project_model_events
 from .execution import ExecutionLease, WorkspaceCommandRunner
 from .execution_policy import ModelExecutionPolicy
 from .features import memory as memorylib
@@ -30,8 +31,9 @@ from .interaction_policy import (
 from .memory_admission import extract_explicit_memory
 from .outcome import RunOutcome
 from .path_support import logical_path, native_path
+from .progress import ExecutionLedger
 from .prompt_prefix import build_prompt_prefix, tool_signature
-from .repository_graph import RepositoryGraph
+from .repository_intelligence import RepositoryIntelligence
 from .run_store import RunStore
 from .security import REDACTED_VALUE, SecretBoundary
 from .session_store import SessionStore
@@ -41,7 +43,11 @@ from .text_document import TextDecodingError
 from .tool_context import ToolContext
 from .tool_executor import ToolExecutor
 from .transaction_context import TransactionContext
-from .transactional_workspace import COPY_EXCLUDES, TransactionalWorkspace
+from .transactional_workspace import (
+    COPY_EXCLUDES,
+    TERMINAL_STATES,
+    TransactionalWorkspace,
+)
 from .workspace import MAX_HISTORY, WorkspaceContext, clip, now
 
 DEFAULT_SHELL_ENV_ALLOWLIST = (
@@ -71,6 +77,9 @@ DEFAULT_SHELL_ENV_ALLOWLIST = (
     "USERPROFILE",
     "WINDIR",
 )
+MAX_SESSION_HISTORY_ITEMS = 128
+MAX_SESSION_HISTORY_CONTENT_CHARS = 4000
+MAX_SESSION_TOOL_ARGUMENT_CHARS = 2000
 DEFAULT_FEATURE_FLAGS = {
     "memory": True,
     "relevant_memory": True,
@@ -94,7 +103,7 @@ class Pico:
         run_store=None,
         approval_policy="ask",
         max_steps=6,
-        max_new_tokens=512,
+        max_new_tokens=None,
         depth=0,
         max_depth=1,
         read_only=False,
@@ -111,19 +120,31 @@ class Pico:
         model_execution_policy="adaptive",
         progress_sink=None,
         package_layout=None,
+        semantic_index="auto",
     ):
         self.model_client = model_client
         self.workspace = workspace
         self.source_root = Path(workspace.repo_root).resolve()
         self.root = self.source_root
         self.session_store = session_store
-        self.approval_policy = approval_policy
-        self.max_steps = max_steps
-        self.max_new_tokens = max_new_tokens
+        self.approval_policy = str(approval_policy)
+        if self.approval_policy not in {"ask", "auto", "never"}:
+            raise ValueError("approval_policy must be 'ask', 'auto', or 'never'")
+        self.max_steps = int(max_steps)
+        self.max_new_tokens = (
+            int(max_new_tokens) if max_new_tokens not in (None, "") else None
+        )
+        if self.max_steps < 1:
+            raise ValueError("max_steps must be positive")
+        if self.max_new_tokens is not None and self.max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive")
         self.soft_discovery_limit = soft_discovery_limit
         self.hard_discovery_limit = hard_discovery_limit
         self.model_execution_policy = ModelExecutionPolicy(model_execution_policy)
         self.progress_sink = progress_sink
+        self.semantic_index = str(semantic_index or "auto").strip().lower()
+        if self.semantic_index not in {"auto", "off"}:
+            raise ValueError("semantic_index must be 'auto' or 'off'")
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
@@ -156,6 +177,9 @@ class Pico:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
         fallback_state_root = Path(self.session_store.root).parent
+        self.semantic_cache_root = (
+            self.workspace_state.root if self.workspace_state else fallback_state_root
+        ) / "lsp"
         preference_root = self.workspace_state.root if self.workspace_state else fallback_state_root
         self.preference_store = WorkspacePreferenceStore(preference_root / "preferences.json")
         self.package_layout_override = str(package_layout).strip() if package_layout else ""
@@ -175,6 +199,9 @@ class Pico:
             "memory": memorylib.default_memory_state(),
         }
         self._ensure_session_shape()
+        self.model_execution_policy.load_usage(
+            self.session.get("model_usage_samples", [])
+        )
         active_transaction_id = str(self.session.get("active_transaction_id", "")).strip()
         if self.transaction_context is None and active_transaction_id:
             transaction = TransactionalWorkspace.load(
@@ -183,21 +210,29 @@ class Pico:
                 active_transaction_id,
                 secret_boundary=self.secret_boundary,
             )
-            if not transaction.execution_root.exists():
+            if transaction.state in TERMINAL_STATES:
+                # The transaction record is authoritative. A process may stop
+                # after commit/discard persisted its terminal state and removed
+                # the shadow, but before the session pointer is cleared.
+                self.session.pop("active_transaction_id", None)
+                transaction.cleanup_terminal_artifacts()
+                self.session_path = self.session_store.save(self.session)
+            elif not transaction.execution_root.exists():
                 raise RuntimeError("RECOVERY_UNAVAILABLE: transaction shadow workspace is missing")
-            runner = WorkspaceCommandRunner(
-                transaction.execution_root,
-                self.secret_boundary,
-                env_allowlist=self.shell_env_allowlist,
-            )
-            self.transaction_context = TransactionContext(
-                transaction_id=transaction.transaction_id,
-                workspace=transaction,
-                secret_boundary=self.secret_boundary,
-                execution_lease=ExecutionLease(runner),
-                owns_context=True,
-            )
-            self.root = transaction.execution_root
+            else:
+                runner = WorkspaceCommandRunner(
+                    transaction.execution_root,
+                    self.secret_boundary,
+                    env_allowlist=self.shell_env_allowlist,
+                )
+                self.transaction_context = TransactionContext(
+                    transaction_id=transaction.transaction_id,
+                    workspace=transaction,
+                    secret_boundary=self.secret_boundary,
+                    execution_lease=ExecutionLease(runner),
+                    owns_context=True,
+                )
+                self.root = transaction.execution_root
         self.memory = memorylib.LayeredMemory(
             self.session.setdefault("memory", memorylib.default_memory_state()),
             workspace_root=self.root,
@@ -225,6 +260,8 @@ class Pico:
         self.last_shell_validation_succeeded = None  # compatibility for persisted V1 state
         self.last_run_outcome = None
         self.progress_controller = None
+        self.repository_intelligence = None
+        self.last_repository_evidence = {}
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
@@ -260,14 +297,46 @@ class Pico:
 
     def repository_evidence(self, user_message, limit=10):
         try:
-            return clip(RepositoryGraph(self.root).query(user_message, limit=limit), 2400)
+            bundle = self.inspect_repository(user_message, limit, include_semantic=False)
+            self.last_repository_evidence = bundle.ledger_seed()
+            return clip(bundle.render(), 2400)
         except (OSError, TextDecodingError, ValueError):
+            self.last_repository_evidence = {}
             return ""
+
+    def inspect_repository(self, query, limit=12, include_semantic=True):
+        if (
+            self.repository_intelligence is None
+            or self.repository_intelligence.root != Path(self.root).resolve()
+        ):
+            self.close_repository_intelligence()
+            self.repository_intelligence = RepositoryIntelligence(
+                self.root,
+                semantic_mode=self.semantic_index,
+                semantic_cache_root=self.semantic_cache_root,
+            )
+        bundle = self.repository_intelligence.inspect(
+            query,
+            limit=limit,
+            include_semantic=include_semantic,
+        )
+        self.last_repository_evidence = bundle.ledger_seed()
+        if self.progress_controller is not None:
+            self.progress_controller.ledger.seed_repository_evidence(
+                self.last_repository_evidence
+            )
+        return bundle
+
+    def close_repository_intelligence(self):
+        if self.repository_intelligence is not None:
+            self.repository_intelligence.close()
+            self.repository_intelligence = None
 
     def _recover_orphaned_runs(self):
         for payload in self.run_store.claim_orphaned_runs():
             task_state = TaskState.from_dict(payload)
             transaction_error = ""
+            delivered_paths = []
             transaction_id = str(task_state.transaction_id or "").strip()
             if transaction_id:
                 try:
@@ -285,10 +354,19 @@ class Pico:
                         )
                     transaction.interrupt("orphaned_run")
                     task_state.transaction_state = transaction.state
+                    if transaction.state == "COMMITTED":
+                        delivered_paths = [
+                            change["path"] for change in transaction.committed_changes()
+                        ]
                 except Exception as exc:  # noqa: BLE001 - orphan recovery must still close the run record
                     transaction_error = self.redact_text(str(exc))
             final = "Recovered a run left active without a live process owner."
             task_state.stop_orphaned(final)
+            self.capture_run_outcome(
+                task_state,
+                staged_paths=delivered_paths,
+                delivered_paths=delivered_paths,
+            )
             self.run_store.write_task_state(task_state)
             self.emit_trace(
                 task_state,
@@ -319,6 +397,9 @@ class Pico:
             self.source_root,
             self.transactions_root,
             secret_boundary=self.secret_boundary,
+            source_excludes=(
+                (self.workspace_state.global_root,) if self.workspace_state else ()
+            ),
         ).begin()
         runner = WorkspaceCommandRunner(
             transaction.execution_root,
@@ -341,11 +422,32 @@ class Pico:
         self.memory.workspace_root = self.root
         self.tools = self._apply_tool_allowlist(self.build_tools())
         self._apply_prefix_state(self.build_prefix())
-        self.session_path = self.session_store.save(self.session)
+        try:
+            self.session_path = self.session_store.save(self.session)
+        except Exception:
+            # The session pointer is the ownership record for a live shadow.
+            # If it cannot be persisted, the untouched new shadow must not be
+            # left orphaned and undiscoverable.
+            self.session.pop("active_transaction_id", None)
+            self.transaction_context.execution_lease.stop()
+            try:
+                transaction.discard()
+            except OSError:
+                pass
+            self.transaction_context = None
+            self.root = self.source_root
+            self.workspace = WorkspaceContext.build(
+                self.source_root, repo_root_override=self.source_root
+            )
+            self.memory.workspace_root = self.source_root
+            self.tools = self._apply_tool_allowlist(self.build_tools())
+            self._apply_prefix_state(self.build_prefix())
+            raise
         return self.transaction_context
 
     def _restore_source_view(self, clear_context=True):
         context = self.transaction_context
+        self.close_repository_intelligence()
         self.root = self.source_root
         self.workspace = WorkspaceContext.build(self.source_root, repo_root_override=self.source_root)
         self.memory.workspace_root = self.source_root
@@ -381,6 +483,13 @@ class Pico:
             return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
         if self.last_verification_succeeded is False:
             conflicts = transaction.block_validation("verification_failed")
+            return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
+        if (
+            changes
+            and (self.current_interaction or {}).get("validation_required")
+            and self.last_verification_succeeded is not True
+        ):
+            conflicts = transaction.block_validation("verification_required")
             return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
         conflicts = transaction.validate_commit()
         if conflicts:
@@ -462,20 +571,71 @@ class Pico:
         )
 
     def _ensure_session_shape(self):
-        self.session.setdefault("history", [])
-        self.session.setdefault("memory", memorylib.default_memory_state())
+        history = self.session.setdefault("history", [])
+        if not isinstance(history, list):
+            self.session["history"] = []
+        else:
+            normalized_history = []
+            for raw_item in history[-MAX_SESSION_HISTORY_ITEMS:]:
+                if not isinstance(raw_item, dict):
+                    continue
+                item = dict(raw_item)
+                item["role"] = str(item.get("role", ""))
+                item["content"] = clip(
+                    str(item.get("content", "")),
+                    MAX_SESSION_HISTORY_CONTENT_CHARS,
+                )
+                if item["role"] == "tool":
+                    item["name"] = str(item.get("name", ""))
+                    raw_args = item.get("args", {})
+                    item["args"] = self.compact_tool_args(
+                        raw_args if isinstance(raw_args, dict) else {}
+                    )
+                normalized_history.append(item)
+            self.session["history"] = normalized_history
+        memory = self.session.setdefault("memory", memorylib.default_memory_state())
+        if not isinstance(memory, dict):
+            self.session["memory"] = memorylib.default_memory_state()
         model_events = self.session.setdefault("model_events", [])
         if not isinstance(model_events, list):
             self.session["model_events"] = []
+        else:
+            self.session["model_events"], _ = project_model_events(
+                model_events, event_limit=24
+            )
+        usage_samples = self.session.setdefault("model_usage_samples", [])
+        if not isinstance(usage_samples, list):
+            self.session["model_usage_samples"] = []
+        else:
+            self.session["model_usage_samples"] = [
+                dict(item) for item in usage_samples[-32:] if isinstance(item, dict)
+            ]
         execution_ledger = self.session.setdefault("execution_ledger", {})
         if not isinstance(execution_ledger, dict):
             self.session["execution_ledger"] = {}
+        else:
+            self.session["execution_ledger"] = ExecutionLedger.from_dict(
+                execution_ledger
+            ).to_dict()
         checkpoints = self.session.setdefault("checkpoints", {})
         if not isinstance(checkpoints, dict):
             checkpoints = {}
             self.session["checkpoints"] = checkpoints
         checkpoints.setdefault("current_id", "")
-        checkpoints.setdefault("items", {})
+        checkpoint_items = checkpoints.setdefault("items", {})
+        if not isinstance(checkpoint_items, dict):
+            checkpoints["items"] = {}
+        else:
+            retained_items = {}
+            for checkpoint_id, raw_checkpoint in list(checkpoint_items.items())[
+                -checkpointlib.MAX_CHECKPOINTS:
+            ]:
+                normalized = checkpointlib.normalize_checkpoint(raw_checkpoint)
+                if normalized is not None:
+                    retained_items[str(checkpoint_id)] = normalized
+            checkpoints["items"] = retained_items
+            if checkpoints.get("current_id") not in retained_items:
+                checkpoints["current_id"] = next(reversed(retained_items), "")
         runtime_identity = self.session.setdefault("runtime_identity", {})
         if not isinstance(runtime_identity, dict):
             self.session["runtime_identity"] = {}
@@ -620,11 +780,37 @@ class Pico:
         return prompt
 
     def record(self, item):
-        self.session["history"].append(self.redact_artifact(item))
+        history = self.session["history"]
+        item = self.redact_artifact(item)
+        if isinstance(item, dict):
+            item = dict(item)
+            if "content" in item:
+                item["content"] = clip(
+                    item["content"], MAX_SESSION_HISTORY_CONTENT_CHARS
+                )
+            if item.get("role") == "tool":
+                item["args"] = self.compact_tool_args(item.get("args", {}))
+        history.append(item)
+        del history[:-MAX_SESSION_HISTORY_ITEMS]
         self.session_path = self.session_store.save(self.session)
 
+    @staticmethod
+    def compact_tool_args(args):
+        compact = {}
+        for key, value in dict(args or {}).items():
+            if isinstance(value, str) and len(value) > MAX_SESSION_TOOL_ARGUMENT_CHARS:
+                compact[key] = (
+                    f"[compacted argument; original_chars={len(value)}]\n"
+                    + clip(value, 600)
+                )
+                compact[f"{key}_chars"] = len(value)
+            else:
+                compact[key] = value
+        return compact
+
     def record_model_events(self, events, execution_ledger=None):
-        self.session["model_events"] = self.redact_artifact(list(events)[-24:])
+        projected, _ = project_model_events(events, event_limit=24)
+        self.session["model_events"] = self.redact_artifact(projected)
         if execution_ledger is not None:
             self.session["execution_ledger"] = self.redact_artifact(execution_ledger)
         self.session_path = self.session_store.save(self.session)
@@ -970,7 +1156,27 @@ class Pico:
             "model_duration_ms": task_state.model_duration_ms,
             "tool_duration_ms": task_state.tool_duration_ms,
             "provider_retry_count": task_state.provider_retry_count,
+            "model_recovery_count": task_state.model_recovery_count,
+            "completion_quality": task_state.completion_quality(),
             "model_execution_policy": self.model_execution_policy.mode,
+            "adaptive_budget": {
+                "hard_output_cap": self.max_new_tokens,
+                "last_requested_output_tokens": self.last_completion_metadata.get(
+                    "requested_output_tokens"
+                ),
+                "last_input_tokens": self.last_completion_metadata.get(
+                    "input_tokens"
+                ),
+                "last_output_tokens": self.last_completion_metadata.get(
+                    "output_tokens"
+                ),
+                "last_incomplete_reason": self.last_completion_metadata.get(
+                    "incomplete_reason", ""
+                ),
+                "usage_sample_count": len(
+                    self.model_execution_policy.usage_snapshot()
+                ),
+            },
             "execution_backend": "workspace-process",
             "execution_isolation": "deployment-boundary",
             "session_revision": int(self.session.get("revision", 0)),
@@ -979,6 +1185,12 @@ class Pico:
                 "changed_paths": list(task_state.changed_paths),
                 "validation_commands": list(task_state.validation_commands),
                 "validation_status": task_state.validation_status,
+                "initial_evidence_count": task_state.initial_evidence_count,
+                "broad_exploration_count": task_state.broad_exploration_count,
+                "targeted_read_count": task_state.targeted_read_count,
+                "evidence_hit_rate": task_state.evidence_hit_rate,
+                "semantic_backend": task_state.semantic_backend,
+                "semantic_status": task_state.semantic_status,
             },
         }
 
@@ -994,6 +1206,9 @@ class Pico:
             root=self.root,
             path_resolver=self.path,
             shell_env_provider=self.shell_env,
+            repository_inspector=lambda query, limit: self.inspect_repository(
+                query, limit, include_semantic=True
+            ),
             command_runner=(
                 self.transaction_context.execution_lease.runner
                 if self.transaction_context is not None
@@ -1028,6 +1243,7 @@ class Pico:
             soft_discovery_limit=self.soft_discovery_limit,
             hard_discovery_limit=self.hard_discovery_limit,
             model_execution_policy=self.model_execution_policy.mode,
+            semantic_index=self.semantic_index,
             progress_sink=self.progress_sink,
             package_layout=self.effective_package_layout(),
         )

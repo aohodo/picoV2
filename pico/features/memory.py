@@ -16,6 +16,8 @@ from ..workspace import clip, now
 WORKING_FILE_LIMIT = 8
 EPISODIC_NOTE_LIMIT = 12
 FILE_SUMMARY_LIMIT = 6
+NOTE_TAG_LIMIT = 16
+NOTE_TAG_CHAR_LIMIT = 120
 
 DURABLE_TOPIC_DEFAULTS = {
     "project-conventions": {
@@ -422,7 +424,11 @@ def _normalize_note(note, index):
     kind = str(note.get("kind", "episodic")).strip() or "episodic"
     return {
         "text": text,
-        "tags": _dedupe_preserve_order(tags),
+        "tags": _dedupe_preserve_order(
+            clip(str(tag).strip(), NOTE_TAG_CHAR_LIMIT)
+            for tag in tags
+            if str(tag).strip()
+        )[-NOTE_TAG_LIMIT:],
         "source": source,
         "created_at": created_at,
         "note_index": note_index,
@@ -506,7 +512,18 @@ def normalize_memory_state(state, workspace_root=None):
             "created_at": created_at,
             "freshness": freshness,
         }
-    state["file_summaries"] = normalized_file_summaries
+    recent_paths = [
+        path
+        for path in working["recent_files"]
+        if path in normalized_file_summaries
+    ]
+    other_paths = [
+        path for path in normalized_file_summaries if path not in recent_paths
+    ]
+    retained_paths = (other_paths + recent_paths)[-FILE_SUMMARY_LIMIT:]
+    state["file_summaries"] = {
+        path: normalized_file_summaries[path] for path in retained_paths
+    }
 
     next_note_index = state.get("next_note_index")
     if not isinstance(next_note_index, int) or next_note_index < 0:
@@ -549,8 +566,12 @@ def append_note(state, text, tags=(), source="", created_at=None, workspace_root
         return state
 
     normalized_tags = _dedupe_preserve_order(
-        [str(tag).strip() for tag in _ensure_list(tags) if str(tag).strip()]
-    )
+        [
+            clip(str(tag).strip(), NOTE_TAG_CHAR_LIMIT)
+            for tag in _ensure_list(tags)
+            if str(tag).strip()
+        ]
+    )[-NOTE_TAG_LIMIT:]
     note = {
         "text": text,
         "tags": normalized_tags,

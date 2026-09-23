@@ -134,6 +134,15 @@ def _configured_secret_names(args):
     return sorted(configured_secret_names)
 
 
+def _optional_positive_int(value, name):
+    if value in (None, ""):
+        return None
+    parsed = int(value)
+    if parsed < 1:
+        raise ValueError(f"{name} must be positive")
+    return parsed
+
+
 def _build_model_client(args):
     provider = _effective_provider(args)
     # CLI 只负责把 provider 选择翻译成具体 client。
@@ -155,6 +164,16 @@ def _build_model_client(args):
                 getattr(args, "openai_reasoning_effort", None)
                 or provider_env("PICO_OPENAI_REASONING_EFFORT")
                 or None
+            ),
+            context_window=_optional_positive_int(
+                getattr(args, "model_context_window", None)
+                or provider_env("PICO_MODEL_CONTEXT_WINDOW"),
+                "model context window",
+            ),
+            max_output_tokens=_optional_positive_int(
+                getattr(args, "model_max_output_tokens", None)
+                or provider_env("PICO_MODEL_MAX_OUTPUT_TOKENS"),
+                "model maximum output tokens",
             ),
         )
     if provider == "anthropic":
@@ -297,6 +316,7 @@ def build_agent(args):
             hard_discovery_limit=getattr(args, "hard_discovery_limit", None),
             model_execution_policy=getattr(args, "model_execution_policy", "adaptive"),
             package_layout=getattr(args, "package_layout", None),
+            semantic_index=getattr(args, "semantic_index", "auto"),
         )
     return Pico(
         model_client=model,
@@ -312,6 +332,7 @@ def build_agent(args):
         hard_discovery_limit=getattr(args, "hard_discovery_limit", None),
         model_execution_policy=getattr(args, "model_execution_policy", "adaptive"),
         package_layout=getattr(args, "package_layout", None),
+        semantic_index=getattr(args, "semantic_index", "auto"),
     )
 
 
@@ -349,6 +370,24 @@ def build_arg_parser():
         default="adaptive",
         help="Per-turn thinking policy. An explicit --openai-reasoning-effort still takes precedence.",
     )
+    parser.add_argument(
+        "--model-context-window",
+        type=int,
+        default=None,
+        help="Authoritative model context-window capability when the compatible API does not publish it.",
+    )
+    parser.add_argument(
+        "--model-max-output-tokens",
+        type=int,
+        default=None,
+        help="Authoritative model output capability; this is not a per-turn target.",
+    )
+    parser.add_argument(
+        "--semantic-index",
+        choices=("auto", "off"),
+        default="auto",
+        help="Use optional Python/Java language-server evidence when pico[lsp] is installed.",
+    )
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
     parser.add_argument(
         "--package-layout",
@@ -383,7 +422,18 @@ def build_arg_parser():
         default=None,
         help="Exploratory tool streak that triggers a forced-decision intervention.",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
+    parser.add_argument(
+        "--max-output-cap",
+        "--max-new-tokens",
+        dest="max_new_tokens",
+        type=int,
+        default=None,
+        help=(
+            "Optional hard ceiling for a model turn. By default Pico lets the "
+            "adaptive policy and provider capabilities choose; --max-new-tokens "
+            "is retained as a deprecated alias."
+        ),
+    )
     parser.add_argument(
         "--no-progress",
         action="store_true",

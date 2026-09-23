@@ -11,9 +11,19 @@ import urllib.error
 import urllib.request
 from http.client import RemoteDisconnected
 
-from ..model_contract import ModelTurn
+from ..model_contract import ModelCapabilities, ModelTurn
 
 OPENAI_COMPATIBLE_USER_AGENT = "pico/0.1"
+MAX_PROVIDER_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
+def _positive_optional_int(value):
+    if value in (None, ""):
+        return None
+    parsed = int(value)
+    if parsed < 1:
+        raise ValueError("model capability limits must be positive")
+    return parsed
 
 
 class ProviderResponseError(RuntimeError):
@@ -51,11 +61,27 @@ def _backoff(attempt):
     time.sleep(0.25 * (2 ** attempt))
 
 
+def _read_response_text(response, backend):
+    try:
+        body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+    except TypeError:
+        # Some compatible transports and small test doubles expose read()
+        # without a size argument. The post-read bound still rejects excess.
+        body = response.read()
+    if len(body) > MAX_PROVIDER_RESPONSE_BYTES:
+        raise ProviderResponseError(
+            "provider_response_too_large",
+            f"{backend} response exceeded {MAX_PROVIDER_RESPONSE_BYTES} bytes",
+        )
+    return body.decode("utf-8")
+
+
 class FakeModelClient:
     def __init__(self, outputs):
         self.outputs = list(outputs)
         self.prompts = []
         self.supports_prompt_cache = False
+        self.capabilities = ModelCapabilities()
         self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, **kwargs):
@@ -75,23 +101,26 @@ class OllamaModelClient:
         self.top_p = top_p
         self.timeout = timeout
         self.supports_prompt_cache = False
+        self.capabilities = ModelCapabilities()
         self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, **kwargs):
         # Ollama 当前不支持我们这里接入的 prompt cache 语义，
         # 所以 runtime 传下来的缓存参数会被忽略。
         self.last_completion_metadata = {}
+        options = {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+        }
+        if max_new_tokens is not None:
+            options["num_predict"] = int(max_new_tokens)
         payload = {
             "model": self.model,
             "prompt": prompt,
             "stream": False,
             "raw": False,
             "think": False,
-            "options": {
-                "num_predict": max_new_tokens,
-                "temperature": self.temperature,
-                "top_p": self.top_p,
-            },
+            "options": options,
         }
         request = urllib.request.Request(
             self.host + "/api/generate",
@@ -101,7 +130,7 @@ class OllamaModelClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
+                data = json.loads(_read_response_text(response, "Ollama"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Ollama request failed with HTTP {exc.code}: {body}") from exc
@@ -238,7 +267,15 @@ def _extract_usage_cache_details(data):
 
 class OpenAICompatibleModelClient:
     def __init__(
-        self, model, base_url, api_key, temperature, timeout, reasoning_effort=None
+        self,
+        model,
+        base_url,
+        api_key,
+        temperature,
+        timeout,
+        reasoning_effort=None,
+        context_window=None,
+        max_output_tokens=None,
     ):
         self.model = model
         self.base_url = _normalize_versioned_base_url(base_url)
@@ -247,8 +284,6 @@ class OpenAICompatibleModelClient:
         self.timeout = timeout
         configured_effort = str(reasoning_effort or "").strip().lower()
         self.reasoning_effort_explicit = bool(configured_effort)
-        if not configured_effort and str(model).lower().startswith("qwen3.8"):
-            configured_effort = "medium"
         if configured_effort and configured_effort not in {
             "none", "minimal", "low", "medium", "high", "xhigh", "max"
         }:
@@ -258,6 +293,16 @@ class OpenAICompatibleModelClient:
         # 避免对不支持的后端传一个“看起来统一、其实没意义”的伪参数。
         self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes"))
         self.supports_native_tools = True
+        self.capabilities = ModelCapabilities(
+            context_window=_positive_optional_int(context_window),
+            max_output_tokens=_positive_optional_int(max_output_tokens),
+            supports_reasoning=True,
+            supports_native_tools=True,
+            supports_previous_response_id=False,
+            # A generic OpenAI-compatible endpoint must prove this capability;
+            # accepting an unknown field is not evidence of compaction support.
+            supports_server_compaction=False,
+        )
         self.last_completion_metadata = {}
 
     def _request_responses(self, payload, prompt_cache_key=None, prompt_cache_retention=None, reasoning_effort=None):
@@ -273,6 +318,22 @@ class OpenAICompatibleModelClient:
         if self.supports_prompt_cache and prompt_cache_retention:
             payload["prompt_cache_retention"] = prompt_cache_retention
 
+        request_body = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        request_metadata = {
+            "request_body_bytes": len(request_body),
+            "request_input_items": len(payload.get("input") or []),
+            "request_input_chars": len(
+                json.dumps(payload.get("input") or [], ensure_ascii=False)
+            ),
+            "request_tool_schema_chars": len(
+                json.dumps(payload.get("tools") or [], ensure_ascii=False)
+            ),
+            "request_instruction_chars": len(str(payload.get("instructions") or "")),
+        }
+        self.last_completion_metadata = dict(request_metadata)
+
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -282,7 +343,7 @@ class OpenAICompatibleModelClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         request = urllib.request.Request(
             self.base_url + "/responses",
-            data=json.dumps(payload).encode("utf-8"),
+            data=request_body,
             headers=headers,
             method="POST",
         )
@@ -290,23 +351,32 @@ class OpenAICompatibleModelClient:
         for attempt in range(attempts):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    body_text = response.read().decode("utf-8")
+                    body_text = _read_response_text(response, "OpenAI-compatible")
                     response_headers = getattr(response, "headers", {}) or {}
                     content_type = response_headers.get("Content-Type", "")
                 break
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
                 if _retryable_http_status(exc.code) and attempt < attempts - 1:
-                    self.last_completion_metadata = {"transport_retries": attempt + 1}
+                    self.last_completion_metadata = {
+                        **request_metadata,
+                        "transport_retries": attempt + 1,
+                    }
                     _backoff(attempt)
                     continue
                 raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
             except (urllib.error.URLError, RemoteDisconnected, TimeoutError) as exc:
                 if attempt < attempts - 1:
-                    self.last_completion_metadata = {"transport_retries": attempt + 1}
+                    self.last_completion_metadata = {
+                        **request_metadata,
+                        "transport_retries": attempt + 1,
+                    }
                     _backoff(attempt)
                     continue
-                self.last_completion_metadata = {"transport_retries": attempt}
+                self.last_completion_metadata = {
+                    **request_metadata,
+                    "transport_retries": attempt,
+                }
                 raise _transport_error(exc, "OpenAI-compatible", attempts=attempt + 1) from exc
 
         if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
@@ -323,6 +393,7 @@ class OpenAICompatibleModelClient:
         data = _validate_openai_response_envelope(data)
         retries = int(self.last_completion_metadata.get("transport_retries", 0))
         self.last_completion_metadata = {
+            **request_metadata,
             "prompt_cache_supported": self.supports_prompt_cache,
             "prompt_cache_key": prompt_cache_key,
             "prompt_cache_retention": prompt_cache_retention,
@@ -349,9 +420,10 @@ class OpenAICompatibleModelClient:
             "model": self.model,
             "input": list(input_items),
             "tools": list(tools),
-            "max_output_tokens": max_new_tokens,
             "stream": False,
         }
+        if max_new_tokens is not None:
+            payload["max_output_tokens"] = int(max_new_tokens)
         if tools:
             payload["tool_choice"] = "auto"
         if instructions:
@@ -450,9 +522,10 @@ class OpenAICompatibleModelClient:
                     ],
                 }
             ],
-            "max_output_tokens": max_new_tokens,
             "stream": False,
         }
+        if max_new_tokens is not None:
+            payload["max_output_tokens"] = int(max_new_tokens)
         data = self._request_responses(payload, prompt_cache_key, prompt_cache_retention)
         if data["status"] == "incomplete":
             raise ProviderResponseError(
@@ -503,6 +576,7 @@ class AnthropicCompatibleModelClient:
         self.timeout = timeout
         self.thinking = dict(thinking) if thinking else None
         self.supports_prompt_cache = False
+        self.capabilities = ModelCapabilities(output_limit_required=True)
         self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
@@ -510,6 +584,10 @@ class AnthropicCompatibleModelClient:
         # 这里只是显式丢弃，因为当前 Anthropic-compatible 路径没有接缓存复用。
         del prompt_cache_key, prompt_cache_retention
         self.last_completion_metadata = {}
+        if max_new_tokens is None:
+            raise ValueError(
+                "this provider requires an explicit output limit; configure --max-output-cap"
+            )
         payload = {
             "model": self.model,
             "messages": [
@@ -547,7 +625,7 @@ class AnthropicCompatibleModelClient:
         for attempt in range(attempts):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    body_text = response.read().decode("utf-8")
+                    body_text = _read_response_text(response, "Anthropic-compatible")
                 break
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")

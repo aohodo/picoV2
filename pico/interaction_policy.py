@@ -35,6 +35,11 @@ _RELATIVE = re.compile(
     r"(?i)\b(?:a\s+little|slightly|somewhat|smaller|larger|faster|slower|simpler|stricter)\b|"
     r"小一点|大一点|快一点|慢一点|简单一点|严格一点|稍微|略微|适当|一些"
 )
+_VALIDATION_REQUIRED = re.compile(
+    r"(?i)\b(?:run|execute)\s+(?:the\s+)?(?:tests?|build|verification|checks?)\b|"
+    r"\bverify\b|(?:运行|执行|跑)(?:[^，。；\n]{0,24})?(?:测试|构建|校验|验证)|"
+    r"(?:测试|构建)(?:[^，。；\n]{0,12})?(?:通过|成功)"
+)
 _TEMPORARY = re.compile(r"(?i)\b(?:this\s+time|this\s+task|temporarily|for\s+now)\b|本次|这次|本轮|暂时|临时")
 _DURABLE = re.compile(r"(?i)\b(?:from\s+now\s+on|always|default|remember|long[- ]term)\b|以后|今后|默认|长期|记住")
 _PROTECTED_TARGET = re.compile(
@@ -177,6 +182,7 @@ def build_interaction_contract(user_message, package_layout):
     intent = classify_interaction(user_message)
     return {
         **intent.to_dict(),
+        "validation_required": bool(_VALIDATION_REQUIRED.search(str(user_message or ""))),
         "protected_paths": extract_protected_paths(user_message),
         "package_layout": package_layout,
         "instruction_priority": [

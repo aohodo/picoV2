@@ -1,6 +1,12 @@
 """Admission control for model-proposed terminal answers."""
 
+import re
 from dataclasses import dataclass
+
+_EXPLICITLY_INCOMPLETE = re.compile(
+    r"(?i)\b(?:could not|unable to|did not|not yet)\s+(?:fully\s+)?complete(?:d)?\b|"
+    r"\bincomplete\b|未完成|尚未完成|仍未完成|待完成"
+)
 
 
 @dataclass(frozen=True)
@@ -32,4 +38,6 @@ class CompletionAdmission:
                 return CompletionDecision(False, reason="empty_final")
         if text.startswith("<") and ">" not in text:
             return CompletionDecision(False, reason="protocol_fragment")
+        if _EXPLICITLY_INCOMPLETE.search(text):
+            return CompletionDecision(False, reason="explicitly_incomplete_final")
         return CompletionDecision(True, text=text)

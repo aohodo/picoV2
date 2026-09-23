@@ -8,7 +8,6 @@ from functools import partial
 
 from .execution import format_shell_result
 from .path_support import logical_path, native_path
-from .repository_graph import RepositoryGraph
 from .text_document import TextDecodingError, read_text_document, write_text_document
 from .workspace import IGNORED_PATH_NAMES
 
@@ -319,10 +318,13 @@ def tool_search(context, args):
 
 
 def tool_inspect_repository(context, args):
-    return RepositoryGraph(context.root).query(
-        str(args.get("query", "")),
-        limit=int(args.get("limit", 12)),
-    )
+    query = str(args.get("query", ""))
+    limit = int(args.get("limit", 12))
+    if context.repository_inspector is not None:
+        return context.repository_inspector(query, limit).render()
+    from .repository_graph import RepositoryGraph
+
+    return RepositoryGraph(context.root).query(query, limit=limit)
 
 
 def tool_run_shell(context, args):

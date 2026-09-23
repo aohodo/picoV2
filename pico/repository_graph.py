@@ -32,6 +32,7 @@ class Symbol:
     name: str
     kind: str
     line: int
+    column: int = 0
 
 
 @dataclass
@@ -44,6 +45,64 @@ class SourceNode:
     parse_error: str = ""
 
 
+@dataclass(frozen=True)
+class RankedSourceNode:
+    score: int
+    node: SourceNode
+
+
+@dataclass(frozen=True)
+class RepositoryGraphEvidence:
+    query: str
+    total_files: int
+    truncated: bool
+    matches: tuple[RankedSourceNode, ...]
+    reverse: dict[str, frozenset[str]] = field(default_factory=dict, compare=False, repr=False)
+
+    @property
+    def paths(self):
+        return tuple(item.node.path for item in self.matches)
+
+    @property
+    def confidence(self):
+        if not self.matches:
+            return "none"
+        score = self.matches[0].score
+        if score >= 12:
+            return "high"
+        if score >= 6:
+            return "medium"
+        return "low"
+
+    def render(self):
+        lines = [
+            (
+                "repository_graph: "
+                f"files={self.total_files} truncated={'yes' if self.truncated else 'no'} "
+                f"confidence={self.confidence} query={self.query!r}"
+            )
+        ]
+        for item in self.matches:
+            score, node = item.score, item.node
+            symbols = ", ".join(
+                f"{symbol.kind}:{symbol.name}@{symbol.line}" for symbol in node.symbols[:20]
+            ) or "none"
+            imports = ", ".join(node.imports[:12]) or "none"
+            inbound = ", ".join(sorted(self.reverse.get(node.path, ()))[:12]) or "none"
+            lines.extend(
+                [
+                    f"- {node.path} [language={node.language} score={score}]",
+                    f"  module: {node.module or 'none'}",
+                    f"  symbols: {symbols}",
+                    f"  imports: {imports}",
+                    f"  referenced_by: {inbound}",
+                ]
+            )
+            if node.parse_error:
+                lines.append(f"  parse_error: {node.parse_error}")
+        return "\n".join(lines)
+
+
 class RepositoryGraph:
     """Build a small evidence graph without requiring a language server."""
 
@@ -52,6 +111,9 @@ class RepositoryGraph:
         self.max_files = int(max_files)
 
     def query(self, query, limit=12):
+        return self.inspect(query, limit=limit).render()
+
+    def inspect(self, query, limit=12):
         query = str(query or "").strip()
         if not query:
             raise ValueError("query must not be empty")
@@ -66,27 +128,13 @@ class RepositoryGraph:
         selected = [(score, node) for score, node in ranked if score > 0][: max(1, min(int(limit), 30))]
         if not selected:
             selected = ranked[: max(1, min(int(limit), 30))]
-        lines = [
-            f"repository_graph: files={len(nodes)} truncated={'yes' if truncated else 'no'} query={query!r}"
-        ]
-        for score, node in selected:
-            symbols = ", ".join(
-                f"{symbol.kind}:{symbol.name}@{symbol.line}" for symbol in node.symbols[:20]
-            ) or "none"
-            imports = ", ".join(node.imports[:12]) or "none"
-            inbound = ", ".join(sorted(reverse.get(node.path, ()))[:12]) or "none"
-            lines.extend(
-                [
-                    f"- {node.path} [language={node.language} score={score}]",
-                    f"  module: {node.module or 'none'}",
-                    f"  symbols: {symbols}",
-                    f"  imports: {imports}",
-                    f"  referenced_by: {inbound}",
-                ]
-            )
-            if node.parse_error:
-                lines.append(f"  parse_error: {node.parse_error}")
-        return "\n".join(lines)
+        return RepositoryGraphEvidence(
+            query=query,
+            total_files=len(nodes),
+            truncated=truncated,
+            matches=tuple(RankedSourceNode(score, node) for score, node in selected),
+            reverse={path: frozenset(items) for path, items in reverse.items()},
+        )
 
     def _build(self):
         paths = []
@@ -131,10 +179,20 @@ class RepositoryGraph:
         except SyntaxError as exc:
             node.parse_error = f"{exc.msg} at line {exc.lineno}"
             return node
+        source_lines = text.splitlines()
         for item in ast.walk(tree):
             if isinstance(item, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
                 kind = "class" if isinstance(item, ast.ClassDef) else "function"
-                node.symbols.append(Symbol(item.name, kind, int(item.lineno)))
+                line = source_lines[int(item.lineno) - 1]
+                column = line.find(item.name, int(item.col_offset))
+                node.symbols.append(
+                    Symbol(
+                        item.name,
+                        kind,
+                        int(item.lineno),
+                        column if column >= 0 else int(item.col_offset),
+                    )
+                )
             elif isinstance(item, ast.Import):
                 node.imports.extend(alias.name for alias in item.names)
             elif isinstance(item, ast.ImportFrom):
@@ -151,11 +209,27 @@ class RepositoryGraph:
         node = SourceNode(path=relative, language="java", module=package)
         node.imports = sorted(set(JAVA_IMPORT.findall(text)))
         for match in JAVA_TYPE.finditer(text):
-            node.symbols.append(Symbol(match.group(1), "type", text.count("\n", 0, match.start()) + 1))
+            line_start = text.rfind("\n", 0, match.start(1)) + 1
+            node.symbols.append(
+                Symbol(
+                    match.group(1),
+                    "type",
+                    text.count("\n", 0, match.start()) + 1,
+                    match.start(1) - line_start,
+                )
+            )
         for match in JAVA_METHOD.finditer(text):
             name = match.group(1)
             if name not in {"if", "for", "while", "switch", "catch", "return", "new"}:
-                node.symbols.append(Symbol(name, "method", text.count("\n", 0, match.start()) + 1))
+                line_start = text.rfind("\n", 0, match.start(1)) + 1
+                node.symbols.append(
+                    Symbol(
+                        name,
+                        "method",
+                        text.count("\n", 0, match.start()) + 1,
+                        match.start(1) - line_start,
+                    )
+                )
         node.symbols.sort(key=lambda symbol: (symbol.line, symbol.name))
         return node
 
@@ -211,5 +285,11 @@ class RepositoryGraph:
                 score += 6
             score += sum(12 for name in symbol_names if token in name)
             score += sum(3 for name in imports if token in name)
-            score += sum(2 for name in reverse.get(node.path, ()) if token in name.casefold())
+            # Reverse dependencies are supporting evidence, not a popularity
+            # contest. Without a cap, generic words such as "service" make a
+            # widely inherited base class outrank the named policy/symbol.
+            score += min(
+                4,
+                sum(2 for name in reverse.get(node.path, ()) if token in name.casefold()),
+            )
         return score

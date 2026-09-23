@@ -64,6 +64,27 @@ class SessionStore:
             raise SessionLoadError(path, "revision is negative")
         if schema_version != SESSION_SCHEMA_VERSION:
             raise SessionLoadError(path, f"unsupported schema_version {schema_version}")
+        expected_types = {
+            "history": list,
+            "memory": dict,
+            "model_events": list,
+            "model_usage_samples": list,
+            "execution_ledger": dict,
+            "checkpoints": dict,
+            "runtime_identity": dict,
+            "resume_state": dict,
+            "active_transaction_id": str,
+        }
+        for field, expected_type in expected_types.items():
+            if field in payload and not isinstance(payload[field], expected_type):
+                raise SessionLoadError(path, f"field {field!r} has an invalid type")
+        checkpoints = payload.get("checkpoints")
+        if (
+            isinstance(checkpoints, dict)
+            and "items" in checkpoints
+            and not isinstance(checkpoints["items"], dict)
+        ):
+            raise SessionLoadError(path, "field 'checkpoints.items' has an invalid type")
         payload["schema_version"] = schema_version
         payload["revision"] = revision
         return payload

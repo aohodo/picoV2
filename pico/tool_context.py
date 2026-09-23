@@ -13,6 +13,7 @@ class ToolContext:
     depth: int
     max_depth: int
     spawn_delegate: Callable[[dict], str]
+    repository_inspector: Callable[[str, int], object] | None = None
     command_runner: object = None
 
     def path(self, raw_path):

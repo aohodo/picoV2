@@ -42,16 +42,32 @@ REPL 内置命令与会话路径：
 
 需要 Python 3.10+。
 
-如果你用 `uv`，直接安装依赖：
+推荐使用 Conda 创建隔离环境（在项目根目录执行）：
 
 ```bash
-uv sync
+conda env create -f environment.yml
+conda activate pico
 ```
 
-如果你已经在自己的 Python 环境里工作，也可以直接装成可编辑模式：
+如果当前 PowerShell 尚未执行过 `conda init powershell`，无需修改全局 Shell
+配置，也可以直接运行：
 
 ```bash
-pip install -e .
+conda run -n pico pico
+```
+
+大型 Python/Java 仓库可以安装可选语言服务增强。基础 AST/导入图始终可用；
+该 extra 增加定义、引用等 LSP 语义，并在语言服务不可用时自动降级：
+
+```bash
+python -m pip install -e ".[lsp]"
+```
+
+如果环境已创建、需要同步当前源码与依赖：
+
+```bash
+conda activate pico
+python -m pip install -e .
 ```
 
 ## 快速开始
@@ -59,19 +75,23 @@ pip install -e .
 在当前仓库里启动交互模式。默认 provider 是 DeepSeek：
 
 ```bash
-uv run pico
+pico
 ```
 
 指定另一个工作目录：
 
 ```bash
-uv run pico --cwd /path/to/repo
+pico --cwd /path/to/repo
 ```
+
+安装 `lsp` extra 后，`inspect_repository` 会按需启动 Python/Java 语言服务，
+同一个 workspace/transaction 内复用进程。若需要排查语言服务问题或只使用
+快速静态图，可以传 `--semantic-index off`。
 
 直接跑一次性任务：
 
 ```bash
-uv run pico "inspect the test failures and propose a fix"
+pico "inspect the test failures and propose a fix"
 ```
 
 如果当前环境已经安装过包，也可以直接这样启动：
@@ -124,13 +144,13 @@ PICO_DEEPSEEK_MODEL="deepseek-v4-pro"
 所以常规情况下 `.env` 里只填 `PICO_DEEPSEEK_API_KEY` 就能直接启动：
 
 ```bash
-uv run pico
+pico
 ```
 
 如果你需要临时切模型或代理地址，不必改 `.env`，可以直接覆盖：
 
 ```bash
-uv run pico --model deepseek-v4-pro --base-url https://api.deepseek.com/anthropic
+pico --model deepseek-v4-pro --base-url https://api.deepseek.com/anthropic
 ```
 
 DeepSeek 当前走 Anthropic-compatible Messages API，所以 runtime 里复用的是 Anthropic-compatible client；这只影响 HTTP 协议，不影响 CLI 用法。
@@ -153,8 +173,8 @@ PICO_RIGHT_CODES_API_KEY="your-right-codes-key"
 然后按需要选择 provider：
 
 ```bash
-uv run pico --provider openai
-uv run pico --provider anthropic
+pico --provider openai
+pico --provider anthropic
 ```
 
 如果你想显式区分两条 provider 的 key，也可以分别配置：
@@ -184,7 +204,7 @@ PICO_ANTHROPIC_API_KEY="your-right-codes-key-for-claude"
 如果要改用 OpenAI-compatible `/responses` 服务，显式传 `--provider openai`：
 
 ```bash
-uv run pico --provider openai
+pico --provider openai
 ```
 
 默认 OpenAI 兼容接口使用 right.codes 的 Codex endpoint：
@@ -208,7 +228,7 @@ PICO_OPENAI_MODEL="gpt-5.4"
 如果要改用 Anthropic-compatible 服务，显式传 `--provider anthropic`：
 
 ```bash
-uv run pico --provider anthropic
+pico --provider anthropic
 ```
 
 默认 Anthropic 兼容接口使用 right.codes 的 Claude endpoint：
@@ -228,7 +248,7 @@ PICO_ANTHROPIC_MODEL="claude-sonnet-4-6"
 ```bash
 ollama serve
 ollama pull qwen3.5:4b
-uv run pico --provider ollama --model qwen3.5:4b
+pico --provider ollama --model qwen3.5:4b
 ```
 
 ## 常用交互命令
@@ -260,7 +280,7 @@ uv run pico --provider ollama --model qwen3.5:4b
 TSW 只负责 Shadow 工作区、冲突检查、提交、回滚和恢复，不会在每次任务或
 `run_shell` 时启动嵌套 Docker。Shell 命令直接在当前事务的 Shadow 根目录中
 执行，且只继承经过筛选的环境变量。生产部署的宿主隔离由 Pico 外层运行环境
-负责；直接在宿主机运行 `uv run pico` 属于可信本地模式，不等价于安全沙箱。
+负责；直接在宿主机运行 `pico` 属于可信本地模式，不等价于安全沙箱。
 
 如需容器隔离，只构建并启动整个 Pico Runtime：
 
@@ -279,8 +299,8 @@ docker run --rm -it --env-file .env `
 常用本地检查：
 
 ```bash
-uv run pytest tests -q
-uv run ruff check pico tests scripts
+python -m pytest tests -q
+python -m ruff check pico tests scripts
 ```
 
 内部代码现在按较轻的边界拆分：`pico/evaluation/` 放 benchmark 和 metrics，`pico/providers/` 放模型 provider client，`pico/features/` 放可选运行时能力。新代码应直接使用这些包路径；旧的 `pico.evaluator`、`pico.metrics`、`pico.models` 和 `pico.memory` import 不再作为公共入口保留。

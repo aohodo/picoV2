@@ -532,7 +532,8 @@ class ContextManager:
                 "summarized_tool_count": int(rendered["history"].details.get("summarized_tool_count", 0)),
             },
             "current_request": {
-                "text": user_message,
+                "text": _tail_clip(user_message, 1000),
+                "text_truncated": len(user_message) > 1000,
                 "raw_chars": len(user_message),
                 "rendered_chars": len(user_message),
                 "section_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),

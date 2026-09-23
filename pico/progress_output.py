@@ -30,6 +30,13 @@ class ConsoleProgressRenderer:
             retries = int((payload.get("completion_metadata") or {}).get("transport_retries", 0))
             retry_text = f" | transport retries {retries}" if retries else ""
             line = f"[pico] model {payload.get('duration_ms', 0) / 1000:.2f}s | {payload.get('kind', 'unknown')}{retry_text}"
+        elif event == "tool_started":
+            target = self._target(payload.get("args"))
+            line = (
+                f"[pico] step {payload.get('next_step', task_state.tool_steps + 1)} | "
+                f"{payload.get('name', 'tool')}"
+                f"{f' | {target}' if target else ''} | running..."
+            )
         elif event == "tool_executed":
             target = self._target(payload.get("args"))
             status = payload.get("tool_status", "unknown")
@@ -41,6 +48,11 @@ class ConsoleProgressRenderer:
             line = f"[pico] intervention | {payload.get('level', 'unknown')}"
         elif event == "model_contract_rejected":
             line = f"[pico] model response rejected | retry {payload.get('consecutive_failures', 0)}"
+        elif event == "model_recovered":
+            line = (
+                f"[pico] model response recovered | {payload.get('kind', 'unknown')}"
+                f" | after {payload.get('recovery_attempts', 1)} retry"
+            )
         elif event == "model_failed":
             retry_text = (
                 f" | transport retries {task_state.provider_retry_count}"

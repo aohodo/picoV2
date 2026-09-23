@@ -197,9 +197,22 @@ class ToolExecutor:
         preflight = controller.preflight(name, progress_args) if controller is not None else {"allowed": True}
         if not preflight["allowed"]:
             evidence = preflight["evidence"]
+            error_code = (
+                "broad_exploration_after_grounding"
+                if evidence.reason == "broad_exploration_after_grounding"
+                else (
+                    "material_action_required"
+                    if evidence.reason == "material_action_required"
+                    else (
+                        "typed_repository_read_required"
+                        if evidence.reason == "typed_repository_read_required"
+                        else "repeated_no_progress"
+                    )
+                )
+            )
             metadata = _metadata(
                 "rejected",
-                tool_error_code="repeated_no_progress",
+                tool_error_code=error_code,
                 risk_level="high" if tool["risky"] else "low",
                 read_only=not tool["risky"],
             )
@@ -212,9 +225,29 @@ class ToolExecutor:
             )
             return self._finalize(name, args, ToolExecutionResult(
                 content=(
-                    f"error: repeated_no_progress for {name}; this exact read-only call already "
-                    "succeeded and the workspace has not changed. Reuse the previous result or "
-                    "choose a materially different action."
+                    (
+                        f"error: broad_exploration_after_grounding for {name}; high-confidence "
+                        "repository evidence already identified candidate files. Read those "
+                        "targets before another repository-wide listing or search."
+                    )
+                    if error_code == "broad_exploration_after_grounding"
+                    else (
+                        f"error: material_action_required for {name}; the exploration budget is "
+                        "exhausted. Use write_file/patch_file, finalize from existing evidence, "
+                        "or identify a blocker."
+                    )
+                    if error_code == "material_action_required"
+                    else (
+                        f"error: typed_repository_read_required for {name}; use read_file, "
+                        "read_files, list_files, search, or inspect_repository so repository "
+                        "evidence remains bounded and auditable."
+                    )
+                    if error_code == "typed_repository_read_required"
+                    else (
+                        f"error: repeated_no_progress for {name}; this exact read-only call already "
+                        "succeeded and the workspace has not changed. Reuse the previous result or "
+                        "choose a materially different action."
+                    )
                 ),
                 metadata=metadata,
             ), progress_recorded=True, progress_args=progress_args)

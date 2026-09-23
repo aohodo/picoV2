@@ -11,6 +11,9 @@ from pathlib import Path
 
 def default_state_root(env=None):
     env = os.environ if env is None else env
+    configured = str(env.get("PICO_STATE_ROOT", "")).strip()
+    if configured:
+        return Path(configured).expanduser()
     if os.name == "nt":
         base = env.get("LOCALAPPDATA")
         if base:
