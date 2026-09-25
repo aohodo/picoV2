@@ -450,6 +450,8 @@ def normalize_memory_state(state, workspace_root=None):
     working.setdefault("task_summary", "")
     working.setdefault("recent_files", [])
     working["task_summary"] = clip(str(working.get("task_summary", "")).strip(), 300)
+    working["work_note"] = clip(str(working.get("work_note", "")).strip(), 500)
+    working["work_scope"] = str(working.get("work_scope", ""))
     working["recent_files"] = _dedupe_preserve_order(
         [
             canonicalize_path(path, workspace_root)
@@ -697,6 +699,7 @@ def render_memory_text(state, workspace_root=None):
     lines = [
         "Memory:",
         f"- task: {state['working']['task_summary'] or '-'}",
+        f"- tentative work note (model-authored, not verified; current evidence and request take precedence): {state['working']['work_note'] or '-'}",
         f"- recent_files: {', '.join(state['working']['recent_files']) or '-'}",
     ]
 
@@ -750,6 +753,18 @@ class LayeredMemory:
 
     def set_task_summary(self, summary):
         self.state = set_task_summary(self.state, summary, self.workspace_root)
+        return self
+
+    def set_work_scope(self, scope):
+        self.state = normalize_memory_state(self.state, self.workspace_root)
+        if self.state["working"]["work_scope"] != str(scope):
+            self.state["working"]["work_note"] = ""
+        self.state["working"]["work_scope"] = str(scope)
+        return self
+
+    def set_work_note(self, text):
+        self.state = normalize_memory_state(self.state, self.workspace_root)
+        self.state["working"]["work_note"] = clip(str(text).strip(), 500)
         return self
 
     def remember_file(self, path):

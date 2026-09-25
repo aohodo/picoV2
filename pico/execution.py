@@ -313,11 +313,46 @@ class ExecutionLease:
             self.runner.stop()
 
 
-def format_shell_result(result):
+def bound_text_observation(text, limit):
+    text = str(text)
+    if limit is None or len(text) <= limit:
+        return text
+    if limit <= 0:
+        return ""
+    marker = f"\n...[omitted {len(text) - limit} chars]...\n"
+    if len(marker) >= limit:
+        return text[:limit]
+    available = limit - len(marker)
+    head = (available * 2) // 3
+    return text[:head] + marker + text[-(available - head):]
+
+
+def format_shell_result(result, char_budget=None):
     profile = result.get("shell_profile") or {}
-    return (
+    prefix = (
         f"exit_code: {result['exit_code']}\n"
         f"shell: {profile.get('dialect', 'unknown')}\n"
-        f"stdout:\n{result['stdout'].strip() or '(empty)'}\n"
-        f"stderr:\n{result['stderr'].strip() or '(empty)'}"
+    )
+    stdout = result["stdout"].strip() or "(empty)"
+    stderr = result["stderr"].strip() or "(empty)"
+    if char_budget is None:
+        return prefix + f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    labels = "stdout:\n\nstderr:\n"
+    char_budget = max(0, int(char_budget))
+    if char_budget <= len(prefix) + len(labels):
+        return bound_text_observation(prefix + labels, char_budget)
+    available = char_budget - len(prefix) - len(labels)
+    stdout_budget = min(len(stdout), available // 2)
+    stderr_budget = min(len(stderr), available - stdout_budget)
+    remaining = available - stdout_budget - stderr_budget
+    if remaining and len(stdout) > stdout_budget:
+        added = min(remaining, len(stdout) - stdout_budget)
+        stdout_budget += added
+        remaining -= added
+    if remaining and len(stderr) > stderr_budget:
+        stderr_budget += min(remaining, len(stderr) - stderr_budget)
+    return (
+        prefix
+        + f"stdout:\n{bound_text_observation(stdout, stdout_budget)}\n"
+        + f"stderr:\n{bound_text_observation(stderr, stderr_budget)}"
     )

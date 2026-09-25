@@ -17,6 +17,7 @@ from .session_store import SessionConflictError
 from .task_state import TaskState
 from .tool_executor import ToolExecutionResult
 from .tools import native_tool_definitions
+from .verification_feedback import completion_feedback
 from .workspace import clip, now
 
 
@@ -680,6 +681,10 @@ class AgentLoop:
             task_state.transaction_state = agent.transaction_context.workspace.state
             agent.run_store.write_task_state(task_state)
         agent.memory.set_task_summary(user_message)
+        agent.memory.set_work_scope(
+            agent.transaction_context.transaction_id
+            if agent.transaction_context is not None else task_state.task_id
+        )
         agent.record({"role": "user", "content": user_message, "created_at": now()})
         controller = ProgressController(
             max_steps=agent.max_steps,
@@ -746,8 +751,15 @@ class AgentLoop:
             agent.run_store.write_task_state(task_state)
             prompt_started_at = time.monotonic()
             progress_notice = controller.consume_notice()
+            delivery_review_notice = controller.delivery_review_notice()
             combined_notice = "\n".join(
-                notice for notice in (progress_notice, model_notice) if notice
+                notice
+                for notice in (
+                    progress_notice,
+                    model_notice,
+                    delivery_review_notice,
+                )
+                if notice
             )
             model_notice = ""
             turn_policy = agent.model_execution_policy.for_turn(
@@ -786,6 +798,14 @@ class AgentLoop:
                         "level": controller.state.intervention_level,
                         **controller.metrics(),
                     },
+                )
+            if delivery_review_notice:
+                controller.mark_delivery_review_presented()
+                prompt_metadata["delivery_review"] = "presented"
+                agent.emit_trace(
+                    task_state,
+                    "delivery_review_presented",
+                    controller.metrics(),
                 )
             prompt_metadata.update(prompt_metadata_base)
             agent.emit_trace(
@@ -910,6 +930,12 @@ class AgentLoop:
                     )
                 contract_failures = 0
                 contract_failure_reason = ""
+                public_note = raw.strip() if native_turn is not None else raw.split("<tool", 1)[0].strip()
+                # Only the public preamble, never protocol payloads or tagged
+                # provider reasoning, becomes a replaceable working note.
+                if public_note and "<" not in public_note:
+                    agent.memory.set_work_note(agent.redact_text(public_note))
+                    agent.session["memory"] = agent.memory.to_dict()
                 if native_turn is not None and raw.strip():
                     # Preserve the assistant's public plan/preamble alongside
                     # its actions. Never replay opaque provider reasoning items.
@@ -935,10 +961,16 @@ class AgentLoop:
                             ),
                         )
                     ]
-                deferred_reason = ""
+                batch_failure_reason = ""
                 for name, args, call_id in calls:
+                    deferred_reason = ""
                     if task_state.tool_steps >= agent.max_steps:
                         deferred_reason = "the configured tool budget was exhausted"
+                    elif (
+                        batch_failure_reason
+                        and agent.tools.get(name, {}).get("risky", True)
+                    ):
+                        deferred_reason = batch_failure_reason
                     controller.set_remaining_steps(
                         agent.max_steps - task_state.tool_steps
                     )
@@ -953,7 +985,7 @@ class AgentLoop:
                         deferred_reason=deferred_reason,
                     )
                     if metadata.get("tool_status") != "ok":
-                        deferred_reason = (
+                        batch_failure_reason = (
                             "an earlier call failed; inspect its result before requesting further actions"
                         )
                 if controller.state.stuck_detected:
@@ -1054,12 +1086,7 @@ class AgentLoop:
                     # A final message is a proposal, not a workspace commit.
                     # Give the model the same authoritative failure the commit
                     # boundary would return, while there is still room to act.
-                    model_notice = (
-                        "Runtime verification feedback: completion was not accepted "
-                        f"({completion_failure_reason}). Staged changes are preserved. "
-                        "Inspect the test results, repair failures if needed, and run "
-                        "the required verification on the current code before finishing."
-                    )
+                    model_notice = completion_feedback(completion_failure_reason, controller.ledger)
                     agent.emit_trace(
                         task_state,
                         "completion_deferred",
@@ -1067,6 +1094,8 @@ class AgentLoop:
                     )
                     agent.run_store.write_task_state(task_state)
                     continue
+            controller.complete_delivery_review()
+            task_state.record_progress(controller.metrics())
             return self._finish_success(task_state, user_message, final, run_started_at)
 
         if task_state.tool_steps >= agent.max_steps:
@@ -1077,13 +1106,17 @@ class AgentLoop:
                 task_state.record_attempt()
                 agent.run_store.write_task_state(task_state)
                 prompt_started_at = time.monotonic()
-                recovery_notice = ""
+                notices = []
+                delivery_review_notice = controller.delivery_review_notice()
+                if delivery_review_notice:
+                    notices.append(delivery_review_notice)
                 if finalization_failures:
-                    recovery_notice = (
+                    notices.append(
                         "Runtime notice: finalization was incomplete and rejected "
                         f"({finalization_reason}). Regenerate one complete final answer "
                         "from existing evidence. Do not call or describe another tool."
                     )
+                recovery_notice = "\n".join(notices)
                 turn_policy = agent.model_execution_policy.for_turn(
                     purpose="finalization",
                     max_output_tokens=agent.max_new_tokens,
@@ -1117,6 +1150,14 @@ class AgentLoop:
                     )
                     if recovery_notice:
                         prompt += "\n" + recovery_notice
+                if delivery_review_notice:
+                    controller.mark_delivery_review_presented()
+                    prompt_metadata["delivery_review"] = "presented"
+                    agent.emit_trace(
+                        task_state,
+                        "delivery_review_presented",
+                        controller.metrics(),
+                    )
                 prompt_metadata["finalization"] = True
                 agent.emit_trace(
                     task_state,
@@ -1177,6 +1218,8 @@ class AgentLoop:
                             },
                         )
                     final = (payload or raw).strip()
+                    controller.complete_delivery_review()
+                    task_state.record_progress(controller.metrics())
                     return self._finish_success(
                         task_state, user_message, final, run_started_at
                     )

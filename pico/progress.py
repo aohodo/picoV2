@@ -10,7 +10,12 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from .read_observation import ranges_cover, visible_read_coverage
+from .read_observation import (
+    DEFAULT_SOURCE_WINDOW_LINES,
+    ranges_cover,
+    visible_read_coverage,
+)
+from .verification_feedback import verification_observation
 
 NEW_EVIDENCE = "NEW_EVIDENCE"
 MATERIAL_PROGRESS = "MATERIAL_PROGRESS"
@@ -66,7 +71,7 @@ def is_validation_command(command):
 
 
 def is_repository_read_command(command):
-    """Recognize shell pipelines that only duplicate typed repository reads."""
+    """Recognize shell commands containing a typed repository-read operation."""
     text = str(command or "").strip()
     if not text or is_validation_command(text):
         return False
@@ -79,7 +84,10 @@ def is_repository_read_command(command):
         if match is None:
             return False
         commands.append(match.group(1).casefold())
-    return bool(commands) and all(command in REPOSITORY_READ_COMMANDS for command in commands)
+    # A mixed pipeline is still an opaque evidence channel: `cat x | tool`
+    # cannot attach file/revision/range identity to what the model observes.
+    # Executable tests/builds were excluded above and remain shell-capable.
+    return any(command in REPOSITORY_READ_COMMANDS for command in commands)
 
 
 def is_repository_read_argv(argv):
@@ -251,9 +259,16 @@ class ExecutionLedger:
             "mutation_path_count": max(self.mutation_path_count, len(self.mutations)),
             "validations": list(self.validations[-MAX_LEDGER_VALIDATIONS:]),
             "validation_count": max(self.validation_count, len(self.validations)),
-            "unresolved_failures": list(
-                self.unresolved_failures[-MAX_LEDGER_FAILURES:]
-            ),
+            "unresolved_failures": [
+                {**item, "observation": verification_observation(item.get("output", "")), **({
+                    "identity_warning": (
+                        "Legacy verification did not save argument boundaries. "
+                        "Its display command cannot prove which check failed; "
+                        "review original execution evidence before restarting the work unit."
+                    ),
+                } if "argv" not in item else {})}
+                for item in self.unresolved_failures[-MAX_LEDGER_FAILURES:]
+            ],
             "unresolved_failure_count": max(
                 self.unresolved_failure_count, len(self.unresolved_failures)
             ),
@@ -366,6 +381,9 @@ class ProgressState:
     observations: set = field(default_factory=set)
     pending_notices: list = field(default_factory=list)
     rejected_actions: set = field(default_factory=set)
+    delivery_review_pending: bool = False
+    delivery_review_presented: bool = False
+    delivery_review_completed: bool = False
 
 
 class ProgressController:
@@ -399,6 +417,18 @@ class ProgressController:
         self._visible_reads = None
         self.delivery_requirements = dict(delivery_requirements or {})
         self.ledger = ExecutionLedger.from_dict(ledger)
+        validation_records = [
+            item for item in self.ledger.validations
+            if item.get("kind") == "validation"
+        ]
+        self.state.delivery_review_pending = bool(
+            self.ledger.mutation_path_count
+            and validation_records
+            and not self.ledger.unresolved_failures
+            and not self.ledger.unresolved_failure_count
+            and not self.ledger.unverified_changes
+            and not self.ledger.unverified_change_count
+        )
         if repository_evidence:
             self.ledger.seed_repository_evidence(repository_evidence)
 
@@ -437,19 +467,42 @@ class ProgressController:
 
     def _read_is_visible(self, tool_name, args):
         if self._visible_reads is None:
-            return False
+            content = self._read_contents.get(self.signature(tool_name, args).key)
+            return bool(content) and content in (self._visible_outputs or set())
         items = [args] if tool_name == "read_file" else args.get("files", [])
         return bool(items) and all(
-            ranges_cover(self._visible_reads, item.get("path", ""),
-                         self.ledger.path_revision(item.get("path", "")),
-                         int(item.get("start", 1)), int(item.get("end", 200)))
+            ranges_cover(
+                self._visible_reads,
+                item.get("path", ""),
+                self.ledger.path_revision(item.get("path", "")),
+                int(item.get("start", 1)),
+                int(item.get("end", DEFAULT_SOURCE_WINDOW_LINES)),
+            )
             for item in items
         )
 
     def preflight(self, tool_name, args):
-        # Exploration is model-directed. Permissions, path boundaries and
-        # approval are enforced by ToolExecutor; total run limits bound work.
-        return {"allowed": True, "signature": self.signature(tool_name, args)}
+        signature = self.signature(tool_name, args)
+        # This is an evidence-identity check, not a read-count quota. If the
+        # exact current source range is already present in the model's actual
+        # input, executing the read cannot add information. Once the evidence
+        # is compacted away or the path revision changes, the read is allowed.
+        if tool_name in {"read_file", "read_files"} and self._read_is_visible(
+            tool_name, args
+        ):
+            self.state.blocked_repeats += 1
+            self.state.no_progress_streak += 1
+            self._maybe_intervene()
+            return {
+                "allowed": False,
+                "signature": signature,
+                "evidence": ProgressEvidence(
+                    NO_PROGRESS, "", "repeated_no_progress"
+                ),
+            }
+        # Broad exploration remains model-directed. Permissions, path
+        # boundaries and approval are enforced at their own boundaries.
+        return {"allowed": True, "signature": signature}
 
     def requires_material_action(self):
         return False
@@ -480,20 +533,32 @@ class ProgressController:
         status = str(metadata.get("tool_status", ""))
         executed = bool(metadata.get("executed", False))
         changed = bool(metadata.get("workspace_changed", False))
+        if "validation" in metadata:
+            authoritative_verification = bool(metadata["validation"])
+        else:
+            # Backward compatibility for persisted ledgers and callers from
+            # before verification purpose was explicit: run_verification was
+            # always authoritative unless it explicitly says diagnostic.
+            authoritative_verification = bool(
+                tool_name == "run_verification"
+                and str(args.get("purpose", "acceptance")).lower()
+                != "diagnostic"
+            )
         read_evidence = None
         if executed and status == "ok" and "read_coverage" in metadata:
             read_evidence = visible_read_coverage(content, metadata["read_coverage"])
-            read_evidence = [
-                {**item, "revision": self.ledger.path_revision(item["path"])}
-                for item in read_evidence
-            ]
-            metadata["read_evidence"] = read_evidence
 
         if changed:
             affected_paths = list(metadata.get("affected_paths", []))
             if not affected_paths and args.get("path"):
                 affected_paths = [str(args["path"])]
             self.ledger.mark_mutation(affected_paths)
+            if read_evidence is not None:
+                read_evidence = [
+                    {**item, "revision": self.ledger.path_revision(item["path"])}
+                    for item in read_evidence
+                ]
+                metadata["read_evidence"] = read_evidence
             evidence = ProgressEvidence(MATERIAL_PROGRESS, observation_hash, "workspace_changed")
             self.state.workspace_revision += 1
             self.state.mutation_count += 1
@@ -512,7 +577,19 @@ class ProgressController:
             # which they occurred. A successful mutation may make the exact
             # same operation valid, so failures must not poison later phases.
             self.state.rejected_actions.clear()
+            # A review only applies to the exact implementation that was
+            # validated. Any later mutation reopens both verification and
+            # senior review.
+            self.state.delivery_review_pending = False
+            self.state.delivery_review_presented = False
+            self.state.delivery_review_completed = False
         else:
+            if read_evidence is not None:
+                read_evidence = [
+                    {**item, "revision": self.ledger.path_revision(item["path"])}
+                    for item in read_evidence
+                ]
+                metadata["read_evidence"] = read_evidence
             if read_evidence is not None and self._visible_reads is not None:
                 novel = any(not ranges_cover(
                     self._visible_reads, item["path"], item["revision"], item["start"], item["end"]
@@ -540,8 +617,8 @@ class ProgressController:
                 self.state.discovery_streak += 1
                 self.state.max_discovery_streak = max(self.state.max_discovery_streak, self.state.discovery_streak)
             elif tool_name in {"run_shell", "run_verification"} and executed:
-                validation = tool_name == "run_verification" or is_validation_command(
-                    args.get("command", "")
+                validation = authoritative_verification or (
+                    tool_name == "run_shell" and is_validation_command(args.get("command", ""))
                 )
                 if validation:
                     self.state.shell_count += 1
@@ -575,17 +652,38 @@ class ProgressController:
                     ):
                         self.state.pending_notices.append(self._grounding_notice())
             if tool_name in {"run_shell", "run_verification"}:
-                validation = tool_name == "run_verification"
+                validation = authoritative_verification
                 command = (
                     " ".join(str(item) for item in args.get("argv", []))
-                    if validation
+                    if tool_name == "run_verification"
                     else str(args.get("command", ""))
                 )
                 record = {
                     "command": command,
                     "status": status,
-                    "kind": "validation" if validation else "shell_execution",
+                    "kind": (
+                        "validation"
+                        if validation
+                        else (
+                            "diagnostic"
+                            if tool_name == "run_verification"
+                            else "shell_execution"
+                        )
+                    ),
                 }
+                if validation:
+                    # Display text is lossy (one "a b" argument is not two
+                    # arguments). Preserve the executed argument boundaries
+                    # for retries and persisted failure resolution.
+                    record["argv"] = list(args["argv"])
+                    previous = [
+                        item for item in self.ledger.unresolved_failures
+                        if item.get("argv") == record["argv"]
+                    ]
+                    remaining = [
+                        item for item in self.ledger.unresolved_failures
+                        if item.get("argv") != record["argv"]
+                    ]
                 self.ledger.validations.append(record)
                 self.ledger.validation_count += 1
                 del self.ledger.validations[:-MAX_LEDGER_VALIDATIONS]
@@ -600,20 +698,16 @@ class ProgressController:
                 if validation and status == "ok" and not changed:
                     self.ledger.unverified_changes.clear()
                     self.ledger.unverified_change_count = 0
-                    resolved = sum(item.get("command") == command for item in self.ledger.unresolved_failures)
-                    self.ledger.unresolved_failures = [
-                        item for item in self.ledger.unresolved_failures if item.get("command") != command
-                    ]
-                    self.ledger.unresolved_failure_count = max(0, self.ledger.unresolved_failure_count - resolved)
+                    # Legacy failures without argv cannot be matched safely by
+                    # splitting their display command; retain that uncertainty.
+                    self.ledger.unresolved_failures = remaining
+                    self.ledger.unresolved_failure_count = max(0, self.ledger.unresolved_failure_count - len(previous))
+                    if self.ledger.mutation_path_count:
+                        self.state.delivery_review_pending = True
+                        self.state.delivery_review_presented = False
+                        self.state.delivery_review_completed = False
                 elif validation:
-                    previous = [
-                        item for item in self.ledger.unresolved_failures
-                        if item.get("command") == command
-                    ]
-                    self.ledger.unresolved_failures = [
-                        item for item in self.ledger.unresolved_failures
-                        if item.get("command") != command
-                    ]
+                    self.ledger.unresolved_failures = remaining
                     # ToolExecutor has already bounded and redacted content.
                     # Keep the latest actionable failure until this check
                     # passes, independently of ordinary history eviction.
@@ -624,6 +718,29 @@ class ProgressController:
                         self.ledger.unresolved_failure_count -= len(previous) - 1
         self._maybe_intervene()
         return evidence
+
+    def delivery_review_notice(self):
+        if not self.state.delivery_review_pending:
+            return ""
+        return (
+            "Runtime notice: delivery review is active. Before returning a final answer, "
+            "act like a senior maintainer reviewing another developer's change: return to "
+            "the original request and independently check each required behavior, semantic "
+            "invariant, boundary case, compatibility promise, architecture constraint, and "
+            "modified-file scope against the current implementation. Passing authored tests "
+            "are evidence, not the specification or proof of correctness. If a claim is not "
+            "supported, inspect or correct the implementation and rerun verification; if the "
+            "delivery is sound, finish without inventing more work."
+        )
+
+    def mark_delivery_review_presented(self):
+        if self.state.delivery_review_pending:
+            self.state.delivery_review_presented = True
+
+    def complete_delivery_review(self):
+        if self.state.delivery_review_pending and self.state.delivery_review_presented:
+            self.state.delivery_review_pending = False
+            self.state.delivery_review_completed = True
 
     def _maybe_intervene(self):
         if (
@@ -690,5 +807,14 @@ class ProgressController:
                 self.ledger.targeted_read_count / self.ledger.file_read_count
                 if self.ledger.file_read_count
                 else 0.0
+            ),
+            "delivery_review_status": (
+                "completed"
+                if self.state.delivery_review_completed
+                else "presented"
+                if self.state.delivery_review_presented
+                else "pending"
+                if self.state.delivery_review_pending
+                else "not_required"
             ),
         }

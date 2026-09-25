@@ -65,6 +65,96 @@ def test_unresolved_validation_failure_blocks_unrelated_success(tmp_path):
     assert (agent.source_root / "app.py").read_text() == "VALUE = 1\n"
 
 
+def test_diagnostic_probe_neither_blocks_nor_satisfies_delivery(tmp_path):
+    agent = make_agent(tmp_path)
+    prepare_change(agent)
+
+    diagnostic = agent.execute_tool(
+        "run_verification",
+        {
+            "argv": [sys.executable, "-c", "raise SystemExit(1)"],
+            "purpose": "diagnostic",
+        },
+    )
+
+    assert diagnostic.metadata["tool_status"] == "error"
+    assert diagnostic.metadata["validation"] is False
+    assert diagnostic.metadata["verification_purpose"] == "diagnostic"
+    assert not agent.progress_controller.ledger.unresolved_failures
+    assert agent.progress_controller.metrics()["validation_status"] == "not_run"
+    assert agent.verification_failure_reason() == "verification_required"
+
+    accepted = verify(agent, "print('real delivery check')")
+    assert accepted.metadata["validation"] is True
+    assert agent.finalize_transaction()["state"] == "COMMITTED"
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_verifier_argv_boundaries_require_exact_repair_before_delivery(tmp_path, resume):
+    agent = make_agent(tmp_path)
+    prepare_change(agent)
+    program = (
+        "import json, sys; from pathlib import Path; ns = {}; "
+        "exec(Path('app.py').read_text(), ns); "
+        "print(json.dumps(sys.argv[1:])); "
+        "assert sys.argv[1:] != ['a b'] or ns['VALUE'] == 3"
+    )
+    failed_argv = [sys.executable, "-c", program, "a b"]
+    unrelated_argv = [sys.executable, "-c", program, "a", "b"]
+    assert " ".join(failed_argv) == " ".join(unrelated_argv)
+
+    failure = agent.execute_tool("run_verification", {"argv": failed_argv})
+    assert failure.metadata["executed"]
+    assert failure.metadata["tool_status"] == "error"
+    assert '["a b"]' in failure.content
+
+    if resume:
+        agent.interrupt_transaction()
+        agent = Pico(
+            model_client=FakeModelClient([]),
+            workspace=WorkspaceContext.build(
+                agent.source_root, repo_root_override=agent.source_root,
+            ),
+            session_store=agent.session_store,
+            session=agent.session_store.load(agent.session["id"]),
+            state_root=tmp_path / "state",
+            approval_policy="auto",
+            commit_policy="auto",
+            semantic_index="off",
+        )
+        assert agent.verification_failure_reason() == "verification_failed"
+        agent.transaction_context.workspace.resume_editing()
+        agent.current_interaction = {
+            "mutation_allowed": True,
+            "validation_required": True,
+        }
+        agent.progress_controller = ProgressController(
+            12, ledger=agent.session["execution_ledger"],
+        )
+
+    success = agent.execute_tool("run_verification", {"argv": unrelated_argv})
+    assert success.metadata["executed"]
+    assert success.metadata["tool_status"] == "ok"
+    assert '["a", "b"]' in success.content
+
+    blocked = agent.finalize_transaction()
+
+    assert blocked["state"] == "INTERRUPTED"
+    assert blocked["conflicts"][0]["reason"] == "verification_failed"
+    assert agent.progress_controller.ledger.unresolved_failure_count == 1
+    assert (agent.source_root / "app.py").read_text() == "VALUE = 1\n"
+    agent.transaction_context.workspace.resume_editing()
+    agent.execute_tool("write_file", {"path": "app.py", "content": "VALUE = 3\n"})
+    repaired = agent.execute_tool("run_verification", {"argv": failed_argv})
+    assert repaired.metadata["executed"]
+    assert repaired.metadata["tool_status"] == "ok"
+    assert '["a b"]' in repaired.content
+    assert not agent.progress_controller.ledger.unresolved_failures
+    assert agent.progress_controller.ledger.unresolved_failure_count == 0
+    assert agent.finalize_transaction()["state"] == "COMMITTED"
+    assert (agent.source_root / "app.py").read_text() == "VALUE = 3\n"
+
+
 def test_verifier_mutation_makes_validation_stale(tmp_path):
     agent = make_agent(tmp_path)
     prepare_change(agent)

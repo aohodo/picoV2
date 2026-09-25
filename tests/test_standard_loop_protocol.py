@@ -2,6 +2,7 @@
 
 import json
 import sys
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -82,7 +83,7 @@ def test_native_transport_failure_is_not_reclassified_as_completion(tmp_path):
     assert agent.current_task_state.stop_reason == "model_error"
 
 
-def test_failed_batch_preserves_error_and_reports_every_deferred_call(tmp_path):
+def test_failed_batch_continues_independent_read_only_calls(tmp_path):
     agent, model = make_agent(
         tmp_path,
         [
@@ -94,7 +95,6 @@ def test_failed_batch_preserves_error_and_reports_every_deferred_call(tmp_path):
                 ),
                 response_status="completed",
             ),
-            call("read_file", {"path": "app.py"}, "retry"),
             final(),
         ],
     )
@@ -107,11 +107,39 @@ def test_failed_batch_preserves_error_and_reports_every_deferred_call(tmp_path):
     }
     assert set(outputs) == {"missing", "deferred"}
     assert "error:" in outputs["missing"]
-    assert "batch_call_deferred" in outputs["deferred"]
-    assert any(
-        item.get("call_id") == "retry" and "VALUE = 1" in item.get("output", "")
-        for item in model.requests[2]["input_items"]
+    assert "VALUE = 1" in outputs["deferred"]
+    assert len(model.requests) == 2
+
+
+def test_failed_batch_defers_later_mutation(tmp_path):
+    agent, model = make_agent(
+        tmp_path,
+        [
+            ModelTurn(
+                kind="tool_batch",
+                tool_calls=(
+                    ModelToolCall("read_file", {"path": "missing.py"}, "missing"),
+                    ModelToolCall(
+                        "write_file",
+                        {"path": "app.py", "content": "VALUE = 2\n"},
+                        "deferred-write",
+                    ),
+                ),
+                response_status="completed",
+            ),
+            final(),
+        ],
     )
+
+    assert agent.ask("Update app.py only if missing.py permits it") == "Done."
+    outputs = {
+        item["call_id"]: item["output"]
+        for item in model.requests[1]["input_items"]
+        if item.get("type") == "function_call_output"
+    }
+    assert "error:" in outputs["missing"]
+    assert "batch_call_deferred" in outputs["deferred-write"]
+    assert (agent.source_root / "app.py").read_text() == "VALUE = 1\n"
 
 
 def test_budget_exhaustion_keeps_batch_call_result_pairs(tmp_path):
@@ -163,6 +191,94 @@ def test_premature_final_can_run_verification_and_then_deliver(tmp_path):
     assert (agent.source_root / "app.py").read_text() == "VALUE = 2\n"
     assert agent.current_task_state.transaction_state == "COMMITTED"
     assert agent.current_task_state.tool_steps == 2
+
+
+def test_successful_verification_uses_existing_final_turn_for_delivery_review(tmp_path):
+    agent, model = make_agent(
+        tmp_path,
+        [
+            call("write_file", {"path": "app.py", "content": "VALUE = 2\n"}, "write"),
+            call(
+                "run_verification",
+                {"argv": [sys.executable, "-c", "import app; assert app.VALUE == 2"]},
+                "verify",
+            ),
+            final("Implemented and reviewed."),
+        ],
+    )
+
+    assert agent.ask("Update app.py VALUE to 2 and run tests") == "Implemented and reviewed."
+    final_input = json.dumps(model.requests[2]["input_items"])
+    assert "delivery review is active" in final_input
+    assert "Passing authored tests are evidence" in final_input
+    assert agent.current_task_state.validation_status == "passed"
+    assert agent.current_task_state.transaction_state == "COMMITTED"
+    assert agent.current_task_state.to_dict()["delivery_review_status"] == "completed"
+
+
+def test_step_budget_finalization_cannot_bypass_delivery_review(tmp_path):
+    agent, model = make_agent(
+        tmp_path,
+        [
+            call("write_file", {"path": "app.py", "content": "VALUE = 2\n"}, "write"),
+            call(
+                "run_verification",
+                {"argv": [sys.executable, "-c", "import app; assert app.VALUE == 2"]},
+                "verify",
+            ),
+            final("Implemented and reviewed at the budget boundary."),
+        ],
+        max_steps=2,
+    )
+
+    result = agent.ask("Update app.py VALUE to 2 and run tests")
+
+    assert result == "Implemented and reviewed at the budget boundary."
+    final_input = json.dumps(model.requests[2]["input_items"])
+    assert "delivery review is active" in final_input
+    assert agent.current_task_state.delivery_review_status == "completed"
+    assert agent.current_task_state.transaction_state == "COMMITTED"
+
+
+def test_repaired_expectation_requires_original_check_before_delivery(tmp_path):
+    original = [sys.executable, "check.py"]
+    alternate = [sys.executable, "-X", "utf8", "check.py"]
+    repair = call(
+        "write_file",
+        {"path": "check.py", "content": "import app\nassert app.VALUE == 2\n"},
+        "repair-test",
+    )
+    repair = replace(
+        repair,
+        text="The request requires VALUE 2; correct the test expectation and rerun it.",
+    )
+    agent, model = make_agent(
+        tmp_path,
+        [
+            call("write_file", {"path": "app.py", "content": "VALUE = 2\n"}, "write"),
+            call("write_file", {
+                "path": "check.py", "content": "import app\nassert app.VALUE == 3\n",
+            }, "wrong-test"),
+            call("run_verification", {"argv": original}, "failed-check"),
+            repair,
+            call("run_verification", {"argv": alternate}, "different-check"),
+            final("Premature completion."),
+            call("run_verification", {"argv": original}, "original-check"),
+            final("Corrected and verified."),
+        ],
+        max_steps=12,
+    )
+
+    assert agent.ask("Set VALUE to 2 and add a regression test") == "Corrected and verified."
+    feedback = json.dumps(model.requests[6]["input_items"])
+    assert "AssertionError" in feedback
+    assert "Runtime verification feedback" in feedback
+    assert "rerun" in feedback
+    assert "test expectation" in json.dumps(model.requests[4]["input_items"])
+    assert (agent.source_root / "app.py").read_text() == "VALUE = 2\n"
+    assert (agent.source_root / "check.py").read_text().endswith("assert app.VALUE == 2\n")
+    assert agent.current_task_state.transaction_state == "COMMITTED"
+    assert not model.turns
 
 
 @pytest.mark.parametrize(

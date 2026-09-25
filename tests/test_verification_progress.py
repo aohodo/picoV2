@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from pico.progress import ProgressController
 
 
@@ -125,6 +129,87 @@ def test_passing_one_command_does_not_erase_other_failed_checks():
     })
     observe(controller, "run_verification")
     assert controller.ledger.unresolved_failures[0]["command"] == "other-test"
+
+
+def test_diagnostic_verification_is_audited_without_failure_authority():
+    controller = ProgressController(24)
+    controller.observe(
+        "run_verification",
+        {"argv": ["python", "-c", "raise SystemExit(1)"], "purpose": "diagnostic"},
+        "probe failed",
+        {
+            "tool_status": "error",
+            "executed": True,
+            "workspace_changed": False,
+            "validation": False,
+            "verification_purpose": "diagnostic",
+        },
+    )
+
+    assert not controller.ledger.unresolved_failures
+    assert controller.ledger.unresolved_failure_count == 0
+    assert controller.ledger.validations[-1]["kind"] == "diagnostic"
+    assert controller.metrics()["validation_status"] == "not_required"
+
+
+@pytest.mark.parametrize("failed_argv,other_argv", [
+    (["check", "a b"], ["check", "a", "b"]),
+    (["check", '"a b"'], ["check", '"a', 'b"']),
+    (["check", "中文 目录", "🙂"], ["check", "中文", "目录 🙂"]),
+    (["check", "a\tb c"], ["check", "a\tb", "c"]),
+])
+def test_argument_boundaries_distinguish_failed_verifications(failed_argv, other_argv):
+    assert " ".join(failed_argv) == " ".join(other_argv)
+    controller = ProgressController(24)
+    metadata = {"tool_status": "error", "executed": True, "workspace_changed": False}
+    for argv in (failed_argv, other_argv):
+        controller.observe("run_verification", {"argv": argv}, "assertion failed", metadata)
+
+    assert controller.ledger.unresolved_failure_count == 2
+    resumed = ProgressController(24, ledger=json.loads(json.dumps(controller.ledger.to_dict())))
+    resumed.observe("run_verification", {"argv": other_argv}, "passed", {
+        **metadata, "tool_status": "ok",
+    })
+    assert resumed.ledger.unresolved_failure_count == 1
+    assert resumed.ledger.unresolved_failures[0]["argv"] == failed_argv
+    assert resumed.metrics()["validation_status"] == "failed"
+
+    resumed.observe("run_verification", {"argv": failed_argv}, "passed", {
+        **metadata, "tool_status": "ok",
+    })
+    assert not resumed.ledger.unresolved_failures
+    assert resumed.ledger.unresolved_failure_count == 0
+
+
+def test_verification_identity_copies_arguments_and_ignores_timeout():
+    controller = ProgressController(24)
+    argv = ["pytest", "tests/test_service.py"]
+    controller.observe("run_verification", {"argv": argv, "timeout": 1}, "timed out", {
+        "tool_status": "error", "executed": True, "workspace_changed": False,
+    })
+    argv.append("--changed-after-recording")
+    assert controller.ledger.unresolved_failures[0]["argv"] == ["pytest", "tests/test_service.py"]
+    controller.observe("run_verification", {
+        "argv": ["pytest", "tests/test_service.py"], "timeout": 120,
+    }, "passed", {"tool_status": "ok", "executed": True, "workspace_changed": False})
+    assert not controller.ledger.unresolved_failures
+
+
+def test_legacy_failure_without_arguments_is_not_resolved_by_guessing():
+    controller = ProgressController(24, ledger={
+        "unresolved_failures": [{
+            "kind": "validation", "command": "check a b", "status": "error",
+            "output": "legacy failure: parameter boundaries were not saved",
+        }],
+        "unresolved_failure_count": 1,
+    })
+    for argv in (["check", "a", "b"], ["check", "a b"]):
+        controller.observe("run_verification", {"argv": argv}, "passed", {
+            "tool_status": "ok", "executed": True, "workspace_changed": False,
+        })
+    assert controller.metrics()["validation_status"] == "failed"
+    assert controller.ledger.unresolved_failure_count == 1
+    assert "legacy failure" in controller.ledger.unresolved_failures[0]["output"]
 
 
 def test_repeated_failure_then_success_does_not_leave_phantom_obligation():

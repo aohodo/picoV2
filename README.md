@@ -1,6 +1,6 @@
 # pico
 
-`pico` 是一个面向代码仓库的轻量本地 coding agent。它直接跑在终端里，先看当前工作区，再用一组受约束的工具去读文件、改文件、跑命令，并把会话状态保存在本地 `.pico/` 目录里。
+`pico` 是一个面向代码仓库的轻量本地 coding agent。它直接跑在终端里，先看当前工作区，再用一组受约束的工具去读文件、改文件、跑命令。会话和运行工件保存在宿主状态目录，不会在源码仓库里创建 `.pico/`。
 
 它更像一个能在仓库里持续工作的命令行助手，不是纯聊天窗口。你可以拿它做代码排查、测试修复、仓库分析，或者让它在当前项目里执行一次性的工程任务。
 
@@ -16,8 +16,8 @@
 - 包名是 `pico`
 - CLI 命令是 `pico`
 - 模块入口是 `python -m pico`
-- 会话保存在 `.pico/sessions/`
-- 每次运行的工件保存在 `.pico/runs/<run_id>/`
+- 会话保存在 `<state-root>/workspaces/<workspace-id>/sessions/`
+- 每次运行的工件保存在 `<state-root>/workspaces/<workspace-id>/runs/<run_id>/`
 - 支持四类模型后端：
   - Ollama
   - OpenAI 兼容 Responses API
@@ -267,13 +267,18 @@ pico --provider ollama --model qwen3.5:4b
 - `--approval auto`
 - `--approval never`
 
-每次运行结束后，都会在 `.pico/runs/<run_id>/` 下写出这些文件：
+每次运行结束后，都会在
+`<state-root>/workspaces/<workspace-id>/runs/<run_id>/` 下写出这些文件：
 
 - `task_state.json`
 - `trace.jsonl`
 - `report.json`
 
 这些内容默认只保存在本地，不需要跟仓库一起提交。
+
+Windows 默认的 `<state-root>` 是 `%LOCALAPPDATA%\Pico`；Linux/macOS 使用
+`$XDG_STATE_HOME/pico`，未设置时使用 `~/.local/state/pico`。可以通过
+`PICO_STATE_ROOT` 显式指定位置；`/session` 会显示当前会话文件的实际路径。
 
 ### TSW 与执行环境
 

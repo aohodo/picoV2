@@ -75,6 +75,7 @@ class TaskState:
     validation_commands: list = field(default_factory=list)
     validation_command_count: int = 0
     validation_status: str = "not_run"
+    delivery_review_status: str = "not_required"
     outcome_status: str = "running"
     staged_paths: list = field(default_factory=list)
     delivered_paths: list = field(default_factory=list)
@@ -138,6 +139,9 @@ class TaskState:
                 )
             ),
             validation_status=str(data.get("validation_status", "not_run")),
+            delivery_review_status=str(
+                data.get("delivery_review_status", "not_required")
+            ),
             outcome_status=str(data.get("outcome_status", data.get("status", "running"))),
             staged_paths=list(data.get("staged_paths", [])),
             delivered_paths=list(data.get("delivered_paths", [])),
@@ -209,6 +213,8 @@ class TaskState:
     def record_progress(self, metrics):
         if metrics.get("validation_status"):
             self.validation_status = str(metrics["validation_status"])
+        if metrics.get("delivery_review_status"):
+            self.delivery_review_status = str(metrics["delivery_review_status"])
         self.blocked_repeats = int(metrics.get("blocked_repeats", self.blocked_repeats))
         self.intervention_count = int(metrics.get("intervention_count", self.intervention_count))
         self.max_discovery_streak = int(metrics.get("max_discovery_streak", self.max_discovery_streak))
@@ -352,6 +358,7 @@ class TaskState:
             "validation_commands": list(self.validation_commands),
             "validation_command_count": self.validation_command_count,
             "validation_status": self.validation_status,
+            "delivery_review_status": self.delivery_review_status,
             "outcome_status": self.outcome_status,
             "staged_paths": list(self.staged_paths),
             "delivered_paths": list(self.delivered_paths),

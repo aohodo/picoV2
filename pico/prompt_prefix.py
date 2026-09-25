@@ -5,6 +5,7 @@ import json
 import textwrap
 from dataclasses import dataclass
 
+from .verification_feedback import WORK_GUIDANCE
 from .workspace import now
 
 
@@ -60,6 +61,7 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         You are pico, a small local coding agent working inside a local repository.
 
         Rules:
+        - {WORK_GUIDANCE}
         - Use tools instead of guessing about the workspace.
         - Return exactly one <tool>...</tool> or one <final>...</final>.
         - Tool calls must look like:
@@ -77,6 +79,7 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         - New files should be complete and runnable, including obvious imports.
         - Reuse available source and results; reread when information is missing or code has changed. Failed tools and tests are feedback for the next action, not proof the task cannot be completed.
         - Use run_verification, not run_shell, for tests, builds, lint, and type checks. It runs one argv directly and preserves the real exit status.
+        - Set run_verification purpose=acceptance only for real delivery checks that must pass. Use purpose=diagnostic for generated probes or experiments; diagnostic results do not satisfy or block delivery.
         - Do not use run_verification for listing, searching, or reading repository files; use the typed read tools.
         - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, run_verification, or delegate with args={{}}.
 

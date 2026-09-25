@@ -3,10 +3,10 @@
 import re
 from dataclasses import dataclass
 
+from .execution import bound_text_observation
 from .features import memory as memorylib
 from .interaction_policy import path_matches_patterns
 from .text_document import TextDecodingError, read_text_document
-from .workspace import clip
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,7 @@ def _metadata(
     diff_summary=None,
     executed=False,
     validation=False,
+    verification_purpose="",
 ):
     result = {
         "tool_status": tool_status,
@@ -40,6 +41,8 @@ def _metadata(
         "executed": bool(executed),
         "validation": bool(validation),
     }
+    if verification_purpose:
+        result["verification_purpose"] = str(verification_purpose)
     if workspace_fingerprint:
         result["workspace_fingerprint"] = workspace_fingerprint
     return result
@@ -58,7 +61,10 @@ class ToolExecutor:
             except (OSError, TextDecodingError):
                 line_count = 0
             start = int(args.get("start", 1))
-            end = min(int(args.get("end", 200)), line_count)
+            end = min(
+                int(args.get("end", self.agent.tool_context().source_window_lines)),
+                line_count,
+            )
             return {"path": path.relative_to(self.agent.root).as_posix(), "start": start, "end": end}
         if name == "read_files":
             files = []
@@ -68,7 +74,11 @@ class ToolExecutor:
                     line_count = len(read_text_document(path).text.splitlines())
                 except (OSError, TextDecodingError):
                     line_count = 0
-                files.append({"path": path.relative_to(self.agent.root).as_posix(), "start": 1, "end": min(500, line_count)})
+                files.append({
+                    "path": path.relative_to(self.agent.root).as_posix(),
+                    "start": 1,
+                    "end": min(self.agent.tool_context().source_window_lines, line_count),
+                })
             return {"files": files}
         if name in {"list_files", "search"}:
             normalized = dict(args)
@@ -286,7 +296,13 @@ class ToolExecutor:
         after_snapshot = before_snapshot
         try:
             raw_result = tool["run"](args)
-            content = agent.redact_text(clip(raw_result))
+            # Tool-specific renderers preserve code ranges and diagnostics.
+            # This final boundary is only an emergency ceiling for legacy or
+            # delegated tools, and uses the same working-set observation
+            # budget instead of the unrelated legacy 4k head-only clip.
+            content = agent.redact_text(bound_text_observation(
+                str(raw_result), agent.tool_context().observation_char_budget
+            ))
             if agent.transaction_context is not None:
                 agent.transaction_context.workspace.enforce_storage_limit()
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
@@ -304,7 +320,11 @@ class ToolExecutor:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
             agent.update_memory_after_tool(name, args, content)
-            if workspace_changed and name != "run_verification" and agent.last_verification_succeeded is not None:
+            authoritative_validation = bool(
+                name == "run_verification"
+                and str(args.get("purpose", "acceptance")).lower() == "acceptance"
+            )
+            if workspace_changed and not authoritative_validation and agent.last_verification_succeeded is not None:
                 agent.last_verification_succeeded = None
                 agent.last_shell_validation_succeeded = None
                 agent.verification_stale = True
@@ -318,7 +338,12 @@ class ToolExecutor:
                 workspace_fingerprint=agent.workspace.fingerprint(),
                 diff_summary=diff_summary,
                 executed=True,
-                validation=(name == "run_verification"),
+                validation=authoritative_validation,
+                verification_purpose=(
+                    str(args.get("purpose", "acceptance")).lower()
+                    if name == "run_verification"
+                    else ""
+                ),
             )
             if hasattr(raw_result, "coverage"):
                 metadata["read_coverage"] = [
@@ -342,7 +367,11 @@ class ToolExecutor:
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
-            if workspace_changed and name != "run_verification" and agent.last_verification_succeeded is not None:
+            authoritative_validation = bool(
+                name == "run_verification"
+                and str(args.get("purpose", "acceptance")).lower() == "acceptance"
+            )
+            if workspace_changed and not authoritative_validation and agent.last_verification_succeeded is not None:
                 agent.last_verification_succeeded = None
                 agent.last_shell_validation_succeeded = None
                 agent.verification_stale = True
@@ -360,7 +389,12 @@ class ToolExecutor:
                 workspace_fingerprint=agent.workspace.fingerprint(),
                 diff_summary=diff_summary,
                 executed=True,
-                validation=(name == "run_verification"),
+                validation=authoritative_validation,
+                verification_purpose=(
+                    str(args.get("purpose", "acceptance")).lower()
+                    if name == "run_verification"
+                    else ""
+                ),
             )
             agent.record_process_note_for_tool(name, metadata)
             if metadata["validation"]:

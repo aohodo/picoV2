@@ -746,13 +746,16 @@ class Pico:
         if "run_shell" in tools:
             dialect = self.execution_profile_view().get("dialect", "unavailable")
             tools["run_shell"]["description"] = (
-                f"Run a {dialect} command in the transaction workspace. "
-                "Use `python -m pytest` for Python validation."
+                f"Run a non-inspection {dialect} command in the transaction workspace. "
+                "Use typed repository tools for listing, searching, and source reads; "
+                "use `python -m pytest` for Python validation."
             )
         if "run_verification" in tools:
             tools["run_verification"]["description"] = (
                 "Run one verification executable directly in the transaction workspace. "
-                "Pass argv as separate elements; its process exit status is authoritative."
+                "Pass argv as separate elements. Use purpose=acceptance only for a real test, "
+                "build, lint, or type check whose exit status is authoritative; use "
+                "purpose=diagnostic for an exploratory probe that must not satisfy or block delivery."
             )
         return tools
 
@@ -1255,7 +1258,14 @@ class Pico:
             "session_revision": int(self.session.get("revision", 0)),
             "interaction": interaction,
             "evidence": {
+                # changed_paths is retained for report-schema compatibility. It is
+                # scoped to this ask(), while transaction_paths is the authoritative
+                # aggregate delivered or staged by a resumed transaction.
                 "changed_paths": list(task_state.changed_paths),
+                "run_changed_paths": list(task_state.changed_paths),
+                "transaction_paths": list(
+                    task_state.delivered_paths or task_state.staged_paths
+                ),
                 "validation_commands": list(task_state.validation_commands),
                 "validation_status": task_state.validation_status,
                 "initial_evidence_count": task_state.initial_evidence_count,
@@ -1275,6 +1285,7 @@ class Pico:
         toolkit.validate_tool(self.tool_context(), name, args)
 
     def tool_context(self):
+        projection = ContextProjector(self)
         return ToolContext(
             root=self.root,
             path_resolver=self.path,
@@ -1290,6 +1301,8 @@ class Pico:
             depth=self.depth,
             max_depth=self.max_depth,
             spawn_delegate=self.spawn_delegate,
+            observation_char_budget=projection.observation_char_budget,
+            source_window_lines=projection.source_window_lines,
         )
 
     def spawn_delegate(self, args):

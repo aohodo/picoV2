@@ -3,13 +3,24 @@
 import json
 
 from .features import memory as memorylib
-from .read_observation import compact_read_observation, visible_read_coverage
-from .workspace import MAX_TOOL_OUTPUT
+from .read_observation import (
+    DEFAULT_OBSERVATION_CHAR_BUDGET,
+    DEFAULT_SOURCE_WINDOW_LINES,
+    compact_read_observation,
+    retain_read_evidence,
+    visible_read_coverage,
+)
+from .verification_feedback import WORK_GUIDANCE
 
 DEFAULT_EVENT_LIMIT = None
-DEFAULT_EVENT_CHAR_BUDGET = 12_000
 DEFAULT_RUNTIME_STATE_CHAR_BUDGET = 8_000
-RECENT_EVENT_GROUPS = 2
+RECENT_EVENT_GROUPS = 5
+WORKING_SET_GROUPS = RECENT_EVENT_GROUPS + 1
+# The model's active event view is a working set, not the audit log. It holds
+# five recent action/observation groups plus one current mutation view.
+# Providers with less capacity reduce it; larger windows do not replay more
+# audit history merely because they can.
+DEFAULT_EVENT_CHAR_BUDGET = DEFAULT_OBSERVATION_CHAR_BUDGET * WORKING_SET_GROUPS
 
 
 def _json_size(value):
@@ -23,6 +34,8 @@ def _head_tail(text, limit):
     if len(text) <= limit:
         return text
     marker = f"\n... [compacted {len(text) - limit} chars] ...\n"
+    if limit <= len(marker):
+        return text[:limit]
     usable = max(0, limit - len(marker))
     head = (usable * 2) // 3
     tail = usable - head
@@ -51,17 +64,17 @@ def _event_groups(events):
 
 
 def discard_stale_read_groups(events, workspace_root):
-    """Remove source observations whose recorded bytes no longer match disk."""
+    """Remove stale source units without discarding fresh siblings in a batch."""
     retained = []
     for group in _event_groups(events):
         if len(group) == 1:
             retained.extend(group)
             continue
         call, output = group
-        if call.get("name") not in {"read_file", "read_files"}:
+        evidence = output.get("_read_evidence")
+        if not evidence and call.get("name") not in {"read_file", "read_files"}:
             retained.extend(group)
             continue
-        evidence = output.get("_read_evidence")
         if not evidence and str(output.get("output", "")).startswith("error:"):
             retained.extend(group)
             continue
@@ -69,14 +82,25 @@ def discard_stale_read_groups(events, workspace_root):
             # Legacy source outputs have no freshness proof and cannot be
             # carried across requests as current code evidence.
             continue
-        stale = any(
-            item.get("freshness") is None
-            or item.get("freshness")
-            != memorylib.file_freshness(item.get("path", ""), workspace_root)
-            for item in evidence
-        )
-        if not stale:
+        fresh = [
+            item for item in evidence
+            if item.get("freshness") is not None
+            and item.get("freshness")
+            == memorylib.file_freshness(item.get("path", ""), workspace_root)
+        ]
+        if len(fresh) == len(evidence):
             retained.extend(group)
+            continue
+        if fresh:
+            filtered_output = dict(output)
+            filtered_output["output"] = retain_read_evidence(
+                output.get("output", ""), fresh
+            )
+            filtered_output["_read_evidence"] = visible_read_coverage(
+                filtered_output["output"], fresh
+            )
+            if filtered_output["_read_evidence"]:
+                retained.extend([call, filtered_output])
     return retained
 
 
@@ -144,30 +168,44 @@ def _compact_arguments(raw_arguments, limit, recent):
     return json.dumps({"_compacted": True}, separators=(",", ":"))
 
 
-def _compact_group(group, recent, hard=False):
+def _compact_group(group, recent, observation_limit, keep_observation=False, hard=False):
     if len(group) == 1:
         message = dict(group[0])
         text = str(message.get("content", ""))
-        limit = 500 if hard else (len(text) if recent else 900)
+        summary_limit = max(1, observation_limit // RECENT_EVENT_GROUPS)
+        limit = max(1, summary_limit // 2) if hard else (
+            min(len(text), observation_limit) if recent else summary_limit
+        )
         message["content"] = _head_tail(text, limit)
         return [message]
     call, output = (dict(group[0]), dict(group[1]))
-    argument_limit = 500 if hard else (2_500 if recent else 900)
-    # Fresh observations have already been bounded by ToolExecutor. Preserve
-    # them until the aggregate context budget actually requires compaction.
-    output_limit = 500 if hard else (len(str(output.get("output", ""))) if recent else 900)
+    summary_limit = max(1, observation_limit // RECENT_EVENT_GROUPS)
+    argument_limit = max(1, summary_limit // 2) if hard else (
+        observation_limit if recent else summary_limit
+    )
+    # Mutation arguments duplicate intended content. The mutation receipt is
+    # authoritative post-edit evidence, so keep the action identity but spend
+    # the working-set budget on what actually reached disk.
+    mutation = call.get("name") in {"write_file", "patch_file"}
     call["arguments"] = _compact_arguments(
-        call.get("arguments", "{}"), argument_limit, recent and not hard
+        call.get("arguments", "{}"),
+        summary_limit if mutation else argument_limit,
+        recent and not hard and not mutation,
     )
     raw_output = str(output.get("output", ""))
+    output_limit = (
+        max(1, summary_limit // 2)
+        if hard
+        else (observation_limit if recent or keep_observation else summary_limit)
+    )
     if len(raw_output) > output_limit:
-        if call.get("name") in {"read_file", "read_files"}:
+        if call.get("name") in {"read_file", "read_files", "write_file", "patch_file"}:
             output["output"] = compact_read_observation(raw_output, output_limit)
         else:
             excerpt = _head_tail(raw_output, max(80, output_limit - 100))
             output["output"] = (
                 f"[compacted tool output; original_chars={len(raw_output)}; "
-                "original retained in audit history]\n"
+                "bounded audit metadata retained]\n"
                 + excerpt
             )
     if "_read_evidence" in output:
@@ -184,8 +222,9 @@ def project_model_events(
 ):
     """Create a protocol-valid, size-bounded projection of tool history.
 
-    Full observations remain in Trace/History. Only complete call/output pairs
-    are projected into the next model request, newest first under the budget.
+    Audit state and the model working set have separate retention policies.
+    Only complete call/output pairs enter the next request, newest first under
+    the working-set budget.
     """
     raw_events = [item for item in events if isinstance(item, dict)]
     groups = _event_groups(raw_events)
@@ -194,14 +233,37 @@ def project_model_events(
     selected_reversed = []
     used = 0
     compacted_events = 0
+    observation_limit = max(1, int(char_budget) // WORKING_SET_GROUPS)
+    latest_source_by_path = {}
     for index in range(len(groups) - 1, -1, -1):
-        projected = _compact_group(groups[index], recent=True)
+        group = groups[index]
+        if len(group) != 2:
+            continue
+        for record in group[1].get("_read_evidence", []):
+            if record.get("delivered"):
+                latest_source_by_path.setdefault(str(record.get("path", "")), index)
+    # Current source is a per-path working set regardless of whether it came
+    # from a read or a mutation receipt. Recency of tool use is not recency of
+    # knowledge: unchanged Controller/Service/Test files remain relevant after
+    # writing neighbouring files.
+    priority_indexes = set(latest_source_by_path.values())
+    for index in range(len(groups) - 1, -1, -1):
+        recent = index >= len(groups) - RECENT_EVENT_GROUPS
+        projected = _compact_group(
+            groups[index], recent, observation_limit,
+            keep_observation=index in priority_indexes,
+        )
         size = sum(_json_size(item) for item in projected)
         if size + used > char_budget:
-            projected = _compact_group(groups[index], recent=False)
+            projected = _compact_group(
+                groups[index], False, observation_limit,
+                keep_observation=index in priority_indexes,
+            )
             size = sum(_json_size(item) for item in projected)
         if size + used > char_budget:
-            projected = _compact_group(groups[index], recent=False, hard=True)
+            projected = _compact_group(
+                groups[index], False, observation_limit, hard=True,
+            )
             size = sum(_json_size(item) for item in projected)
         if size + used > char_budget:
             break
@@ -220,8 +282,33 @@ def project_model_events(
         "raw_event_chars": sum(_json_size(item) for item in raw_events),
         "projected_event_chars": sum(_json_size(item) for item in selected),
         "event_char_budget": int(char_budget),
+        "observation_char_budget": observation_limit,
+        "recent_event_groups": RECENT_EVENT_GROUPS,
+        "working_set_source_groups": len(priority_indexes),
+        # Retained as report compatibility for runs recorded before source
+        # reads and mutation receipts shared one working-set policy.
+        "working_set_mutation_groups": len(priority_indexes),
     }
     return selected, metadata
+
+
+def _project_verification_record(record, char_budget):
+    """Render bounded evidence without turning a display string into identity."""
+    projected = {
+        key: value for key, value in record.items()
+        if key not in {"argv", "command", "output", "observation"}
+    }
+    argv = record.get("argv")
+    command = json.dumps(argv, ensure_ascii=False) if isinstance(argv, list) else record.get("command", "")
+    command_budget = char_budget // 4 if "output" in record else char_budget
+    projected["command"] = _head_tail(command, command_budget)
+    if "output" in record:
+        observation = record.get("observation", {})
+        projected["observed_kinds"] = observation.get("kinds", ["unknown"])
+        projected["output"] = _head_tail(
+            observation.get("evidence") or record["output"], char_budget - command_budget,
+        )
+    return projected
 
 
 def _project_runtime_state(state, char_budget=DEFAULT_RUNTIME_STATE_CHAR_BUDGET):
@@ -239,12 +326,9 @@ def _project_runtime_state(state, char_budget=DEFAULT_RUNTIME_STATE_CHAR_BUDGET)
     # Failed checks remain useful after their chronological tool event is
     # evicted. Keep their actual diagnostics, not just an unhelpful 'failed'.
     failure_share = max(1, char_budget // (2 * max(1, len(failures))))
-    failure_notes = [
-        {**{key: value for key, value in item.items() if key != "output"},
-         "command": _head_tail(item.get("command", ""), failure_share // 4),
-         "output": _head_tail(item.get("output", ""), failure_share * 3 // 4)}
-        for item in failures
-    ]
+    failure_notes = [_project_verification_record(item, failure_share) for item in failures]
+    validations = list(ledger.get("validations", []))[-4:]
+    validation_share = max(1, char_budget // (8 * max(1, len(validations))))
     compact = {
         "progress": state.get("progress", {}),
         "ledger": {
@@ -268,7 +352,9 @@ def _project_runtime_state(state, char_budget=DEFAULT_RUNTIME_STATE_CHAR_BUDGET)
             if key in ledger
         },
         "recent_mutations": list(ledger.get("mutations", []))[-8:],
-        "recent_validations": list(ledger.get("validations", []))[-4:],
+        "recent_validations": [
+            _project_verification_record(item, validation_share) for item in validations
+        ],
         "recent_failures": failure_notes,
         "pending_definition_candidates": list(ledger.get("pending_definition_candidates", []))[:8],
         "unverified_changes": list(ledger.get("unverified_changes", []))[-12:],
@@ -314,10 +400,7 @@ class ContextProjector:
         )
         self.event_char_budget = (
             int(event_char_budget) if event_char_budget is not None
-            # Without an advertised context window, retain the bounded work
-            # unit transcript. A second tiny fixed window used to evict code
-            # after only a few calls and provoke repeated rediscovery.
-            else max(1, int(agent.max_steps)) * MAX_TOOL_OUTPUT
+            else DEFAULT_EVENT_CHAR_BUDGET
         )
         capabilities = getattr(agent.model_client, "capabilities", None)
         if event_char_budget is None and getattr(capabilities, "context_window", None):
@@ -327,9 +410,14 @@ class ContextProjector:
                 getattr(agent, "max_new_tokens", None)
                 or capabilities.max_output_tokens or 0
             )
-            self.event_char_budget = max(
-                1, int((capabilities.context_window - output_reserve) * (ratio or 1))
+            self.event_char_budget = min(
+                self.event_char_budget,
+                max(1, int((capabilities.context_window - output_reserve) * (ratio or 1))),
             )
+        self.observation_char_budget = max(
+            1, self.event_char_budget // WORKING_SET_GROUPS
+        )
+        self.source_window_lines = DEFAULT_SOURCE_WINDOW_LINES
 
     def instructions(self):
         approval = self.agent.approval_policy
@@ -348,7 +436,8 @@ class ContextProjector:
         )
         return (
             "You are Pico, a local coding agent. Use the supplied function tools instead of inventing workspace facts. "
-            "For repository changes, inspect only the files needed, make the requested change in the staged workspace, "
+            + WORK_GUIDANCE + " "
+            + "For repository changes, inspect only the files needed, make the requested change in the staged workspace, "
             "then run focused verification. Runtime read ranges describe delivered excerpts, not whole files. "
             "Read missing ranges when needed. For code analysis cite actual file paths and line ranges; "
             "distinguish observed calls from inferred relationships. If evidence is missing, state that limitation "
@@ -358,6 +447,8 @@ class ContextProjector:
             "Unresolved failures include real diagnostics: use them to test a cause, change the relevant code or test, "
             "and rerun verification. Distinguish a suspected cause from one demonstrated by evidence. "
             "Use already available source and tool results; reread only when missing information or changed files require it. "
+            "A successful write_file or patch_file result contains the current post-edit source around the change; "
+            "treat it as fresh evidence and do not reread merely to confirm that the requested edit landed. "
             "Definition candidates are navigation hints, not proof of dispatch or behavior. "
             "Compacted source bodies marked omitted cannot support detailed code claims. "
             "Return a concise final answer only when the task is complete or concretely blocked. "
@@ -430,10 +521,12 @@ class ContextProjector:
         runtime_text = "Runtime state:\n" + runtime_json
         event_char_budget = self.event_char_budget
         if input_char_budget is not None:
-            # A known model budget supersedes the conservative fallback; do
-            # not truncate a capable model to the legacy 12k-character window.
-            event_char_budget = max(
-                1, input_char_budget - fixed_chars - len(runtime_text)
+            # Provider capacity is a ceiling, not a reason to replay the audit
+            # log. Keep the semantic working set and only shrink it when the
+            # current request/runtime state leaves less input room.
+            event_char_budget = min(
+                self.event_char_budget,
+                max(1, input_char_budget - fixed_chars - len(runtime_text)),
             )
         current_events = discard_stale_read_groups(events, self.agent.root)
         selected_events, event_metadata = project_model_events(

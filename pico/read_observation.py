@@ -3,6 +3,9 @@
 import ast
 import re
 
+DEFAULT_SOURCE_WINDOW_LINES = 100
+DEFAULT_OBSERVATION_CHAR_BUDGET = 8_000
+
 
 def visible_read_coverage(text, coverage):
     """Intersect rendered numbered bodies with trusted delivered ranges.
@@ -34,6 +37,52 @@ def visible_read_coverage(text, coverage):
                     visible.append(record)
                 break
     return visible
+
+
+def retain_read_evidence(text, coverage):
+    """Render only source lines backed by the supplied evidence records.
+
+    A single ``read_files`` result may contain independently versioned files.
+    When one file changes, keeping the unchanged units is safer than dropping
+    the whole tool result.  Reconstructing from numbered source lines also
+    prevents a stale neighbouring file header from being mistaken for source.
+    """
+    retained = []
+    active = None
+    for line in str(text).splitlines():
+        marker = re.fullmatch(
+            r"# unit: (.+):(\d+)-(\d+) .*(\[source fragment\])", line
+        )
+        if marker is not None:
+            path = marker[1]
+            unit_start = int(marker[2])
+            unit_end = int(marker[3])
+            matching = [
+                item
+                for item in coverage
+                if item.get("delivered")
+                and item.get("path") == path
+                and item.get("start", 1) <= unit_end
+                and item.get("end", 0) >= unit_start
+            ]
+            active = (path, matching)
+            if matching:
+                retained.append(line)
+            continue
+        number = re.match(r"^\s*(\d+): ", line)
+        if number is not None and active is not None:
+            index = int(number[1])
+            if any(
+                item.get("start", 1) <= index <= item.get("end", 0)
+                for item in active[1]
+            ):
+                retained.append(line)
+            continue
+        # Excerpt notices belong to the active unit. File headers and mutation
+        # receipt/diff prose do not prove source freshness and are omitted.
+        if active is not None and active[1] and line.startswith("["):
+            retained.append(line)
+    return "\n".join(retained)
 
 
 def ranges_cover(coverage, path, revision, start, end):

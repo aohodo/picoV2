@@ -1,7 +1,11 @@
+from io import StringIO
+
 from pico.cli import run_exit_code
+from pico.progress_output import ConsoleProgressRenderer
 from pico.providers.clients import FakeModelClient
 from pico.runtime import Pico
 from pico.session_store import SessionStore
+from pico.task_state import TaskState
 from pico.workspace import WorkspaceContext
 
 
@@ -104,6 +108,40 @@ def test_task_state_roundtrip_preserves_authoritative_outcome(tmp_path):
     assert saved["outcome_status"] == "committed"
     assert saved["delivered_paths"] == ["sample.py"]
     assert saved["exit_code"] == 0
+
+
+def test_finished_progress_uses_transaction_delivery_scope_after_resume():
+    stream = StringIO()
+    renderer = ConsoleProgressRenderer(stream=stream, max_steps=24)
+    task = TaskState.create("task-resumed", "Continue the interrupted task.")
+    task.changed_paths = ["new-test.py"]
+    task.staged_paths = ["a.py", "b.py", "new-test.py"]
+    task.delivered_paths = ["a.py", "b.py", "new-test.py"]
+    task.validation_status = "passed"
+
+    renderer(
+        "run_finished",
+        {"stop_reason": "final_answer_returned", "run_duration_ms": 1250},
+        task,
+    )
+
+    output = stream.getvalue()
+    assert "delivered 3" in output
+    assert "changed 1" not in output
+
+
+def test_report_separates_run_delta_from_transaction_paths(tmp_path):
+    agent, _ = build_agent(tmp_path, ["<final>No changes.</final>"], max_steps=1)
+    task = TaskState.create("task-resumed", "Continue the interrupted task.")
+    task.changed_paths = ["new-test.py"]
+    task.staged_paths = ["a.py", "b.py", "new-test.py"]
+    task.delivered_paths = ["a.py", "b.py", "new-test.py"]
+
+    evidence = agent.build_report(task)["evidence"]
+
+    assert evidence["changed_paths"] == ["new-test.py"]
+    assert evidence["run_changed_paths"] == ["new-test.py"]
+    assert evidence["transaction_paths"] == ["a.py", "b.py", "new-test.py"]
 
 
 def test_shell_text_cannot_claim_authoritative_verification(tmp_path):

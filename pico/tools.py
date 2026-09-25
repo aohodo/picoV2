@@ -8,11 +8,12 @@ import re
 from functools import partial
 
 from .execution import format_shell_result
+from .mutation_observation import render_mutation_observation
 from .path_support import logical_path, native_path
-from .progress import is_repository_read_argv
-from .read_observation import render_reads
+from .progress import is_repository_read_argv, is_repository_read_command
+from .read_observation import DEFAULT_SOURCE_WINDOW_LINES, render_reads
 from .text_document import TextDecodingError, read_text_document, write_text_document
-from .workspace import IGNORED_PATH_NAMES, MAX_TOOL_OUTPUT
+from .workspace import IGNORED_PATH_NAMES
 
 BASE_TOOL_SPECS = {
     "list_files": {
@@ -21,7 +22,11 @@ BASE_TOOL_SPECS = {
         "description": "List files in the workspace.",
     },
     "read_file": {
-        "schema": {"path": "str", "start": "int=1", "end": "int=200"},
+        "schema": {
+            "path": "str",
+            "start": "int=1",
+            "end": f"int={DEFAULT_SOURCE_WINDOW_LINES}",
+        },
         "risky": False,
         "description": "Read a text file by line range while detecting its encoding.",
     },
@@ -46,25 +51,40 @@ BASE_TOOL_SPECS = {
     "run_shell": {
         "schema": {"command": "str", "timeout": "int=20"},
         "risky": True,
-        "description": "Run a command in the transaction workspace using the declared shell profile.",
+        "description": (
+            "Run a non-inspection command in the transaction workspace using the declared shell profile. "
+            "Use typed repository tools for file listing, search, and source reads."
+        ),
     },
     "run_verification": {
-        "schema": {"argv": "list[str]", "timeout": "int=120"},
+        "schema": {
+            "argv": "list[str]",
+            "timeout": "int=120",
+            "purpose": "str='acceptance'",
+        },
         "risky": True,
         "description": (
             "Run one test, build, lint, or type-check executable directly and record its real exit status. "
-            "Use this instead of run_shell for verification; repository inspection commands are rejected."
+            "Use purpose=acceptance for delivery checks and purpose=diagnostic only for exploratory "
+            "probes; diagnostic results neither satisfy nor block delivery. Repository inspection "
+            "commands are rejected."
         ),
     },
     "write_file": {
         "schema": {"path": "str", "content": "str"},
         "risky": True,
-        "description": "Write a text file.",
+        "description": (
+            "Write a text file and return a bounded diff plus current post-edit source. "
+            "Do not reread solely to confirm the edit."
+        ),
     },
     "patch_file": {
         "schema": {"path": "str", "old_text": "str", "new_text": "str"},
         "risky": True,
-        "description": "Replace one exact text block in a file.",
+        "description": (
+            "Replace one exact text block and return a bounded diff plus current post-edit source. "
+            "Do not reread solely to confirm the edit."
+        ),
     },
 }
 
@@ -167,7 +187,7 @@ def validate_tool(context, name, args):
         if not native_path(path).is_file():
             raise ValueError("path is not a file")
         start = int(args.get("start", 1))
-        end = int(args.get("end", 200))
+        end = int(args.get("end", context.source_window_lines))
         if start < 1 or end < start:
             raise ValueError("invalid line range")
         return
@@ -206,6 +226,11 @@ def validate_tool(context, name, args):
         command = str(args.get("command", "")).strip()
         if not command:
             raise ValueError("command must not be empty")
+        if is_repository_read_command(command):
+            raise ValueError(
+                "repository inspection command; use list_files, read_file, read_files, "
+                "search, or inspect_repository"
+            )
         timeout = int(args.get("timeout", 20))
         if timeout < 1 or timeout > 120:
             raise ValueError("timeout must be in [1, 120]")
@@ -228,6 +253,9 @@ def validate_tool(context, name, args):
         timeout = int(args.get("timeout", 120))
         if timeout < 1 or timeout > 120:
             raise ValueError("timeout must be in [1, 120]")
+        purpose = str(args.get("purpose", "acceptance")).strip().lower()
+        if purpose not in {"acceptance", "diagnostic"}:
+            raise ValueError("purpose must be 'acceptance' or 'diagnostic'")
         return
 
     if name == "write_file":
@@ -285,13 +313,13 @@ def tool_read_file(context, args):
     if not native_path(path).is_file():
         raise ValueError("path is not a file")
     start = int(args.get("start", 1))
-    end = int(args.get("end", 200))
+    end = int(args.get("end", context.source_window_lines))
     if start < 1 or end < start:
         raise ValueError("invalid line range")
     document = read_text_document(path)
     lines = document.text.splitlines()
     return render_reads([(path.relative_to(context.root).as_posix(), document.encoding,
-                          lines, start, end)], MAX_TOOL_OUTPUT)
+                          lines, start, end)], context.observation_char_budget)
 
 
 def tool_read_files(context, args):
@@ -303,8 +331,8 @@ def tool_read_files(context, args):
         path = context.path(raw_path)
         document = read_text_document(path)
         documents.append((path.relative_to(context.root).as_posix(), document.encoding,
-                          document.text.splitlines(), 1, 500))
-    return render_reads(documents, MAX_TOOL_OUTPUT)
+                          document.text.splitlines(), 1, context.source_window_lines))
+    return render_reads(documents, context.observation_char_budget)
 
 
 def tool_search(context, args):
@@ -352,7 +380,10 @@ def tool_run_shell(context, args):
         raise ValueError("timeout must be in [1, 120]")
     if context.command_runner is None:
         raise RuntimeError("shell_runtime_unavailable: no execution runtime is attached to this transaction")
-    return format_shell_result(context.command_runner.run(command, timeout=timeout))
+    return format_shell_result(
+        context.command_runner.run(command, timeout=timeout),
+        char_budget=context.observation_char_budget,
+    )
 
 
 def tool_run_verification(context, args):
@@ -360,7 +391,10 @@ def tool_run_verification(context, args):
     timeout = int(args.get("timeout", 120))
     if context.command_runner is None:
         raise RuntimeError("shell_runtime_unavailable: no execution runtime is attached to this transaction")
-    return format_shell_result(context.command_runner.run_argv(argv, timeout=timeout))
+    return format_shell_result(
+        context.command_runner.run_argv(argv, timeout=timeout),
+        char_budget=context.observation_char_budget,
+    )
 
 
 def tool_write_file(context, args):
@@ -368,7 +402,15 @@ def tool_write_file(context, args):
     content = str(args["content"])
     existing = read_text_document(path) if native_path(path).is_file() else None
     write_text_document(path, content, existing)
-    return f"wrote {path.relative_to(context.root)} ({len(content)} chars)"
+    relative = path.relative_to(context.root).as_posix()
+    return render_mutation_observation(
+        relative,
+        existing.text if existing is not None else "",
+        read_text_document(path),
+        "write_file",
+        context.observation_char_budget,
+        context.source_window_lines,
+    )
 
 
 def tool_patch_file(context, args):
@@ -386,7 +428,15 @@ def tool_patch_file(context, args):
     if count != 1:
         raise ValueError(f"old_text must occur exactly once, found {count}")
     write_text_document(path, text.replace(old_text, str(args["new_text"]), 1), document)
-    return f"patched {path.relative_to(context.root)}"
+    relative = path.relative_to(context.root).as_posix()
+    return render_mutation_observation(
+        relative,
+        document.text,
+        read_text_document(path),
+        "patch_file",
+        context.observation_char_budget,
+        context.source_window_lines,
+    )
 
 
 def tool_delegate(context, args):

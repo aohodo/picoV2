@@ -9,7 +9,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from .context_projection import _head_tail, _project_runtime_state
 from .features import memory as memorylib
+from .progress import ExecutionLedger
+from .read_observation import (
+    compact_read_observation,
+    retain_read_evidence,
+    visible_read_coverage,
+)
 
 DEFAULT_TOTAL_BUDGET = 12000
 DEFAULT_SECTION_BUDGETS = {
@@ -152,10 +159,48 @@ class ContextManager:
             # Keep it beside the untruncated current request so tool growth cannot
             # silently push resume state outside the prefix budget.
             section_texts[CURRENT_REQUEST_SECTION] = checkpoint_text + "\n\n" + request_text
+        controller = getattr(self.agent, "progress_controller", None)
+        runtime_state = (
+            controller.runtime_state_view()
+            if controller is not None
+            else {"ledger": ExecutionLedger.from_dict(
+                getattr(self.agent, "session", {}).get("execution_ledger", {})
+            ).view()}
+        )
+        ledger = runtime_state.get("ledger", {})
+        failures = ledger.get("unresolved_failures", [])
         selected_notes = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
             selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
-
+        if failures or ledger.get("unresolved_failure_count", 0):
+            header = "Runtime verification feedback:\n"
+            reserved = self._assemble_prompt(self._render_sections(
+                section_texts, self.section_floors, selected_notes=selected_notes,
+            ))
+            feedback_budget = max(1, self.total_budget - len(reserved) - len(header) - 2)
+            # Project actionable failures, not a duplicate navigation/metrics
+            # ledger, into the space left by the request and section floors.
+            runtime_json, _ = _project_runtime_state({"ledger": {
+                "unresolved_failures": failures,
+                "unresolved_failure_count": ledger.get("unresolved_failure_count", len(failures)),
+            }}, char_budget=feedback_budget)
+            if len(runtime_json) > feedback_budget:
+                # When even the structured summary cannot fit, retain the
+                # newest diagnostic explicitly as an excerpt, not broken JSON.
+                latest = failures[-1] if failures else {}
+                runtime_json = _head_tail(
+                    "Unresolved verification failures; latest diagnostic excerpt "
+                    "(full records remain in the session):\n"
+                    + latest.get("identity_warning", "") + "\n"
+                    + latest.get("output", "Original failure details are unavailable."),
+                    feedback_budget,
+                )
+            feedback = header + runtime_json
+            # Active failures are current evidence even after their historical
+            # tool outputs disappear. Keep the latest user request last.
+            section_texts[CURRENT_REQUEST_SECTION] = (
+                feedback + "\n\n" + section_texts[CURRENT_REQUEST_SECTION]
+            )
         if not context_reduction_enabled:
             rendered = self._render_sections_without_reduction(section_texts, selected_notes=selected_notes)
             prompt = self._assemble_prompt(rendered)
@@ -398,25 +443,40 @@ class ContextManager:
         history = list(getattr(self.agent, "session", {}).get("history", []))
         current = []
         for item in history:
-            if item.get("role") != "tool" or item.get("name") not in {
-                "read_file",
-                "read_files",
-            }:
+            if item.get("role") != "tool":
                 current.append(item)
                 continue
             evidence = item.get("read_evidence")
             if not evidence:
+                # A failed read is feedback, not stale source. Legacy mutation
+                # acknowledgements have no source evidence and remain useful
+                # as action history until naturally summarized.
+                if item.get("name") in {"read_file", "read_files"} and not str(
+                    item.get("content", "")
+                ).startswith("error:"):
+                    continue
+                current.append(item)
                 continue
-            if any(
-                record.get("freshness") is None
-                or record.get("freshness")
-                != memorylib.file_freshness(
+            fresh = [
+                record for record in evidence
+                if record.get("freshness") is not None
+                and record.get("freshness")
+                == memorylib.file_freshness(
                     record.get("path", ""), self.agent.root
                 )
-                for record in evidence
-            ):
+            ]
+            if not fresh:
                 continue
-            current.append(item)
+            if len(fresh) == len(evidence):
+                current.append(item)
+                continue
+            filtered = dict(item)
+            filtered["content"] = retain_read_evidence(item.get("content", ""), fresh)
+            filtered["read_evidence"] = visible_read_coverage(
+                filtered["content"], fresh
+            )
+            if filtered["read_evidence"]:
+                current.append(filtered)
         return current
 
     def _compressed_history_entries(self, history, recent_start):
@@ -498,7 +558,16 @@ class ContextManager:
     def _render_history_item(self, item, line_limit):
         if item["role"] == "tool":
             prefix = f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}"
-            content = _tail_clip(item["content"], max(20, line_limit))
+            content = str(item["content"])
+            if item.get("name") in {
+                "read_file",
+                "read_files",
+                "write_file",
+                "patch_file",
+            }:
+                content = compact_read_observation(content, max(20, line_limit))
+            else:
+                content = _tail_clip(content, max(20, line_limit))
             return [prefix, content]
         return [f"[{item['role']}] {_tail_clip(item['content'], line_limit)}"]
 

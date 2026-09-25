@@ -1,7 +1,7 @@
 import json
 
 from pico.context_projection import project_model_events
-from pico.progress import NEW_EVIDENCE, NO_PROGRESS, ProgressController
+from pico.progress import NEW_EVIDENCE, ProgressController
 from pico.read_observation import render_reads, visible_read_coverage
 
 
@@ -25,9 +25,7 @@ def test_compaction_then_reacquisition_is_not_historical_stagnation():
     assert first.reason == "missing_source_delivered"
     projected, _ = project_model_events(events, char_budget=10000)
     controller.set_visible_tool_outputs(projected)
-    assert controller.preflight("read_file", args)["allowed"]
-    _, repeated, _ = read(controller)
-    assert repeated.kind == NO_PROGRESS
+    assert not controller.preflight("read_file", args)["allowed"]
     projected, _ = project_model_events(events, char_budget=1000)
     controller.set_visible_tool_outputs(projected)
     assert controller.preflight("read_file", args)["allowed"]
@@ -46,9 +44,9 @@ def test_overlapping_ranges_use_union_not_call_signature():
     _, evidence, second = read(controller, 10, 25)
     assert evidence.reason == "missing_source_delivered"
     controller.set_visible_tool_outputs(first + second)
-    assert controller.preflight("read_file", {"path": "app.py", "start": 3, "end": 24})["allowed"]
-    _, repeated, _ = read(controller, 3, 24)
-    assert repeated.kind == NO_PROGRESS
+    assert not controller.preflight(
+        "read_file", {"path": "app.py", "start": 3, "end": 24}
+    )["allowed"]
 
 
 def test_old_revision_is_not_visible_after_mutation():
@@ -77,9 +75,7 @@ def test_recovery_stays_correct_in_second_cycle_without_resetting_phase():
         controller.set_visible_tool_outputs([])
         args, _, events = read(controller)
         controller.set_visible_tool_outputs(events)
-        assert controller.preflight("read_file", args)["allowed"]
-        _, repeated, _ = read(controller)
-        assert repeated.kind == NO_PROGRESS
+        assert not controller.preflight("read_file", args)["allowed"]
         controller.set_visible_tool_outputs([])
         assert controller.preflight("read_file", args)["allowed"]
         _, evidence, _ = read(controller)
@@ -96,6 +92,4 @@ def test_truncated_observation_only_counts_delivered_lines():
     assert delivered < 100
     controller.set_visible_tool_outputs(events)
     assert controller.preflight("read_file", {**args, "start": delivered, "end": 100})["allowed"]
-    assert controller.preflight("read_file", {**args, "end": delivered})["allowed"]
-    _, repeated, _ = read(controller, 1, delivered, ["x = '" + "a" * 100 + "'"] * 100)
-    assert repeated.kind == NO_PROGRESS
+    assert not controller.preflight("read_file", {**args, "end": delivered})["allowed"]

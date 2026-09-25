@@ -66,9 +66,17 @@ class ConsoleProgressRenderer:
         elif event == "durable_memory_admitted":
             line = f"[pico] durable memory | {len(payload.get('promoted', []))} stored"
         elif event == "run_finished":
+            delivered_paths = list(getattr(task_state, "delivered_paths", []))
+            staged_paths = list(getattr(task_state, "staged_paths", []))
+            if delivered_paths:
+                change_text = f"delivered {len(delivered_paths)}"
+            elif staged_paths:
+                change_text = f"staged {len(staged_paths)}"
+            else:
+                change_text = f"changed {len(getattr(task_state, 'changed_paths', []))}"
             line = (
                 f"[pico] finished | {payload.get('stop_reason', 'unknown')}"
-                f" | changed {len(getattr(task_state, 'changed_paths', []))}"
+                f" | {change_text}"
                 f" | validation {getattr(task_state, 'validation_status', 'not_run')}"
                 f" | {payload.get('run_duration_ms', 0) / 1000:.2f}s"
             )
