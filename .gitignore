@@ -49,6 +49,7 @@ docs/*
 !docs/review-pack/README.md
 !docs/architecture/
 !docs/architecture/agent-harness-v1-overview.md
+!docs/architecture/human-inspired-programming-loop.md
 
 # OS files
 .DS_Store

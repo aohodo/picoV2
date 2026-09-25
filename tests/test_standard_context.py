@@ -26,6 +26,32 @@ def test_unknown_context_capacity_uses_working_set_not_step_count():
     assert ContextProjector(long).event_char_budget == DEFAULT_EVENT_CHAR_BUDGET
 
 
+def test_instructions_include_authoritative_execution_environment():
+    agent = SimpleNamespace(
+        model_client=SimpleNamespace(),
+        approval_policy="auto",
+        read_only=False,
+        execution_profile_view=lambda: {
+            "host_os": "Windows",
+            "dialect": "bash",
+            "path_style": "windows",
+            "python_command": "python",
+            "available_commands": ["git", "python", "java", "mvn"],
+        },
+        workspace=SimpleNamespace(text=lambda: "Workspace: test"),
+    )
+
+    instructions = ContextProjector(agent).instructions()
+
+    assert "host OS=Windows" in instructions
+    assert "shell dialect=bash" in instructions
+    assert "path style=windows" in instructions
+    assert "Python command=python" in instructions
+    assert "git, python, java, mvn" in instructions
+    assert "do not assume an unlisted" in instructions.lower()
+    assert "python3 exists" in instructions.lower()
+
+
 def test_unresolved_failure_diagnostic_survives_runtime_compaction():
     state = {"ledger": {"observed_files": {str(i): "x" * 400 for i in range(100)},
                         "unresolved_failures": [{"command": "pytest test_age.py",

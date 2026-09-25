@@ -7,6 +7,7 @@ from .execution import bound_text_observation
 from .features import memory as memorylib
 from .interaction_policy import path_matches_patterns
 from .text_document import TextDecodingError, read_text_document
+from .tools import mutation_paths
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,20 @@ class ToolExecutor:
                 set(requirements.get("protected_paths", ()))
                 | set(interaction.get("protected_paths", ()))
             )
+            for key in (
+                "referenced_paths",
+                "requested_existing_paths",
+                "requested_missing_paths",
+                "unresolved_path_mentions",
+            ):
+                requirements[key] = list(
+                    dict.fromkeys(
+                        [
+                            *requirements.get(key, ()),
+                            *interaction.get(key, ()),
+                        ]
+                    )
+                )
         result.metadata.update(controller.metrics())
         return result
 
@@ -166,12 +181,15 @@ class ToolExecutor:
                 ),
             ))
 
-        if name in {"write_file", "patch_file"} and path_matches_patterns(
-            args.get("path", ""), interaction.get("protected_paths", [])
-        ):
+        protected_targets = [
+            path
+            for path in mutation_paths(name, args)
+            if path_matches_patterns(path, interaction.get("protected_paths", []))
+        ]
+        if protected_targets:
             return self._finalize(name, args, ToolExecutionResult(
                 content=(
-                    f"error: scope_constraint for {name}; {args.get('path', '')} is protected by "
+                    f"error: scope_constraint for {name}; {', '.join(protected_targets)} is protected by "
                     "an explicit no-modification instruction in the current request."
                 ),
                 metadata=_metadata(
@@ -180,7 +198,7 @@ class ToolExecutor:
                     security_event_type="scope_constraint",
                     risk_level="high",
                     read_only=False,
-                    affected_paths=[str(args.get("path", ""))],
+                    affected_paths=protected_targets,
                 ),
             ))
 
@@ -260,7 +278,8 @@ class ToolExecutor:
                     if error_code == "broad_exploration_after_grounding"
                     else (
                         f"error: material_action_required for {name}; the exploration budget is "
-                        "exhausted. Complete related edits with write_file/patch_file, use "
+                        "exhausted. Complete related edits with write_file, patch_file, or "
+                        "apply_patch; use "
                         "run_verification, read missing source at known targets, finalize from existing evidence, "
                         "or identify a blocker."
                     )
@@ -319,6 +338,15 @@ class ToolExecutor:
                 elif exit_code != 0:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
+            verification_evidence = getattr(raw_result, "verification_evidence", None)
+            if (
+                name == "run_verification"
+                and verification_evidence
+                and verification_evidence.get("missing_test_paths")
+                and tool_status == "ok"
+            ):
+                tool_status = "error"
+                tool_error_code = "verification_incomplete"
             agent.update_memory_after_tool(name, args, content)
             authoritative_validation = bool(
                 name == "run_verification"
@@ -355,6 +383,8 @@ class ToolExecutor:
                     }
                     for item in raw_result.coverage
                 ]
+            if verification_evidence is not None:
+                metadata["verification_evidence"] = verification_evidence
             agent.record_process_note_for_tool(name, metadata)
             if metadata["validation"]:
                 agent.last_verification_succeeded = (
@@ -396,6 +426,16 @@ class ToolExecutor:
                     else ""
                 ),
             )
+            if getattr(exc, "coverage", None):
+                metadata["read_coverage"] = [
+                    {
+                        **item,
+                        "freshness": memorylib.file_freshness(
+                            item.get("path", ""), agent.root
+                        ),
+                    }
+                    for item in exc.coverage
+                ]
             agent.record_process_note_for_tool(name, metadata)
             if metadata["validation"]:
                 agent.last_verification_succeeded = False

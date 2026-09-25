@@ -13,7 +13,12 @@ import sys
 import textwrap
 from pathlib import Path
 
-from .config import load_project_env, provider_env
+from .config import (
+    PicoConfigError,
+    load_runtime_env,
+    provider_env,
+    require_provider_value,
+)
 from .interaction_policy import PACKAGE_LAYOUTS, PreferenceError
 from .progress_output import ConsoleProgressRenderer
 from .providers.clients import (
@@ -70,13 +75,6 @@ HELP_DETAILS = textwrap.dedent(
 
 DEFAULT_OLLAMA_MODEL = "qwen3.5:4b"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
-DEFAULT_OPENAI_MODEL = "gpt-5.4"
-DEFAULT_OPENAI_BASE_URL = "https://www.right.codes/codex/v1"
-DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
-DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
-DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
-DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
-DEFAULT_PROVIDER = "deepseek"
 PROVIDER_CHOICES = ("ollama", "openai", "anthropic", "deepseek")
 SECRET_ENV_NAMES_VAR = "PICO_SECRET_ENV_NAMES"
 
@@ -85,13 +83,17 @@ def _effective_provider(args):
     # Provider 选择优先级：
     # 1. 用户显式传入 --provider
     # 2. 项目 .env / shell 里的 PICO_PROVIDER
-    # 3. 代码里的默认 provider
-    provider = getattr(args, "provider", None) or provider_env(
-        "PICO_PROVIDER", default=DEFAULT_PROVIDER
-    )
+    provider = getattr(args, "provider", None) or provider_env("PICO_PROVIDER")
+    if not provider:
+        raise PicoConfigError(
+            "PICO_PROVIDER is not configured. Define it in .env or pass --provider; "
+            "Pico will not silently select a cloud provider."
+        )
     if provider not in PROVIDER_CHOICES:
         choices = ", ".join(PROVIDER_CHOICES)
-        raise ValueError(f"unknown provider: {provider}. expected one of: {choices}")
+        raise PicoConfigError(
+            f"unknown provider: {provider}. expected one of: {choices}"
+        )
     return provider
 
 
@@ -107,17 +109,23 @@ def _effective_model(args, provider):
         model = provider_env("PICO_OPENAI_MODEL", ("OPENAI_MODEL",))
         if model:
             return model
-        return DEFAULT_OPENAI_MODEL
+        raise PicoConfigError(
+            "openai provider requires PICO_OPENAI_MODEL in .env or --model"
+        )
     if provider == "anthropic":
         model = provider_env("PICO_ANTHROPIC_MODEL", ("ANTHROPIC_MODEL",))
         if model:
             return model
-        return DEFAULT_ANTHROPIC_MODEL
+        raise PicoConfigError(
+            "anthropic provider requires PICO_ANTHROPIC_MODEL in .env or --model"
+        )
     if provider == "deepseek":
         model = provider_env("PICO_DEEPSEEK_MODEL", ("DEEPSEEK_MODEL",))
         if model:
             return model
-        return DEFAULT_DEEPSEEK_MODEL
+        raise PicoConfigError(
+            "deepseek provider requires PICO_DEEPSEEK_MODEL in .env or --model"
+        )
     return DEFAULT_OLLAMA_MODEL
 
 
@@ -149,10 +157,19 @@ def _build_model_client(args):
     # 真正的提示词格式、缓存支持、HTTP 协议差异，都封装在 models.py 里。
     if provider == "openai":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or provider_env("PICO_OPENAI_API_BASE", ("OPENAI_API_BASE",), DEFAULT_OPENAI_BASE_URL)
-        api_key = provider_env(
+        base_url = require_provider_value(
+            getattr(args, "base_url", None)
+            or provider_env("PICO_OPENAI_API_BASE", ("OPENAI_API_BASE",)),
+            "PICO_OPENAI_API_BASE",
+            provider,
+        )
+        api_key = require_provider_value(
+            provider_env(
+                "PICO_OPENAI_API_KEY",
+                ("OPENAI_API_KEY", "PICO_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY"),
+            ),
             "PICO_OPENAI_API_KEY",
-            ("OPENAI_API_KEY", "PICO_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY", "PICO_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+            provider,
         )
         return OpenAICompatibleModelClient(
             model=model,
@@ -178,10 +195,19 @@ def _build_model_client(args):
         )
     if provider == "anthropic":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or provider_env("PICO_ANTHROPIC_API_BASE", ("ANTHROPIC_API_BASE",), DEFAULT_ANTHROPIC_BASE_URL)
-        api_key = provider_env(
+        base_url = require_provider_value(
+            getattr(args, "base_url", None)
+            or provider_env("PICO_ANTHROPIC_API_BASE", ("ANTHROPIC_API_BASE",)),
+            "PICO_ANTHROPIC_API_BASE",
+            provider,
+        )
+        api_key = require_provider_value(
+            provider_env(
+                "PICO_ANTHROPIC_API_KEY",
+                ("ANTHROPIC_API_KEY", "PICO_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY"),
+            ),
             "PICO_ANTHROPIC_API_KEY",
-            ("ANTHROPIC_API_KEY", "PICO_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY", "PICO_OPENAI_API_KEY", "OPENAI_API_KEY"),
+            provider,
         )
         return AnthropicCompatibleModelClient(
             model=model,
@@ -192,8 +218,17 @@ def _build_model_client(args):
         )
     if provider == "deepseek":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or provider_env("PICO_DEEPSEEK_API_BASE", ("DEEPSEEK_API_BASE",), DEFAULT_DEEPSEEK_BASE_URL)
-        api_key = provider_env("PICO_DEEPSEEK_API_KEY", ("DEEPSEEK_API_KEY",))
+        base_url = require_provider_value(
+            getattr(args, "base_url", None)
+            or provider_env("PICO_DEEPSEEK_API_BASE", ("DEEPSEEK_API_BASE",)),
+            "PICO_DEEPSEEK_API_BASE",
+            provider,
+        )
+        api_key = require_provider_value(
+            provider_env("PICO_DEEPSEEK_API_KEY", ("DEEPSEEK_API_KEY",)),
+            "PICO_DEEPSEEK_API_KEY",
+            provider,
+        )
         return AnthropicCompatibleModelClient(
             model=model,
             base_url=base_url,
@@ -281,7 +316,7 @@ def build_agent(args):
     # 这里是 CLI 到 runtime 的装配点：
     # 先采集工作区快照和加载项目级环境，再整理 secret 名单、模型后端和 session。
     workspace = WorkspaceContext.build(args.cwd)
-    load_project_env(workspace.repo_root)
+    load_runtime_env(Path.cwd(), workspace.repo_root)
     configured_secret_names = _configured_secret_names(args)
     workspace_state = WorkspaceState(workspace.repo_root).ensure()
     boundary = SecretBoundary(secret_env_names=configured_secret_names)
@@ -347,7 +382,7 @@ def build_arg_parser():
         "--provider",
         choices=PROVIDER_CHOICES,
         default=None,
-        help="Model backend to use. Defaults to PICO_PROVIDER or deepseek.",
+        help="Model backend to use. Defaults to PICO_PROVIDER from .env; no implicit cloud provider is selected.",
     )
     parser.add_argument(
         "--model",
@@ -491,7 +526,7 @@ def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     try:
         agent = build_agent(args)
-    except (SessionError, PreferenceError) as exc:
+    except (PicoConfigError, SessionError, PreferenceError) as exc:
         print_safe(str(exc), file=sys.stderr)
         return 2
 

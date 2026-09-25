@@ -2,6 +2,7 @@
 
 import json
 import time
+from pathlib import Path
 
 from .checkpoint import (
     CHECKPOINT_NONE_STATUS,
@@ -18,12 +19,79 @@ from .task_state import TaskState
 from .tool_executor import ToolExecutionResult
 from .tools import native_tool_definitions
 from .verification_feedback import completion_feedback
+from .working_set import build_initial_working_set
 from .workspace import clip, now
 
 
 class AgentLoop:
     def __init__(self, agent):
         self.agent = agent
+
+    def _ground_referenced_paths(self, interaction):
+        """Resolve user-named paths against the active Shadow workspace.
+
+        Repository graphs are language-specific, while an explicit path in a
+        request is language-agnostic evidence.  Keep the two sources together
+        so Vue/config/document tasks do not restart discovery merely because
+        the semantic index does not parse that file type.
+        """
+        mentioned = list(interaction.get("referenced_paths", ()))
+        graph_paths = list(self.agent.last_repository_evidence.get("paths", ()))
+        existing = []
+        missing = []
+        unresolved = []
+        root = Path(self.agent.root)
+
+        def append_unique(items, value):
+            if value not in items:
+                items.append(value)
+
+        for raw_path in mentioned:
+            path = str(raw_path).replace("\\", "/").removeprefix("./")
+            direct = root / path
+            if direct.is_file():
+                append_unique(existing, path)
+                continue
+            if "/" not in path:
+                matches = [
+                    candidate
+                    for candidate in graph_paths
+                    if Path(candidate).name.casefold() == path.casefold()
+                ]
+                if matches:
+                    for candidate in matches:
+                        append_unique(existing, candidate)
+                else:
+                    append_unique(unresolved, path)
+                continue
+            append_unique(missing, path)
+
+        interaction["requested_existing_paths"] = existing
+        interaction["requested_missing_paths"] = missing
+        interaction["unresolved_path_mentions"] = unresolved
+        if existing:
+            seed = dict(self.agent.last_repository_evidence)
+            seed["paths"] = list(dict.fromkeys([*existing, *graph_paths]))
+            seed["confidence"] = "high"
+            seed["requested_existing_paths"] = existing
+            seed["requested_missing_paths"] = missing
+            self.agent.last_repository_evidence = seed
+
+        if mentioned:
+            lines = ["Explicit path evidence from the current request:"]
+            if existing:
+                lines.append("  existing targets: " + ", ".join(existing))
+            if missing:
+                lines.append(
+                    "  named paths not currently present (possible requested outputs): "
+                    + ", ".join(missing)
+                )
+            if unresolved:
+                lines.append("  unresolved filename mentions: " + ", ".join(unresolved))
+            rendered = str(interaction.get("repository_evidence", "")).strip()
+            interaction["repository_evidence"] = "\n".join(
+                [part for part in (rendered, *lines) if part]
+            )
 
     def _persist_model_failure(self, task_state, user_message, exc, run_started_at, prompt_metadata):
         agent = self.agent
@@ -656,6 +724,8 @@ class AgentLoop:
         agent.last_durable_superseded = []
         agent.last_run_outcome = None
         agent.last_repository_evidence = {}
+        agent.initial_working_set = ""
+        agent.initial_working_set_coverage = []
         agent._last_tool_result_metadata = {}
         task_state = TaskState.create(run_id=agent.new_run_id(), task_id=agent.new_task_id(), user_request=user_message)
         interaction = agent.interaction_contract(user_message)
@@ -676,6 +746,19 @@ class AgentLoop:
             evidence = agent.repository_evidence(user_message)
             if evidence:
                 interaction["repository_evidence"] = evidence
+        self._ground_referenced_paths(interaction)
+        task_state.set_interaction(interaction)
+        if interaction.get("mutation_allowed") and interaction.get(
+            "referenced_paths"
+        ):
+            path_context = agent.session.setdefault("transaction_requirements", {})
+            for key in (
+                "referenced_paths",
+                "requested_existing_paths",
+                "requested_missing_paths",
+                "unresolved_path_mentions",
+            ):
+                path_context[key] = list(interaction.get(key, ()))
         if agent.transaction_context is not None:
             task_state.transaction_id = agent.transaction_context.transaction_id
             task_state.transaction_state = agent.transaction_context.workspace.state
@@ -695,6 +778,19 @@ class AgentLoop:
             repository_evidence=agent.last_repository_evidence,
             delivery_requirements=interaction,
         )
+        initial_working_set = build_initial_working_set(
+            agent.path,
+            user_message,
+            (
+                interaction.get("requested_existing_paths", ())
+                if interaction.get("mutation_allowed") and not agent.read_only
+                else ()
+            ),
+        )
+        agent.initial_working_set = initial_working_set.text
+        agent.initial_working_set_coverage = controller.seed_working_set(
+            initial_working_set.coverage
+        )
         agent.progress_controller = controller
         native_mode = bool(
             getattr(agent.model_client, "supports_native_tools", False)
@@ -711,6 +807,15 @@ class AgentLoop:
                 "interaction": interaction,
             },
         )
+        if initial_working_set.coverage:
+            agent.emit_trace(
+                task_state,
+                "working_set_seeded",
+                {
+                    "chars": len(initial_working_set.text),
+                    "coverage": list(initial_working_set.coverage),
+                },
+            )
         promoted, rejected, superseded = agent.promote_durable_memory(user_message)
         if promoted or rejected or superseded:
             agent.emit_trace(

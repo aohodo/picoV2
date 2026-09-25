@@ -312,6 +312,28 @@ def test_bare_shell_uses_workspace_profile_but_explicit_path_is_preserved(tmp_pa
     assert captured[-1][0] == "E:/other/bash.exe"
 
 
+def test_execution_profile_reports_runtime_facts_without_environment_values(tmp_path):
+    from pico.execution import WorkspaceCommandRunner
+    from pico.security import SecretBoundary
+
+    profile = WorkspaceCommandRunner(tmp_path, SecretBoundary()).profile_view()
+
+    assert profile["host_os"]
+    assert profile["path_style"] in {"windows", "posix"}
+    assert profile["python_command"] == "python"
+    assert profile["python_executable"]
+    assert "python" in profile["available_commands"]
+    assert set(profile) == {
+        "dialect",
+        "executable",
+        "host_os",
+        "path_style",
+        "python_command",
+        "python_executable",
+        "available_commands",
+    }
+
+
 def test_reasoning_usage_is_preserved_without_inventing_missing_values():
     from pico.providers.clients import _extract_usage_cache_details
 

@@ -171,7 +171,7 @@ def test_verifier_mutation_makes_validation_stale(tmp_path):
     }
 
 
-def test_delivery_uses_real_verification_not_test_filename_gate(tmp_path):
+def test_requested_test_artifact_is_a_delivery_obligation(tmp_path):
     agent = make_agent(tmp_path)
     agent.begin_transaction()
     agent.current_interaction = {
@@ -188,9 +188,40 @@ def test_delivery_uses_real_verification_not_test_filename_gate(tmp_path):
 
     outcome = agent.finalize_transaction()
 
-    assert outcome["state"] == "COMMITTED"
-    assert (agent.source_root / "app.py").read_text() == "VALUE = 2\n"
-    assert not shadow.exists()
+    assert outcome["state"] == "CONFLICTED"
+    assert outcome["conflicts"][0]["reason"] == "required_test_artifact_missing"
+    assert (agent.source_root / "app.py").read_text() == "VALUE = 1\n"
+    assert shadow.exists()
+
+
+def test_pytest_report_proves_changed_test_was_executed(tmp_path):
+    agent = make_agent(tmp_path)
+    agent.begin_transaction()
+    agent.current_interaction = {
+        "mutation_allowed": True,
+        "validation_required": True,
+        "test_artifact_required": True,
+    }
+    agent.progress_controller = ProgressController(12)
+    agent.execute_tool("write_file", {"path": "app.py", "content": "VALUE = 2\n"})
+    agent.execute_tool(
+        "write_file",
+        {
+            "path": "test_app.py",
+            "content": "from app import VALUE\n\ndef test_value():\n    assert VALUE == 2\n",
+        },
+    )
+
+    result = agent.execute_tool(
+        "run_verification",
+        {"argv": [sys.executable, "-m", "pytest", "-q"]},
+    )
+
+    assert result.metadata["tool_status"] == "ok"
+    assert result.metadata["verification_evidence"]["verified_test_paths"] == [
+        "test_app.py"
+    ]
+    assert agent.finalize_transaction()["state"] == "COMMITTED"
 
 
 def test_verification_feedback_does_not_close_shadow_repair_cycle(tmp_path):
@@ -362,6 +393,18 @@ def test_read_only_interaction_rejects_every_risky_tool(tmp_path):
     }
     for name, args in (
         ("write_file", {"path": "app.py", "content": "VALUE = 9\n"}),
+        (
+            "apply_patch",
+            {
+                "edits": [
+                    {
+                        "path": "app.py",
+                        "old_text": "VALUE = 1",
+                        "new_text": "VALUE = 9",
+                    }
+                ]
+            },
+        ),
         ("run_shell", {"command": "echo changed > app.py"}),
         ("run_verification", {"argv": [sys.executable, "-c", "print(1)"]}),
     ):

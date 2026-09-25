@@ -1,10 +1,12 @@
 import json
+from unittest.mock import patch
 
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
 from pico.context_projection import ContextProjector, discard_stale_read_groups
 from pico.execution import format_shell_result
 from pico.mutation_observation import _changed_ranges
 from pico.progress import ProgressController
+from pico.tools import native_tool_definitions
 
 
 def make_agent(tmp_path):
@@ -132,6 +134,52 @@ def test_read_is_allowed_after_its_visible_evidence_becomes_stale(tmp_path):
     assert controller.preflight("read_file", args)["allowed"]
 
 
+def test_identical_visible_search_is_rejected_until_workspace_changes(tmp_path):
+    agent = make_agent(tmp_path)
+    args = {"path": ".", "pattern": "VALUE"}
+    result = agent.execute_tool("search", args)
+    controller = agent.progress_controller
+    controller.set_visible_tool_outputs(event_pair("search-1", "search", args, result))
+
+    decision = controller.preflight("search", args)
+
+    assert not decision["allowed"]
+    assert decision["evidence"].reason == "repeated_no_progress"
+
+    agent.execute_tool(
+        "patch_file",
+        {"path": "app.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+    )
+    assert controller.preflight("search", args)["allowed"]
+
+
+def test_visible_batch_read_identity_tracks_each_real_paths_argument(tmp_path):
+    agent = make_agent(tmp_path)
+    agent.execute_tool(
+        "write_file", {"path": "other.py", "content": "OTHER = 1\n"}
+    )
+    args = {"paths": ["app.py", "other.py"]}
+    result = agent.execute_tool("read_files", args)
+    controller = agent.progress_controller
+    controller.set_visible_tool_outputs(
+        event_pair("batch-1", "read_files", args, result)
+    )
+
+    repeated = agent.execute_tool("read_files", args)
+
+    assert repeated.metadata["tool_error_code"] == "repeated_no_progress"
+    assert not repeated.metadata["executed"]
+    assert controller.state.last_action["targets"] == ["app.py", "other.py"]
+
+    agent.execute_tool(
+        "patch_file",
+        {"path": "other.py", "old_text": "OTHER = 1", "new_text": "OTHER = 2"},
+    )
+    allowed_after_change = agent.execute_tool("read_files", args)
+    assert allowed_after_change.metadata["tool_status"] == "ok"
+    assert allowed_after_change.metadata["executed"]
+
+
 def test_patch_receipt_shows_changed_middle_instead_of_head_only_clip(tmp_path):
     agent = make_agent(tmp_path)
     lines = [f"LINE_{index} = {index}" for index in range(1, 201)]
@@ -166,6 +214,237 @@ def test_patch_receipt_returns_complete_current_file_when_it_fits(tmp_path):
     evidence = result.metadata["read_evidence"]
     assert len(evidence) == 1
     assert (evidence[0]["start"], evidence[0]["end"]) == (1, 3)
+
+
+def test_failed_patch_returns_fresh_candidate_source_without_a_reread(tmp_path):
+    agent = make_agent(tmp_path)
+
+    result = agent.execute_tool(
+        "patch_file",
+        {"path": "app.py", "old_text": "VALUE = 0", "new_text": "VALUE = 2"},
+    )
+
+    assert result.metadata["tool_error_code"] == "patch_match_failed"
+    assert result.metadata["tool_status"] == "error"
+    assert "old_text matched 0 times" in result.content
+    assert "VALUE = 1" in result.content
+    assert result.metadata["read_evidence"][0]["path"] == "app.py"
+
+
+def test_ambiguous_patch_reports_occurrence_lines_and_current_source(tmp_path):
+    agent = make_agent(tmp_path)
+    agent.execute_tool(
+        "write_file", {"path": "app.py", "content": "VALUE = 1\nMID = 2\nVALUE = 1\n"}
+    )
+
+    result = agent.execute_tool(
+        "patch_file",
+        {"path": "app.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+    )
+
+    assert result.metadata["tool_error_code"] == "patch_match_failed"
+    assert "matched 2 times at lines [1, 3]" in result.content
+    assert "MID = 2" in result.content
+
+
+def test_apply_patch_changes_multiple_files_and_locations_in_one_tool_call(tmp_path):
+    agent = make_agent(tmp_path)
+    agent.execute_tool(
+        "write_file",
+        {"path": "test_app.py", "content": "assert VALUE == 1\nassert NAME == 'old'\n"},
+    )
+    agent.execute_tool(
+        "write_file", {"path": "app.py", "content": "VALUE = 1\nNAME = 'old'\n"}
+    )
+
+    result = agent.execute_tool(
+        "apply_patch",
+        {
+            "edits": [
+                {"path": "app.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+                {"path": "app.py", "old_text": "NAME = 'old'", "new_text": "NAME = 'new'"},
+                {
+                    "path": "test_app.py",
+                    "old_text": "assert VALUE == 1",
+                    "new_text": "assert VALUE == 2",
+                },
+            ]
+        },
+    )
+
+    assert result.metadata["tool_status"] == "ok"
+    assert result.metadata["workspace_changed"]
+    assert result.metadata["affected_paths"] == ["app.py", "test_app.py"]
+    assert (agent.root / "app.py").read_text(encoding="utf-8") == "VALUE = 2\nNAME = 'new'\n"
+    assert "assert VALUE == 2" in (agent.root / "test_app.py").read_text(encoding="utf-8")
+    assert {item["path"] for item in result.metadata["read_evidence"]} == {
+        "app.py",
+        "test_app.py",
+    }
+
+
+def test_apply_patch_match_failure_writes_nothing_and_returns_current_source(tmp_path):
+    agent = make_agent(tmp_path)
+    agent.execute_tool("write_file", {"path": "other.py", "content": "OTHER = 1\n"})
+
+    result = agent.execute_tool(
+        "apply_patch",
+        {
+            "edits": [
+                {"path": "app.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+                {"path": "other.py", "old_text": "OTHER = 0", "new_text": "OTHER = 2"},
+            ]
+        },
+    )
+
+    assert result.metadata["tool_error_code"] == "patch_match_failed"
+    assert not result.metadata["workspace_changed"]
+    assert (agent.root / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert (agent.root / "other.py").read_text(encoding="utf-8") == "OTHER = 1\n"
+    assert "entire patch set was rejected before writing" in result.content
+    assert "OTHER = 1" in result.content
+
+
+def test_apply_patch_rejects_ambiguous_or_overlapping_edits_without_writing(tmp_path):
+    agent = make_agent(tmp_path)
+    agent.execute_tool(
+        "write_file", {"path": "app.py", "content": "VALUE = 1\nVALUE = 1\n"}
+    )
+    ambiguous = agent.execute_tool(
+        "apply_patch",
+        {"edits": [{"path": "app.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"}]},
+    )
+    assert ambiguous.metadata["tool_error_code"] == "patch_match_failed"
+    assert "matched 2 times" in ambiguous.content
+
+    agent.execute_tool(
+        "write_file", {"path": "app.py", "content": "VALUE = 1\n"}
+    )
+    overlapping = agent.execute_tool(
+        "apply_patch",
+        {
+            "edits": [
+                {"path": "app.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+                {"path": "app.py", "old_text": "VALUE", "new_text": "RESULT"},
+            ]
+        },
+    )
+    assert overlapping.metadata["tool_error_code"] == "patch_match_failed"
+    assert "overlaps another edit" in overlapping.content
+    assert (agent.root / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_apply_patch_rolls_back_earlier_file_if_a_later_write_fails(tmp_path):
+    agent = make_agent(tmp_path)
+    agent.execute_tool("write_file", {"path": "other.py", "content": "OTHER = 1\n"})
+    from pico import patch_set
+
+    real_write = patch_set.write_text_document
+    calls = 0
+
+    def fail_second_write(path, text, document=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            real_write(path, text, document)
+            raise OSError("simulated locked file")
+        return real_write(path, text, document)
+
+    with patch("pico.patch_set.write_text_document", side_effect=fail_second_write):
+        result = agent.execute_tool(
+            "apply_patch",
+            {
+                "edits": [
+                    {"path": "app.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+                    {"path": "other.py", "old_text": "OTHER = 1", "new_text": "OTHER = 2"},
+                ]
+            },
+        )
+
+    assert result.metadata["tool_status"] == "error"
+    assert not result.metadata["workspace_changed"]
+    assert (agent.root / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert (agent.root / "other.py").read_text(encoding="utf-8") == "OTHER = 1\n"
+
+
+def test_apply_patch_preserves_bom_crlf_and_gb18030(tmp_path):
+    agent = make_agent(tmp_path)
+    bom_path = agent.root / "bom.txt"
+    gbk_path = agent.root / "gbk.txt"
+    bom_path.write_bytes(b"\xef\xbb\xbfA=1\r\nB=2\r\n")
+    gbk_path.write_bytes("状态=旧\r\n".encode("gb18030"))
+
+    result = agent.execute_tool(
+        "apply_patch",
+        {
+            "edits": [
+                {
+                    "path": "bom.txt",
+                    "old_text": "A=1\nB=2",
+                    "new_text": "A=1\nB=3",
+                },
+                {"path": "gbk.txt", "old_text": "状态=旧", "new_text": "状态=新"},
+            ]
+        },
+    )
+
+    assert result.metadata["tool_status"] == "ok"
+    assert bom_path.read_bytes() == b"\xef\xbb\xbfA=1\r\nB=3\r\n"
+    assert gbk_path.read_bytes() == "状态=新\r\n".encode("gb18030")
+
+
+def test_patch_file_adapts_line_based_protocol_text_to_crlf(tmp_path):
+    agent = make_agent(tmp_path)
+    path = agent.root / "app.py"
+    path.write_bytes(b"START\r\nVALUE = 1\r\nEND\r\n")
+
+    result = agent.execute_tool(
+        "patch_file",
+        {
+            "path": "app.py",
+            "old_text": "START\nVALUE = 1\nEND",
+            "new_text": "START\nVALUE = 2\nEND",
+        },
+    )
+
+    assert result.metadata["tool_status"] == "ok"
+    assert path.read_bytes() == b"START\r\nVALUE = 2\r\nEND\r\n"
+
+
+def test_patch_file_does_not_guess_a_newline_style_for_mixed_files(tmp_path):
+    agent = make_agent(tmp_path)
+    path = agent.root / "app.py"
+    original = b"START\r\nVALUE = 1\nEND\r\n"
+    path.write_bytes(original)
+
+    result = agent.execute_tool(
+        "patch_file",
+        {
+            "path": "app.py",
+            "old_text": "START\nVALUE = 1\nEND",
+            "new_text": "START\nVALUE = 2\nEND",
+        },
+    )
+
+    assert result.metadata["tool_error_code"] == "patch_match_failed"
+    assert path.read_bytes() == original
+
+
+def test_apply_patch_native_schema_describes_structured_edits(tmp_path):
+    agent = make_agent(tmp_path)
+
+    definitions = {
+        item["name"]: item for item in native_tool_definitions(agent.tools)
+    }
+    schema = definitions["apply_patch"]["parameters"]
+
+    assert schema["required"] == ["edits"]
+    assert schema["properties"]["edits"]["type"] == "array"
+    assert schema["properties"]["edits"]["items"]["required"] == [
+        "path",
+        "old_text",
+        "new_text",
+    ]
 
 
 def test_nearby_mutation_windows_are_merged_without_duplicate_source_lines():

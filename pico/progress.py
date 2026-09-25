@@ -147,6 +147,9 @@ class ExecutionLedger:
     unresolved_failure_count: int = 0
     unverified_change_count: int = 0
     grounding_path_count: int = 0
+    frontier_reduction_count: int = 0
+    evidence_expansion_count: int = 0
+    no_progress_count: int = 0
 
     def path_revision(self, path):
         return int(self.path_revisions.get(str(path), 0))
@@ -286,6 +289,9 @@ class ExecutionLedger:
             "broad_exploration_count": self.broad_exploration_count,
             "targeted_read_count": self.targeted_read_count,
             "file_read_count": self.file_read_count,
+            "frontier_reduction_count": self.frontier_reduction_count,
+            "evidence_expansion_count": self.evidence_expansion_count,
+            "no_progress_count": self.no_progress_count,
         }
 
     def to_dict(self):
@@ -335,6 +341,13 @@ class ExecutionLedger:
         ledger.broad_exploration_count = int(data.get("broad_exploration_count", 0))
         ledger.targeted_read_count = int(data.get("targeted_read_count", 0))
         ledger.file_read_count = int(data.get("file_read_count", 0))
+        ledger.frontier_reduction_count = int(
+            data.get("frontier_reduction_count", 0)
+        )
+        ledger.evidence_expansion_count = int(
+            data.get("evidence_expansion_count", 0)
+        )
+        ledger.no_progress_count = int(data.get("no_progress_count", 0))
         ledger.observed_file_count = max(
             len(ledger.observed_files), int(data.get("observed_file_count", 0))
         )
@@ -384,6 +397,8 @@ class ProgressState:
     delivery_review_pending: bool = False
     delivery_review_presented: bool = False
     delivery_review_completed: bool = False
+    last_action: dict = field(default_factory=dict)
+    evidence_expansion_streak: int = 0
 
 
 class ProgressController:
@@ -415,6 +430,7 @@ class ProgressController:
         self._read_contents = {}
         self._visible_outputs = None
         self._visible_reads = None
+        self._prefetched_reads = []
         self.delivery_requirements = dict(delivery_requirements or {})
         self.ledger = ExecutionLedger.from_dict(ledger)
         validation_records = [
@@ -450,26 +466,208 @@ class ProgressController:
     def signature(self, tool_name, args):
         return ActionSignature.create(tool_name, args, self._revision_for(tool_name, args))
 
+    def _requested_existing_paths(self):
+        return [
+            str(path)
+            for path in self.delivery_requirements.get(
+                "requested_existing_paths", ()
+            )
+            if str(path).strip()
+        ]
+
+    def _requested_missing_paths(self):
+        return [
+            str(path)
+            for path in self.delivery_requirements.get(
+                "requested_missing_paths", ()
+            )
+            if str(path).strip()
+        ]
+
+    def _unread_requested_paths(self):
+        modified = set(self.ledger.mutations)
+        return [
+            path
+            for path in self._requested_existing_paths()
+            if path not in self.ledger.observed_files and path not in modified
+        ]
+
+    def _unread_candidate_paths(self):
+        requested = set(self._requested_existing_paths())
+        modified = set(self.ledger.mutations)
+        return [
+            path
+            for path in sorted(self.ledger.grounding_paths)
+            if path not in requested
+            and path not in self.ledger.observed_files
+            and path not in modified
+        ]
+
+    def _evidence_frontier(self):
+        frontier = {
+            ("requested_path", path) for path in self._unread_requested_paths()
+        }
+        frontier.update(
+            ("candidate_path", path) for path in self._unread_candidate_paths()
+        )
+        frontier.update(
+            (
+                "definition",
+                str(item.get("path", "")),
+                int(item.get("start", 0)),
+            )
+            for item in self.ledger.view()["pending_definition_candidates"]
+        )
+        return frontier
+
+    @staticmethod
+    def _action_targets(tool_name, args, metadata, read_evidence):
+        targets = []
+        if read_evidence:
+            targets.extend(str(item.get("path", "")) for item in read_evidence)
+        elif tool_name == "read_file" and args.get("path"):
+            targets.append(str(args["path"]))
+        elif tool_name == "read_files":
+            targets.extend(
+                str(item.get("path", "")) for item in args.get("files", ())
+            )
+        targets.extend(str(path) for path in metadata.get("affected_paths", ()))
+        return list(dict.fromkeys(path for path in targets if path))
+
+    def work_focus_view(self):
+        """Project one shared decision context from otherwise separate ledgers.
+
+        This view is advisory.  It does not hide tools, impose a discovery
+        quota, or claim that reading a file means its behavior is understood.
+        Its job is to keep the current evidence frontier visible after history
+        compaction so the model can make the next decision from facts instead
+        of reconstructing the task state on every turn.
+        """
+        unread = self._unread_requested_paths()
+        unread_candidates = self._unread_candidate_paths()
+        observed_requested = [
+            path
+            for path in self._requested_existing_paths()
+            if path in self.ledger.observed_files
+        ]
+        pending_definitions = self.ledger.view()["pending_definition_candidates"]
+        failures_present = bool(
+            self.ledger.unresolved_failures
+            or self.ledger.unresolved_failure_count
+        )
+        unverified = sorted(self.ledger.unverified_changes)
+
+        if failures_present:
+            phase = "repair_failure"
+            priority = (
+                "Interpret the newest unresolved failure first; change or rerun "
+                "only what that evidence justifies."
+            )
+        elif unverified or self.ledger.unverified_change_count:
+            phase = "complete_and_verify_changes"
+            priority = (
+                "Finish the requested change set, then verify the current revision; "
+                "do not restart repository-wide discovery."
+            )
+        elif self.state.delivery_review_pending:
+            phase = "delivery_review"
+            priority = "Review the verified diff against the original request and finish."
+        elif unread:
+            phase = "inspect_explicit_targets"
+            priority = (
+                "Read the named existing targets needed for the requested behavior. "
+                "Broaden exploration only for a concrete unresolved dependency."
+            )
+        elif unread_candidates:
+            phase = "inspect_candidate_paths"
+            priority = (
+                "Inspect the grounded candidate paths before broad repository exploration."
+            )
+        elif pending_definitions:
+            phase = "inspect_candidate_definitions"
+            priority = "Inspect the pending definition candidates that bear on the request."
+        elif self.read_only:
+            phase = "answer_from_evidence"
+            priority = (
+                "Answer from current evidence, or make one targeted read for a clearly "
+                "missing fact."
+            )
+        elif observed_requested or self.ledger.observed_files:
+            phase = "implement"
+            priority = (
+                "The named targets have source evidence. Implement now unless one concrete "
+                "dependency is still unknown."
+            )
+        else:
+            phase = "locate_relevant_code"
+            priority = "Locate the smallest source set that can answer the current request."
+
+        return {
+            "phase": phase,
+            "priority": priority,
+            "known": {
+                "observed_requested_paths": observed_requested,
+                "modified_paths": list(self.ledger.mutations[-8:]),
+                "last_action": dict(self.state.last_action),
+            },
+            "open": {
+                "unread_requested_paths": unread,
+                "unread_candidate_paths": unread_candidates,
+                "named_missing_paths": self._requested_missing_paths(),
+                "pending_definition_candidates": pending_definitions[:8],
+                "unverified_changes": unverified[-12:],
+                "unresolved_failure_count": self.ledger.unresolved_failure_count,
+            },
+            "action_value_counts": {
+                "frontier_reducing": self.ledger.frontier_reduction_count,
+                "evidence_expanding": self.ledger.evidence_expansion_count,
+                "no_progress": self.ledger.no_progress_count,
+            },
+            "evidence_expansion_streak": self.state.evidence_expansion_streak,
+        }
+
     def set_visible_tool_outputs(self, events):
         self._visible_outputs = {
             str(item.get("output", "")) for item in events
             if item.get("type") == "function_call_output"
         }
         self._visible_reads = [
-            record for event in events
-            if event.get("type") == "function_call_output"
-            for record in event.get("_read_evidence", [])
+            *self._prefetched_reads,
+            *[
+                record
+                for event in events
+                if event.get("type") == "function_call_output"
+                for record in event.get("_read_evidence", [])
+            ],
         ]
+
+    def seed_working_set(self, coverage):
+        """Register source that is actually present in the first model input."""
+        visible = [
+            {
+                **item,
+                "revision": self.ledger.path_revision(item.get("path", "")),
+            }
+            for item in coverage
+            if item.get("delivered")
+        ]
+        self._prefetched_reads = visible
+        self.ledger.record_read("read_files", {}, visible)
+        return visible
 
     def set_visible_text_context(self, prompt):
         self._visible_outputs = {content for content in self._read_contents.values() if content in prompt}
         self._visible_reads = None
 
     def _read_is_visible(self, tool_name, args):
-        if self._visible_reads is None:
-            content = self._read_contents.get(self.signature(tool_name, args).key)
+        signature = self.signature(tool_name, args)
+        if tool_name != "read_file":
+            content = self._read_contents.get(signature.key)
             return bool(content) and content in (self._visible_outputs or set())
-        items = [args] if tool_name == "read_file" else args.get("files", [])
+        if self._visible_reads is None:
+            content = self._read_contents.get(signature.key)
+            return bool(content) and content in (self._visible_outputs or set())
+        items = [args]
         return bool(items) and all(
             ranges_cover(
                 self._visible_reads,
@@ -487,11 +685,18 @@ class ProgressController:
         # exact current source range is already present in the model's actual
         # input, executing the read cannot add information. Once the evidence
         # is compacted away or the path revision changes, the read is allowed.
-        if tool_name in {"read_file", "read_files"} and self._read_is_visible(
+        if tool_name in STABLE_READ_TOOLS and self._read_is_visible(
             tool_name, args
         ):
             self.state.blocked_repeats += 1
             self.state.no_progress_streak += 1
+            self.ledger.no_progress_count += 1
+            self.state.last_action = {
+                "tool": tool_name,
+                "value": "no_progress",
+                "targets": self._action_targets(tool_name, args, {}, None),
+                "reason": "repeated_no_progress",
+            }
             self._maybe_intervene()
             return {
                 "allowed": False,
@@ -527,6 +732,7 @@ class ProgressController:
         self.state.rejected_actions.add(self.action_key(tool_name, args))
 
     def observe(self, tool_name, args, content, metadata):
+        frontier_before = self._evidence_frontier()
         signature = self.signature(tool_name, args)
         observation_hash = hashlib.sha256(str(content).encode("utf-8")).hexdigest()
         identity = f"{signature.key}:{observation_hash}"
@@ -545,7 +751,7 @@ class ProgressController:
                 != "diagnostic"
             )
         read_evidence = None
-        if executed and status == "ok" and "read_coverage" in metadata:
+        if executed and "read_coverage" in metadata:
             read_evidence = visible_read_coverage(content, metadata["read_coverage"])
 
         if changed:
@@ -638,10 +844,9 @@ class ProgressController:
             self.state.observations.add(identity)
             if tool_name in STABLE_READ_TOOLS and status == "ok":
                 self.state.successful_reads.add(signature.key)
-                if tool_name in {"read_file", "read_files"}:
-                    self._read_contents[signature.key] = str(content)
-                    while len(self._read_contents) > MAX_LEDGER_OBSERVED_FILES * MAX_LEDGER_RANGES_PER_FILE:
-                        del self._read_contents[next(iter(self._read_contents))]
+                self._read_contents[signature.key] = str(content)
+                while len(self._read_contents) > MAX_LEDGER_OBSERVED_FILES * MAX_LEDGER_RANGES_PER_FILE:
+                    del self._read_contents[next(iter(self._read_contents))]
                 self.ledger.record_read(tool_name, args, read_evidence if read_evidence is not None else metadata.get("read_coverage"))
                 if self._is_broad_exploration(tool_name, args):
                     self.ledger.broad_exploration_count += 1
@@ -671,6 +876,10 @@ class ProgressController:
                         )
                     ),
                 }
+                if metadata.get("verification_evidence"):
+                    record["verification_evidence"] = dict(
+                        metadata["verification_evidence"]
+                    )
                 if validation:
                     # Display text is lossy (one "a b" argument is not two
                     # arguments). Preserve the executed argument boundaries
@@ -716,6 +925,50 @@ class ProgressController:
                         self.ledger.unresolved_failure_count += 1
                     elif len(previous) > 1:
                         self.ledger.unresolved_failure_count -= len(previous) - 1
+        frontier_after = self._evidence_frontier()
+        targets = self._action_targets(tool_name, args, metadata, read_evidence)
+        if changed:
+            action_value = "material_change"
+            self.ledger.frontier_reduction_count += 1
+            self.state.evidence_expansion_streak = 0
+        elif authoritative_verification and executed:
+            action_value = (
+                "verification_passed" if status == "ok" else "failure_feedback"
+            )
+            if status == "ok":
+                self.ledger.frontier_reduction_count += 1
+            else:
+                self.ledger.evidence_expansion_count += 1
+            self.state.evidence_expansion_streak = 0
+        elif frontier_after < frontier_before:
+            action_value = "frontier_reduced"
+            self.ledger.frontier_reduction_count += 1
+            self.state.evidence_expansion_streak = 0
+        elif evidence.kind == NEW_EVIDENCE:
+            action_value = "evidence_expanded"
+            self.ledger.evidence_expansion_count += 1
+            self.state.evidence_expansion_streak += 1
+        else:
+            action_value = "no_progress"
+            self.ledger.no_progress_count += 1
+        self.state.last_action = {
+            "tool": tool_name,
+            "value": action_value,
+            "targets": targets,
+            "reason": evidence.reason,
+        }
+        current_phase = self.work_focus_view()["phase"]
+        if (
+            action_value == "evidence_expanded"
+            and current_phase in {"implement", "complete_and_verify_changes"}
+        ):
+            self.state.pending_notices.append(
+                "Runtime decision feedback: the last action added context but did not "
+                "close a known evidence item. If it answered a concrete implementation "
+                "question, use that answer now. Before another discovery action, identify "
+                "the still-open fact it will decide; otherwise implement or verify the "
+                "current work unit. Tools remain available for a genuinely new dependency."
+            )
         self._maybe_intervene()
         return evidence
 
@@ -724,12 +977,17 @@ class ProgressController:
             return ""
         return (
             "Runtime notice: delivery review is active. Before returning a final answer, "
-            "act like a senior maintainer reviewing another developer's change: return to "
-            "the original request and independently check each required behavior, semantic "
+            "act like a senior maintainer reviewing another developer's change: compare the "
+            "original request with the current post-edit mutation receipts, diff evidence, and "
+            "verification result already in context. Independence means checking the implementation "
+            "against the specification, not fetching the same evidence again. Check each required "
+            "behavior, semantic "
             "invariant, boundary case, compatibility promise, architecture constraint, and "
             "modified-file scope against the current implementation. Passing authored tests "
             "are evidence, not the specification or proof of correctness. If a claim is not "
-            "supported, inspect or correct the implementation and rerun verification; if the "
+            "supported by current evidence, inspect that concrete gap or correct the implementation "
+            "and rerun verification; do not reread or repeat a search solely to confirm an edit "
+            "receipt. If the "
             "delivery is sound, finish without inventing more work."
         )
 
@@ -755,7 +1013,11 @@ class ProgressController:
         return self.state.pending_notices.pop(0) if self.state.pending_notices else ""
 
     def runtime_state_view(self):
-        return {"progress": self.metrics(), "ledger": self.ledger.view()}
+        return {
+            "work_focus": self.work_focus_view(),
+            "progress": self.metrics(),
+            "ledger": self.ledger.view(),
+        }
 
     def _soft_notice(self):
         if self.read_only:
@@ -808,6 +1070,10 @@ class ProgressController:
                 if self.ledger.file_read_count
                 else 0.0
             ),
+            "frontier_reduction_count": self.ledger.frontier_reduction_count,
+            "evidence_expansion_count": self.ledger.evidence_expansion_count,
+            "no_progress_count": self.ledger.no_progress_count,
+            "evidence_expansion_streak": self.state.evidence_expansion_streak,
             "delivery_review_status": (
                 "completed"
                 if self.state.delivery_review_completed

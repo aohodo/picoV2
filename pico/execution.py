@@ -6,6 +6,7 @@ environment; it does not claim to be a host security sandbox.
 """
 
 import os
+import platform
 import re
 import shutil
 import signal
@@ -68,9 +69,22 @@ class ExecutionProfile:
     argv_prefix: tuple
     dialect: str
     executable: str
+    host_os: str = ""
+    path_style: str = ""
+    python_command: str = "python"
+    python_executable: str = ""
+    available_commands: tuple = ()
 
     def view(self):
-        return {"dialect": self.dialect, "executable": self.executable}
+        return {
+            "dialect": self.dialect,
+            "executable": self.executable,
+            "host_os": self.host_os,
+            "path_style": self.path_style,
+            "python_command": self.python_command,
+            "python_executable": self.python_executable,
+            "available_commands": list(self.available_commands),
+        }
 
 
 class WorkspaceCommandRunner:
@@ -79,8 +93,9 @@ class WorkspaceCommandRunner:
     backend = "workspace-process"
     isolation = "deployment-boundary"
 
-    def __init__(self, execution_root, secret_boundary, env_allowlist=()):
+    def __init__(self, execution_root, secret_boundary, env_allowlist=(), source_root=None):
         self.execution_root = Path(execution_root).resolve()
+        self.source_root = Path(source_root).resolve() if source_root else None
         self.secret_boundary = secret_boundary
         self.env_allowlist = tuple(env_allowlist)
         self.started = False
@@ -88,7 +103,22 @@ class WorkspaceCommandRunner:
         self._profile_error = ""
         try:
             prefix, dialect = self.shell()
-            self._profile = ExecutionProfile(tuple(prefix), dialect, str(prefix[0]))
+            known_commands = (
+                "git", "python", "uv", "java", "mvn", "node", "npm", "docker"
+            )
+            available_commands = tuple(
+                name for name in known_commands if shutil.which(name)
+            )
+            self._profile = ExecutionProfile(
+                tuple(prefix),
+                dialect,
+                str(prefix[0]),
+                host_os=platform.system() or os.name,
+                path_style="windows" if os.name == "nt" else "posix",
+                python_command="python",
+                python_executable=str(Path(sys.executable).resolve()),
+                available_commands=available_commands,
+            )
         except ExecutionRuntimeUnavailable as exc:
             self._profile_error = str(exc)
 
@@ -143,6 +173,89 @@ class WorkspaceCommandRunner:
             entries.insert(0, runtime_dir)
         env["PATH"] = os.pathsep.join(entries)
         return env
+
+    def _process_env(self, shell_kind):
+        """Build one transaction-local process environment for every command path.
+
+        TSW already keeps source mutations in the shadow workspace. Package
+        managers have separate, implicit write locations, though, and would
+        otherwise mutate the Python environment or user caches outside that
+        workspace. Keep their normal install/cache state with the transaction
+        so a commit only promotes source files and discarding the shadow also
+        discards command side effects.
+        """
+        runtime_root = self.execution_root / ".pico" / "runtime"
+        paths = {
+            "temp": runtime_root / "tmp",
+            "python_packages": runtime_root / "python-packages",
+            "python_user": runtime_root / "python-user",
+            "pip_cache": runtime_root / "cache" / "pip",
+            "uv_cache": runtime_root / "cache" / "uv",
+            "uv_tools": runtime_root / "uv-tools",
+            "uv_python": runtime_root / "uv-python",
+            "npm_prefix": runtime_root / "npm",
+            "npm_cache": runtime_root / "cache" / "npm",
+            "gradle_home": runtime_root / "gradle",
+            "maven_repo": runtime_root / "maven",
+        }
+        for path in paths.values():
+            path.mkdir(parents=True, exist_ok=True)
+
+        python_path = str(paths["python_packages"])
+        env = self.secret_boundary.build_sandbox_env(
+            self.env_allowlist,
+            extra={
+                "PWD": str(self.execution_root),
+                "PICO_AGENT": "1",
+                "PICO_SHELL_DIALECT": shell_kind,
+                "PICO_RUNTIME_ROOT": str(runtime_root),
+                "TMP": str(paths["temp"]),
+                "TEMP": str(paths["temp"]),
+                "TMPDIR": str(paths["temp"]),
+                "PYTHONNOUSERSITE": "1",
+                "PYTHONUSERBASE": str(paths["python_user"]),
+                "PYTHONPATH": python_path,
+                "PIP_TARGET": python_path,
+                "PIP_CACHE_DIR": str(paths["pip_cache"]),
+                "UV_CACHE_DIR": str(paths["uv_cache"]),
+                "UV_TOOL_DIR": str(paths["uv_tools"]),
+                "UV_PYTHON_INSTALL_DIR": str(paths["uv_python"]),
+                "NPM_CONFIG_PREFIX": str(paths["npm_prefix"]),
+                "NPM_CONFIG_CACHE": str(paths["npm_cache"]),
+                "GRADLE_USER_HOME": str(paths["gradle_home"]),
+                "MAVEN_OPTS": f'-Dmaven.repo.local="{paths["maven_repo"]}"',
+            },
+        )
+        return self._prepend_runtime_path(env)
+
+    def _materialize_node_dependencies(self):
+        """Copy installed Node dependencies into the shadow on first use.
+
+        Dependency trees are execution state, not source delivery. TSW omits
+        them from its initial source view and commit manifest, but a build
+        still needs the already-installed tree. A private copy preserves that
+        capability without linking writes back into the user's workspace.
+        """
+        if self.source_root is None:
+            return
+        source = self.source_root / "node_modules"
+        destination = self.execution_root / "node_modules"
+        if destination.exists() or not source.is_dir():
+            return
+        try:
+            shutil.copytree(source, destination, symlinks=True)
+        except OSError as exc:
+            raise ExecutionRuntimeUnavailable(
+                f"dependency_materialization_failed: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _is_node_command(value):
+        executable = str(value or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+        return executable.casefold() in {
+            "node", "node.exe", "npm", "npm.cmd", "npx", "npx.cmd",
+            "pnpm", "pnpm.cmd", "yarn", "yarn.cmd", "vite", "vite.cmd",
+        }
 
     @staticmethod
     def _run_process(argv, cwd, env, timeout):
@@ -207,6 +320,17 @@ class WorkspaceCommandRunner:
             "stderr_truncated": stderr_capture.truncated,
         }
 
+    @staticmethod
+    def _windows_batch_argv(command_processor, executable, arguments):
+        values = [str(executable), *[str(item) for item in arguments]]
+        if any(re.search(r"[&|<>^%!()\r\n]", item) for item in values):
+            raise ValueError("batch verification argv contains shell metacharacters")
+        # Pass argument boundaries to CreateProcess instead of embedding one
+        # pre-quoted command string after /c. The latter is reparsed by cmd's
+        # special first/last-quote rules and breaks executables under paths
+        # such as C:\Program Files.
+        return [str(command_processor), "/d", "/s", "/c", "call", *values]
+
     def run(self, command, timeout=20):
         self.start()
         if self._profile is None:
@@ -214,19 +338,16 @@ class WorkspaceCommandRunner:
         prefix = list(self._profile.argv_prefix)
         shell_kind = self._profile.dialect
         command = str(command)
+        if re.search(
+            r"(?i)(?:^|[;&|]\s*)(?:node|npm|npx|pnpm|yarn|vite)(?:\.exe|\.cmd)?(?:\s|$)",
+            command,
+        ):
+            self._materialize_node_dependencies()
         if shell_kind == "bash":
             host_python = str(Path(sys.executable).resolve())
             command = command.replace(host_python, host_python.replace("\\", "/"))
             command = "set -o pipefail\n" + command
-        env = self.secret_boundary.build_sandbox_env(
-            self.env_allowlist,
-            extra={
-                "PWD": str(self.execution_root),
-                "PICO_AGENT": "1",
-                "PICO_SHELL_DIALECT": shell_kind,
-            },
-        )
-        env = self._prepend_runtime_path(env)
+        env = self._process_env(shell_kind)
         result = self._run_process(
             [*prefix, command], self.execution_root, env, timeout
         )
@@ -247,6 +368,8 @@ class WorkspaceCommandRunner:
         argv = [str(item) for item in argv]
         if not argv or not argv[0].strip():
             raise ValueError("argv must contain an executable")
+        if self._is_node_command(argv[0]):
+            self._materialize_node_dependencies()
         if argv[0].lower() in {"python", "python.exe", "python3", "python3.exe"}:
             argv[0] = str(Path(sys.executable).resolve())
         # An unqualified shell name refers to this workspace's selected shell,
@@ -257,25 +380,17 @@ class WorkspaceCommandRunner:
             and argv[0].casefold() in {self._profile.dialect, self._profile.dialect + ".exe"}
         ):
             argv[0] = self._profile.executable
-        env = self.secret_boundary.build_sandbox_env(
-            self.env_allowlist,
-            extra={
-                "PWD": str(self.execution_root),
-                "PICO_AGENT": "1",
-                "PICO_SHELL_DIALECT": "direct",
-            },
-        )
-        env = self._prepend_runtime_path(env)
+        env = self._process_env("direct")
         profile = {"dialect": "direct", "executable": argv[0]}
         process_argv = argv
         resolved_executable = shutil.which(argv[0], path=env.get("PATH"))
         if os.name == "nt" and resolved_executable and Path(resolved_executable).suffix.casefold() in {".cmd", ".bat"}:
-            if any(re.search(r"[&|<>^\r\n]", item) for item in argv):
-                raise ValueError("batch verification argv contains shell metacharacters")
             command_processor = env.get("COMSPEC") or shutil.which("cmd.exe")
             if not command_processor:
                 raise ExecutionRuntimeUnavailable("verification_runtime_unavailable: cmd.exe was not found")
-            process_argv = [command_processor, "/d", "/s", "/c", subprocess.list2cmdline([resolved_executable, *argv[1:]])]
+            process_argv = self._windows_batch_argv(
+                command_processor, resolved_executable, argv[1:]
+            )
             profile = {"dialect": "direct-batch", "executable": resolved_executable}
         try:
             result = self._run_process(

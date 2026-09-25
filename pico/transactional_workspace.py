@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .git_support import run_git
 from .path_support import native_path
 from .workspace import IGNORED_PATH_NAMES, remove_workspace_tree
 
@@ -102,9 +103,8 @@ def _git_view_paths(root):
 
 def _is_git_workspace(root):
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=root, capture_output=True, text=True, timeout=10, check=False,
+        result = run_git(
+            ["rev-parse", "--show-toplevel"], cwd=root, timeout=10, check=False
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -407,13 +407,8 @@ class TransactionalWorkspace:
             ["git", "commit", "-m", "Pico transaction baseline"],
         )
         for command in commands:
-            result = subprocess.run(
-                command,
-                cwd=self.execution_root,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
+            result = run_git(
+                command[1:], cwd=self.execution_root, timeout=120, check=False
             )
             if result.returncode != 0:
                 raise RuntimeError(f"git shadow initialization failed: {result.stderr.strip()}")

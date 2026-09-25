@@ -69,3 +69,35 @@ def test_shell_side_effect_on_protected_test_is_blocked_at_commit(tmp_path):
     assert "assert True" in (workspace / "test_solution.py").read_text(encoding="utf-8")
     assert agent.last_run_outcome.status == "failed"
     assert agent.current_task_state.stop_reason == "scope_constraint_violation"
+
+
+def test_apply_patch_rejects_entire_work_unit_when_one_path_is_protected(tmp_path):
+    agent, _ = build_agent(tmp_path, [], max_steps=2)
+    agent.begin_transaction()
+    agent.current_interaction = {
+        "mutation_allowed": True,
+        "protected_paths": ["test_*.py"],
+    }
+
+    result = agent.execute_tool(
+        "apply_patch",
+        {
+            "edits": [
+                {
+                    "path": "solution.py",
+                    "old_text": "value = 1",
+                    "new_text": "value = 2",
+                },
+                {
+                    "path": "test_solution.py",
+                    "old_text": "assert True",
+                    "new_text": "assert False",
+                },
+            ]
+        },
+    )
+
+    assert result.metadata["tool_error_code"] == "scope_constraint"
+    assert not result.metadata["executed"]
+    assert (agent.root / "solution.py").read_text(encoding="utf-8") == "value = 1\n"
+    assert "assert True" in (agent.root / "test_solution.py").read_text(encoding="utf-8")

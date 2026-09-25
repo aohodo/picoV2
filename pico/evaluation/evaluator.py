@@ -11,6 +11,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from ..features import memory as memorylib
+from ..git_support import run_git
 from ..providers.clients import FakeModelClient
 from ..run_store import RunStore
 from ..runtime import Pico, SessionStore
@@ -108,13 +109,8 @@ SCRIPTED_MODEL_OUTPUTS = {
 
 def _git_value(args, fallback="", cwd=None):
     try:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=cwd or Path.cwd(),
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=5,
+        result = run_git(
+            args, cwd=cwd or Path.cwd(), check=True, timeout=5
         )
         return result.stdout.strip() or fallback
     except (OSError, subprocess.SubprocessError):

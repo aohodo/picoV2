@@ -26,6 +26,7 @@ from .interaction_policy import (
     PreferenceError,
     WorkspacePreferenceStore,
     build_interaction_contract,
+    is_executable_test_artifact,
     path_matches_patterns,
 )
 from .memory_admission import extract_explicit_memory
@@ -224,6 +225,7 @@ class Pico:
                     transaction.execution_root,
                     self.secret_boundary,
                     env_allowlist=self.shell_env_allowlist,
+                    source_root=self.source_root,
                 )
                 self.transaction_context = TransactionContext(
                     transaction_id=transaction.transaction_id,
@@ -312,6 +314,13 @@ class Pico:
             contract["protected_paths"] = list(
                 requirements.get("protected_paths", ())
             )
+            for key in (
+                "referenced_paths",
+                "requested_existing_paths",
+                "requested_missing_paths",
+                "unresolved_path_mentions",
+            ):
+                contract[key] = list(requirements.get(key, ()))
         return contract
 
     def repository_evidence(self, user_message, limit=10):
@@ -424,6 +433,7 @@ class Pico:
             transaction.execution_root,
             self.secret_boundary,
             env_allowlist=self.shell_env_allowlist,
+            source_root=self.source_root,
         )
         self.transaction_context = TransactionContext(
             transaction_id=transaction.transaction_id,
@@ -546,6 +556,12 @@ class Pico:
             and not unresolved_failures
             and not unverified_changes
         )
+        changed_test_paths = {
+            item["path"] for item in changes or []
+            if is_executable_test_artifact(self.root, item["path"])
+        }
+        if requirements.get("test_artifact_required") and changes and not changed_test_paths:
+            return "required_test_artifact_missing"
         if unresolved_failures:
             return "verification_failed"
         if self.verification_stale or (validation_records and unverified_changes):
@@ -744,11 +760,15 @@ class Pico:
     def build_tools(self):
         tools = toolkit.build_tool_registry(self.tool_context())
         if "run_shell" in tools:
-            dialect = self.execution_profile_view().get("dialect", "unavailable")
+            profile = self.execution_profile_view()
+            dialect = profile.get("dialect", "unavailable")
+            host_os = profile.get("host_os", "unknown")
+            python_command = profile.get("python_command", "python")
             tools["run_shell"]["description"] = (
-                f"Run a non-inspection {dialect} command in the transaction workspace. "
+                f"Run a non-inspection {dialect} command on {host_os} in the transaction workspace. "
+                f"Use {python_command} for Python; do not assume python3 exists. "
                 "Use typed repository tools for listing, searching, and source reads; "
-                "use `python -m pytest` for Python validation."
+                f"use `{python_command} -m pytest` for Python validation."
             )
         if "run_verification" in tools:
             tools["run_verification"]["description"] = (
@@ -1036,21 +1056,25 @@ class Pico:
         """
         if not self.feature_enabled("memory"):
             return
-        path = args.get("path")
-        if not path:
+        paths = toolkit.mutation_paths(name, args)
+        if name == "read_file" and args.get("path"):
+            paths = [args["path"]]
+        if not paths:
             return
-
-        canonical_path = self.memory.canonical_path(path)
         # 不是所有工具结果都进入工作记忆。
         # 读文件会生成摘要；写文件/patch 会让旧摘要失效，因为它们可能过期了。
-        if name in {"read_file", "write_file", "patch_file"}:
-            self.memory.remember_file(canonical_path)
+        canonical_paths = [self.memory.canonical_path(path) for path in paths]
+        if name in {"read_file", "write_file", "patch_file", "apply_patch"}:
+            for canonical_path in canonical_paths:
+                self.memory.remember_file(canonical_path)
         if name == "read_file":
+            canonical_path = canonical_paths[0]
             summary = memorylib.summarize_read_result(result)
             self.memory.set_file_summary(canonical_path, summary)
             self.memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
-        elif name in {"write_file", "patch_file"}:
-            self.memory.invalidate_file_summary(canonical_path)
+        elif name in {"write_file", "patch_file", "apply_patch"}:
+            for canonical_path in canonical_paths:
+                self.memory.invalidate_file_summary(canonical_path)
 
     def note_tool(self, name, args, result):
         self.update_memory_after_tool(name, args, result)
@@ -1293,6 +1317,15 @@ class Pico:
             repository_inspector=lambda query, limit: self.inspect_repository(
                 query, limit, include_semantic=True
             ),
+            pending_test_paths_provider=lambda: [
+                change["path"]
+                for change in (
+                    self.transaction_context.workspace.diff()
+                    if self.transaction_context is not None
+                    else []
+                )
+                if is_executable_test_artifact(self.root, change["path"])
+            ],
             command_runner=(
                 self.transaction_context.execution_lease.runner
                 if self.transaction_context is not None
@@ -1365,6 +1398,9 @@ class Pico:
 
     def tool_patch_file(self, args):
         return toolkit.tool_patch_file(self.tool_context(), args)
+
+    def tool_apply_patch(self, args):
+        return toolkit.tool_apply_patch(self.tool_context(), args)
 
     def tool_delegate(self, args):
         return toolkit.tool_delegate(self.tool_context(), args)

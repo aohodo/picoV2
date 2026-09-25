@@ -210,6 +210,7 @@ def test_successful_verification_uses_existing_final_turn_for_delivery_review(tm
     assert agent.ask("Update app.py VALUE to 2 and run tests") == "Implemented and reviewed."
     final_input = json.dumps(model.requests[2]["input_items"])
     assert "delivery review is active" in final_input
+    assert "not fetching the same evidence again" in final_input
     assert "Passing authored tests are evidence" in final_input
     assert agent.current_task_state.validation_status == "passed"
     assert agent.current_task_state.transaction_state == "COMMITTED"

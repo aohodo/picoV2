@@ -17,6 +17,7 @@ from .read_observation import (
     retain_read_evidence,
     visible_read_coverage,
 )
+from .working_set import project_current_working_set
 
 DEFAULT_TOTAL_BUDGET = 12000
 DEFAULT_SECTION_BUDGETS = {
@@ -167,6 +168,31 @@ class ContextManager:
                 getattr(self.agent, "session", {}).get("execution_ledger", {})
             ).view()}
         )
+        work_focus = runtime_state.get("work_focus", {})
+        active_context = []
+        if work_focus:
+            active_context.append(
+                "Current work focus (runtime facts and advisory priority):\n"
+                + json.dumps(work_focus, ensure_ascii=False, sort_keys=True)
+                + "\nDo not reconstruct completed discovery from old history. A new read should "
+                "answer a concrete item still open in this view."
+            )
+        path_revision = (
+            controller.ledger.path_revision
+            if controller is not None
+            else lambda _path: 0
+        )
+        working_set = project_current_working_set(
+            getattr(self.agent, "initial_working_set", ""),
+            getattr(self.agent, "initial_working_set_coverage", ()),
+            path_revision,
+        )
+        if working_set:
+            active_context.append("Initial source working set:\n" + working_set)
+        if active_context:
+            section_texts["memory"] = "\n\n".join(
+                [*active_context, section_texts["memory"]]
+            )
         ledger = runtime_state.get("ledger", {})
         failures = ledger.get("unresolved_failures", [])
         selected_notes = []
@@ -564,6 +590,7 @@ class ContextManager:
                 "read_files",
                 "write_file",
                 "patch_file",
+                "apply_patch",
             }:
                 content = compact_read_observation(content, max(20, line_limit))
             else:
