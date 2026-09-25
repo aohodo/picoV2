@@ -26,6 +26,7 @@ from .interaction_policy import (
     PreferenceError,
     WorkspacePreferenceStore,
     build_interaction_contract,
+    is_executable_test_artifact,
     path_matches_patterns,
 )
 from .memory_admission import extract_explicit_memory
@@ -224,6 +225,7 @@ class Pico:
                     transaction.execution_root,
                     self.secret_boundary,
                     env_allowlist=self.shell_env_allowlist,
+                    source_root=self.source_root,
                 )
                 self.transaction_context = TransactionContext(
                     transaction_id=transaction.transaction_id,
@@ -424,6 +426,7 @@ class Pico:
             transaction.execution_root,
             self.secret_boundary,
             env_allowlist=self.shell_env_allowlist,
+            source_root=self.source_root,
         )
         self.transaction_context = TransactionContext(
             transaction_id=transaction.transaction_id,
@@ -546,6 +549,12 @@ class Pico:
             and not unresolved_failures
             and not unverified_changes
         )
+        changed_test_paths = {
+            item["path"] for item in changes or []
+            if is_executable_test_artifact(self.root, item["path"])
+        }
+        if requirements.get("test_artifact_required") and changes and not changed_test_paths:
+            return "required_test_artifact_missing"
         if unresolved_failures:
             return "verification_failed"
         if self.verification_stale or (validation_records and unverified_changes):
@@ -1297,6 +1306,15 @@ class Pico:
             repository_inspector=lambda query, limit: self.inspect_repository(
                 query, limit, include_semantic=True
             ),
+            pending_test_paths_provider=lambda: [
+                change["path"]
+                for change in (
+                    self.transaction_context.workspace.diff()
+                    if self.transaction_context is not None
+                    else []
+                )
+                if is_executable_test_artifact(self.root, change["path"])
+            ],
             command_runner=(
                 self.transaction_context.execution_lease.runner
                 if self.transaction_context is not None

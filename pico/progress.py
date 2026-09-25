@@ -545,7 +545,7 @@ class ProgressController:
                 != "diagnostic"
             )
         read_evidence = None
-        if executed and status == "ok" and "read_coverage" in metadata:
+        if executed and "read_coverage" in metadata:
             read_evidence = visible_read_coverage(content, metadata["read_coverage"])
 
         if changed:
@@ -671,6 +671,10 @@ class ProgressController:
                         )
                     ),
                 }
+                if metadata.get("verification_evidence"):
+                    record["verification_evidence"] = dict(
+                        metadata["verification_evidence"]
+                    )
                 if validation:
                     # Display text is lossy (one "a b" argument is not two
                     # arguments). Preserve the executed argument boundaries

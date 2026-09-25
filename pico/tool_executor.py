@@ -319,6 +319,15 @@ class ToolExecutor:
                 elif exit_code != 0:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
+            verification_evidence = getattr(raw_result, "verification_evidence", None)
+            if (
+                name == "run_verification"
+                and verification_evidence
+                and verification_evidence.get("missing_test_paths")
+                and tool_status == "ok"
+            ):
+                tool_status = "error"
+                tool_error_code = "verification_incomplete"
             agent.update_memory_after_tool(name, args, content)
             authoritative_validation = bool(
                 name == "run_verification"
@@ -355,6 +364,8 @@ class ToolExecutor:
                     }
                     for item in raw_result.coverage
                 ]
+            if verification_evidence is not None:
+                metadata["verification_evidence"] = verification_evidence
             agent.record_process_note_for_tool(name, metadata)
             if metadata["validation"]:
                 agent.last_verification_succeeded = (
@@ -396,6 +407,16 @@ class ToolExecutor:
                     else ""
                 ),
             )
+            if getattr(exc, "coverage", None):
+                metadata["read_coverage"] = [
+                    {
+                        **item,
+                        "freshness": memorylib.file_freshness(
+                            item.get("path", ""), agent.root
+                        ),
+                    }
+                    for item in exc.coverage
+                ]
             agent.record_process_note_for_tool(name, metadata)
             if metadata["validation"]:
                 agent.last_verification_succeeded = False

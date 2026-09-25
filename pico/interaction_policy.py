@@ -1,5 +1,6 @@
 """Structured human-agent interaction policy and workspace preferences."""
 
+import ast
 import fnmatch
 import json
 import os
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from .file_lock import FileLock
+from .text_document import TextDecodingError, read_text_document
 
 PACKAGE_LAYOUTS = frozenset({"follow_repository", "layer_first", "feature_first"})
 PREFERENCE_SCHEMA_VERSION = 1
@@ -143,6 +145,33 @@ def is_test_artifact_path(path):
         or name.startswith("test_")
         or name.endswith(("_test.py", "test.java", "tests.java", "spec.js", "spec.ts"))
     )
+
+
+def is_executable_test_artifact(root, path):
+    """Recognize conventional tests or source that contains executable test structure."""
+    if is_test_artifact_path(path):
+        return True
+    candidate = Path(root) / str(path)
+    if candidate.suffix.casefold() not in {".py", ".java", ".js", ".jsx", ".ts", ".tsx"}:
+        return False
+    try:
+        text = read_text_document(candidate).text
+    except (OSError, TextDecodingError):
+        return False
+    if candidate.suffix.casefold() == ".py":
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return False
+        return any(
+            isinstance(node, ast.Assert)
+            or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+            for node in ast.walk(tree)
+        )
+    if candidate.suffix.casefold() == ".java":
+        return bool(re.search(r"(?m)^\s*@(?:org\.junit\.)?(?:Test|ParameterizedTest)\b", text))
+    return bool(re.search(r"(?m)\b(?:describe|test|it)\s*\(", text))
 
 
 class WorkspacePreferenceStore:

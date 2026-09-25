@@ -4,6 +4,7 @@
 如何做参数校验，以及最终如何执行，都是在这里定义的。
 """
 
+import difflib
 import re
 from functools import partial
 
@@ -13,6 +14,7 @@ from .path_support import logical_path, native_path
 from .progress import is_repository_read_argv, is_repository_read_command
 from .read_observation import DEFAULT_SOURCE_WINDOW_LINES, render_reads
 from .text_document import TextDecodingError, read_text_document, write_text_document
+from .verification_evidence import VerificationObservation, VerificationProbe
 from .workspace import IGNORED_PATH_NAMES
 
 BASE_TOOL_SPECS = {
@@ -87,6 +89,16 @@ BASE_TOOL_SPECS = {
         ),
     },
 }
+
+
+class PatchMatchError(ValueError):
+    """An exact patch miss carrying fresh source evidence for the repair turn."""
+
+    code = "patch_match_failed"
+
+    def __init__(self, message, observation):
+        super().__init__(f"{message}\n{observation}")
+        self.coverage = observation.coverage
 
 DELEGATE_TOOL_SPEC = {
     "schema": {"task": "str", "max_steps": "int=3"},
@@ -277,10 +289,6 @@ def validate_tool(context, name, args):
             raise ValueError("old_text must not be empty")
         if "new_text" not in args:
             raise ValueError("missing new_text")
-        text = read_text_document(path).text
-        count = text.count(old_text)
-        if count != 1:
-            raise ValueError(f"old_text must occur exactly once, found {count}")
         return
 
     if name == "delegate":
@@ -391,10 +399,18 @@ def tool_run_verification(context, args):
     timeout = int(args.get("timeout", 120))
     if context.command_runner is None:
         raise RuntimeError("shell_runtime_unavailable: no execution runtime is attached to this transaction")
-    return format_shell_result(
-        context.command_runner.run_argv(argv, timeout=timeout),
-        char_budget=context.observation_char_budget,
-    )
+    probe = VerificationProbe(context.root, argv, context.pending_test_paths())
+    result = context.command_runner.run_argv(probe.process_argv(), timeout=timeout)
+    evidence = probe.finish()
+    output = format_shell_result(result, char_budget=context.observation_char_budget)
+    if result["exit_code"] == 0 and evidence["missing_test_paths"]:
+        output += (
+            "\nverification_incomplete: the process succeeded, but no execution evidence "
+            "covered these changed test artifacts: "
+            + ", ".join(evidence["missing_test_paths"])
+            + ". Run those tests explicitly or use a runner that emits test reports."
+        )
+    return VerificationObservation(output, evidence)
 
 
 def tool_write_file(context, args):
@@ -426,7 +442,43 @@ def tool_patch_file(context, args):
     text = document.text
     count = text.count(old_text)
     if count != 1:
-        raise ValueError(f"old_text must occur exactly once, found {count}")
+        lines = text.splitlines()
+        relative = path.relative_to(context.root).as_posix()
+        if count:
+            occurrences = []
+            offset = 0
+            while True:
+                offset = text.find(old_text, offset)
+                if offset < 0:
+                    break
+                occurrences.append(text.count("\n", 0, offset) + 1)
+                offset += max(1, len(old_text))
+            center = occurrences[0]
+            detail = f"old_text matched {count} times at lines {occurrences[:8]}"
+        else:
+            anchors = [line.strip() for line in old_text.splitlines() if line.strip()]
+            anchor = max(anchors, key=len, default="")
+            center = 1
+            if anchor and lines:
+                center = max(
+                    range(1, len(lines) + 1),
+                    key=lambda number: difflib.SequenceMatcher(
+                        None, anchor, lines[number - 1].strip()
+                    ).ratio(),
+                )
+            detail = "old_text matched 0 times"
+        radius = max(1, context.source_window_lines // 2)
+        start = max(1, center - radius)
+        end = min(len(lines), start + context.source_window_lines - 1)
+        observation = render_reads(
+            [(relative, document.encoding, lines, start, end)],
+            context.observation_char_budget,
+        )
+        raise PatchMatchError(
+            f"{detail}. Construct one new exact old_text from the current source below; "
+            "do not reread solely to recover this patch.",
+            observation,
+        )
     write_text_document(path, text.replace(old_text, str(args["new_text"]), 1), document)
     relative = path.relative_to(context.root).as_posix()
     return render_mutation_observation(

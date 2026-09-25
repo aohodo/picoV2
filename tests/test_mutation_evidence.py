@@ -168,6 +168,37 @@ def test_patch_receipt_returns_complete_current_file_when_it_fits(tmp_path):
     assert (evidence[0]["start"], evidence[0]["end"]) == (1, 3)
 
 
+def test_failed_patch_returns_fresh_candidate_source_without_a_reread(tmp_path):
+    agent = make_agent(tmp_path)
+
+    result = agent.execute_tool(
+        "patch_file",
+        {"path": "app.py", "old_text": "VALUE = 0", "new_text": "VALUE = 2"},
+    )
+
+    assert result.metadata["tool_error_code"] == "patch_match_failed"
+    assert result.metadata["tool_status"] == "error"
+    assert "old_text matched 0 times" in result.content
+    assert "VALUE = 1" in result.content
+    assert result.metadata["read_evidence"][0]["path"] == "app.py"
+
+
+def test_ambiguous_patch_reports_occurrence_lines_and_current_source(tmp_path):
+    agent = make_agent(tmp_path)
+    agent.execute_tool(
+        "write_file", {"path": "app.py", "content": "VALUE = 1\nMID = 2\nVALUE = 1\n"}
+    )
+
+    result = agent.execute_tool(
+        "patch_file",
+        {"path": "app.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+    )
+
+    assert result.metadata["tool_error_code"] == "patch_match_failed"
+    assert "matched 2 times at lines [1, 3]" in result.content
+    assert "MID = 2" in result.content
+
+
 def test_nearby_mutation_windows_are_merged_without_duplicate_source_lines():
     before = ["shared header", "old a", "shared middle", "old b", "shared tail"]
     after = ["shared header", "new a", "shared middle", "new b", "shared tail"]

@@ -8,6 +8,8 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .git_support import run_git
+
 
 def default_state_root(env=None):
     env = os.environ if env is None else env
@@ -25,9 +27,7 @@ def default_state_root(env=None):
 
 def _git_value(source_root, *args):
     try:
-        result = subprocess.run(
-            ["git", *args], cwd=source_root, capture_output=True, text=True, timeout=5, check=True
-        )
+        result = run_git(args, cwd=source_root, timeout=5, check=True)
         return result.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""

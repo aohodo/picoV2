@@ -14,6 +14,7 @@ import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .git_support import run_git
 from .path_support import native_path
 from .text_document import TextDecodingError, read_text_document
 
@@ -79,14 +80,7 @@ class WorkspaceContext:
 
         def git(args, fallback=""):
             try:
-                result = subprocess.run(
-                    ["git", *args],
-                    cwd=cwd,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    timeout=5,
-                )
+                result = run_git(args, cwd=cwd, check=True, timeout=5)
                 return result.stdout.strip() or fallback
             except (OSError, subprocess.SubprocessError):
                 return fallback
