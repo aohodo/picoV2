@@ -9,6 +9,15 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from .context_projection import _head_tail, _project_runtime_state
+from .features import memory as memorylib
+from .progress import ExecutionLedger
+from .read_observation import (
+    compact_read_observation,
+    retain_read_evidence,
+    visible_read_coverage,
+)
+
 DEFAULT_TOTAL_BUDGET = 12000
 DEFAULT_SECTION_BUDGETS = {
     "prefix": 3600,
@@ -95,6 +104,7 @@ class ContextManager:
         的最后一道组装工序。`WorkspaceContext` 提供稳定前缀，`LayeredMemory`
         提供工作记忆，这个函数则把它们和当前请求合成一份可控大小的 prompt。
         """
+        self.agent.invalidate_stale_memory()
         user_message = str(user_message)
         self.section_floors = self._compute_section_floors()
         memory_enabled = True
@@ -104,21 +114,93 @@ class ContextManager:
             memory_enabled = self.agent.feature_enabled("memory")
             relevant_memory_enabled = self.agent.feature_enabled("relevant_memory")
             context_reduction_enabled = self.agent.feature_enabled("context_reduction")
+        interaction = dict(getattr(self.agent, "current_interaction", {}) or {})
+        request_text = f"Current user request:\n{user_message}"
+        if interaction:
+            compact_interaction = {
+                key: interaction[key]
+                for key in (
+                    "mode",
+                    "mutation_allowed",
+                    "relative_adjustment",
+                    "override_scope",
+                    "package_layout",
+                )
+                if key in interaction
+            }
+            request_text = (
+                "Interaction contract:\n"
+                + json.dumps(compact_interaction, ensure_ascii=False, sort_keys=True)
+                + "\nGuidance: latest request outranks memory; ask if a durable conflict's scope is unclear. "
+                "Follow the selected layout and repository conventions; apply relative requests by one "
+                "reasonable step; keep scope focused, coupling low, cohesion high, and abstractions named."
+                + "\n\n"
+                + request_text
+            )
+            repository_evidence = str(interaction.get("repository_evidence", "")).strip()
+            if repository_evidence:
+                request_text = (
+                    "Repository navigation evidence (generated from source symbols and imports):\n"
+                    + repository_evidence
+                    + "\nUse this evidence to choose focused reads; refresh with inspect_repository only if needed.\n\n"
+                    + request_text
+                )
         section_texts = {
             "prefix": str(getattr(self.agent, "prefix", "")),
             "memory": "Memory:\n- disabled" if not memory_enabled else str(self.agent.memory_text()),
             "history": "",
-            CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
+            CURRENT_REQUEST_SECTION: request_text,
         }
         checkpoint_text = ""
         if hasattr(self.agent, "render_checkpoint_text"):
             checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
         if checkpoint_text:
-            section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
+            # Checkpoint state is live task evidence, not stable prefix material.
+            # Keep it beside the untruncated current request so tool growth cannot
+            # silently push resume state outside the prefix budget.
+            section_texts[CURRENT_REQUEST_SECTION] = checkpoint_text + "\n\n" + request_text
+        controller = getattr(self.agent, "progress_controller", None)
+        runtime_state = (
+            controller.runtime_state_view()
+            if controller is not None
+            else {"ledger": ExecutionLedger.from_dict(
+                getattr(self.agent, "session", {}).get("execution_ledger", {})
+            ).view()}
+        )
+        ledger = runtime_state.get("ledger", {})
+        failures = ledger.get("unresolved_failures", [])
         selected_notes = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
             selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
-
+        if failures or ledger.get("unresolved_failure_count", 0):
+            header = "Runtime verification feedback:\n"
+            reserved = self._assemble_prompt(self._render_sections(
+                section_texts, self.section_floors, selected_notes=selected_notes,
+            ))
+            feedback_budget = max(1, self.total_budget - len(reserved) - len(header) - 2)
+            # Project actionable failures, not a duplicate navigation/metrics
+            # ledger, into the space left by the request and section floors.
+            runtime_json, _ = _project_runtime_state({"ledger": {
+                "unresolved_failures": failures,
+                "unresolved_failure_count": ledger.get("unresolved_failure_count", len(failures)),
+            }}, char_budget=feedback_budget)
+            if len(runtime_json) > feedback_budget:
+                # When even the structured summary cannot fit, retain the
+                # newest diagnostic explicitly as an excerpt, not broken JSON.
+                latest = failures[-1] if failures else {}
+                runtime_json = _head_tail(
+                    "Unresolved verification failures; latest diagnostic excerpt "
+                    "(full records remain in the session):\n"
+                    + latest.get("identity_warning", "") + "\n"
+                    + latest.get("output", "Original failure details are unavailable."),
+                    feedback_budget,
+                )
+            feedback = header + runtime_json
+            # Active failures are current evidence even after their historical
+            # tool outputs disappear. Keep the latest user request last.
+            section_texts[CURRENT_REQUEST_SECTION] = (
+                feedback + "\n\n" + section_texts[CURRENT_REQUEST_SECTION]
+            )
         if not context_reduction_enabled:
             rendered = self._render_sections_without_reduction(section_texts, selected_notes=selected_notes)
             prompt = self._assemble_prompt(rendered)
@@ -294,7 +376,7 @@ class ContextManager:
         return max(1, usable // note_count)
 
     def _render_history_section(self, budget):
-        history = list(getattr(self.agent, "session", {}).get("history", []))
+        history = self._current_history()
         raw = self._raw_history_text(history)
         if not history:
             rendered = "Transcript:\n- empty"
@@ -356,6 +438,46 @@ class ContextManager:
                 **history_details,
             },
         )
+
+    def _current_history(self):
+        history = list(getattr(self.agent, "session", {}).get("history", []))
+        current = []
+        for item in history:
+            if item.get("role") != "tool":
+                current.append(item)
+                continue
+            evidence = item.get("read_evidence")
+            if not evidence:
+                # A failed read is feedback, not stale source. Legacy mutation
+                # acknowledgements have no source evidence and remain useful
+                # as action history until naturally summarized.
+                if item.get("name") in {"read_file", "read_files"} and not str(
+                    item.get("content", "")
+                ).startswith("error:"):
+                    continue
+                current.append(item)
+                continue
+            fresh = [
+                record for record in evidence
+                if record.get("freshness") is not None
+                and record.get("freshness")
+                == memorylib.file_freshness(
+                    record.get("path", ""), self.agent.root
+                )
+            ]
+            if not fresh:
+                continue
+            if len(fresh) == len(evidence):
+                current.append(item)
+                continue
+            filtered = dict(item)
+            filtered["content"] = retain_read_evidence(item.get("content", ""), fresh)
+            filtered["read_evidence"] = visible_read_coverage(
+                filtered["content"], fresh
+            )
+            if filtered["read_evidence"]:
+                current.append(filtered)
+        return current
 
     def _compressed_history_entries(self, history, recent_start):
         entries = []
@@ -436,7 +558,16 @@ class ContextManager:
     def _render_history_item(self, item, line_limit):
         if item["role"] == "tool":
             prefix = f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}"
-            content = _tail_clip(item["content"], max(20, line_limit))
+            content = str(item["content"])
+            if item.get("name") in {
+                "read_file",
+                "read_files",
+                "write_file",
+                "patch_file",
+            }:
+                content = compact_read_observation(content, max(20, line_limit))
+            else:
+                content = _tail_clip(content, max(20, line_limit))
             return [prefix, content]
         return [f"[{item['role']}] {_tail_clip(item['content'], line_limit)}"]
 
@@ -498,7 +629,8 @@ class ContextManager:
                 "summarized_tool_count": int(rendered["history"].details.get("summarized_tool_count", 0)),
             },
             "current_request": {
-                "text": user_message,
+                "text": _tail_clip(user_message, 1000),
+                "text_truncated": len(user_message) > 1000,
                 "raw_chars": len(user_message),
                 "rendered_chars": len(user_message),
                 "section_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),

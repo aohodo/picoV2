@@ -18,6 +18,6 @@ Benchmark runs should preserve reproducibility metadata, task rows, summary coun
 
 ## Sample run artifact list
 
-- `.pico/runs/<run_id>/task_state.json`
-- `.pico/runs/<run_id>/trace.jsonl`
-- `.pico/runs/<run_id>/report.json`
+- `<state-root>/workspaces/<workspace-id>/runs/<run_id>/task_state.json`
+- `<state-root>/workspaces/<workspace-id>/runs/<run_id>/trace.jsonl`
+- `<state-root>/workspaces/<workspace-id>/runs/<run_id>/report.json`

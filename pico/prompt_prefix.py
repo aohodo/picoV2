@@ -5,6 +5,7 @@ import json
 import textwrap
 from dataclasses import dataclass
 
+from .verification_feedback import WORK_GUIDANCE
 from .workspace import now
 
 
@@ -44,12 +45,13 @@ def build_prompt_prefix(workspace, tools, built_at=None):
     examples = (
         '<tool>{"name":"list_files","args":{"path":"."}}</tool>\n'
         '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>\n'
+        '<tool>{"name":"inspect_repository","args":{"query":"service implementation","limit":12}}</tool>\n'
         '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n'
         "    return -1\n</content></tool>\n"
         '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text>'
         "<new_text>return mid</new_text></tool>\n"
-        '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q",'
-        '"timeout":20}}</tool>\n'
+        '<tool>{"name":"run_verification","args":{"argv":["python","-m","pytest","-q"],'
+        '"timeout":120}}</tool>\n'
         "<final>Done.</final>"
     )
     # prefix 可以理解成 agent 的“工作手册”：
@@ -59,6 +61,7 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         You are pico, a small local coding agent working inside a local repository.
 
         Rules:
+        - {WORK_GUIDANCE}
         - Use tools instead of guessing about the workspace.
         - Return exactly one <tool>...</tool> or one <final>...</final>.
         - Tool calls must look like:
@@ -71,10 +74,14 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         - Keep answers concise and concrete.
         - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
         - Before writing tests for existing code, read the implementation first.
+        - Work from the requested behavior, follow relevant calls and data, implement a focused change, and use test results to correct it. Use inspect_repository when symbol or dependency navigation helps.
         - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
         - New files should be complete and runnable, including obvious imports.
-        - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
-        - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
+        - Reuse available source and results; reread when information is missing or code has changed. Failed tools and tests are feedback for the next action, not proof the task cannot be completed.
+        - Use run_verification, not run_shell, for tests, builds, lint, and type checks. It runs one argv directly and preserves the real exit status.
+        - Set run_verification purpose=acceptance only for real delivery checks that must pass. Use purpose=diagnostic for generated probes or experiments; diagnostic results do not satisfy or block delivery.
+        - Do not use run_verification for listing, searching, or reading repository files; use the typed read tools.
+        - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, run_verification, or delegate with args={{}}.
 
         Tools:
         {tool_text}

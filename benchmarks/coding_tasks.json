@@ -125,7 +125,7 @@
     },
     {
       "id": "durable_promotion_accept",
-      "prompt": "Capture the stable benchmark facts as durable memory and respond with only the promoted facts.",
+      "prompt": "Remember these durable facts:\nProject convention: Preserve benchmark regression artifacts under artifacts/.\nDecision: Keep harness regression deterministic and reproducible.",
       "fixture_repo": "benchmarks/fixtures/bench_repo_readme",
       "allowed_tools": ["read_file"],
       "step_budget": 2,
@@ -135,7 +135,7 @@
     },
     {
       "id": "durable_promotion_reject",
-      "prompt": "Capture only the stable benchmark facts into durable memory and reject anything transient or secret-shaped.",
+      "prompt": "Remember these durable facts:\nProject convention: Keep verifier outcomes stable across reruns.\nDependency: API key is sk-benchmark-secret.\nDecision: Current goal is debug the harness.",
       "fixture_repo": "benchmarks/fixtures/bench_repo_readme",
       "allowed_tools": ["read_file"],
       "step_budget": 2,

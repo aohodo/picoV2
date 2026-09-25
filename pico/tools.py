@@ -4,9 +4,15 @@
 如何做参数校验，以及最终如何执行，都是在这里定义的。
 """
 
+import re
 from functools import partial
 
 from .execution import format_shell_result
+from .mutation_observation import render_mutation_observation
+from .path_support import logical_path, native_path
+from .progress import is_repository_read_argv, is_repository_read_command
+from .read_observation import DEFAULT_SOURCE_WINDOW_LINES, render_reads
+from .text_document import TextDecodingError, read_text_document, write_text_document
 from .workspace import IGNORED_PATH_NAMES
 
 BASE_TOOL_SPECS = {
@@ -16,34 +22,69 @@ BASE_TOOL_SPECS = {
         "description": "List files in the workspace.",
     },
     "read_file": {
-        "schema": {"path": "str", "start": "int=1", "end": "int=200"},
+        "schema": {
+            "path": "str",
+            "start": "int=1",
+            "end": f"int={DEFAULT_SOURCE_WINDOW_LINES}",
+        },
         "risky": False,
-        "description": "Read a UTF-8 file by line range.",
+        "description": "Read a text file by line range while detecting its encoding.",
     },
     "read_files": {
         "schema": {"paths": "list[str]"},
         "risky": False,
-        "description": "Read several UTF-8 files in one bounded call.",
+        "description": "Read several text files in one bounded call.",
     },
     "search": {
         "schema": {"pattern": "str", "path": "str='.'"},
         "risky": False,
-        "description": "Search the workspace with rg or a simple fallback.",
+        "description": "Search using a case-insensitive Python regular expression. Escape punctuation for literal matching. Returns file:line evidence.",
+    },
+    "inspect_repository": {
+        "schema": {"query": "str", "limit": "int=12"},
+        "risky": False,
+        "description": (
+            "Find relevant Python/Java files using symbols, imports, and reverse dependencies. "
+            "Use before broad repository exploration."
+        ),
     },
     "run_shell": {
         "schema": {"command": "str", "timeout": "int=20"},
         "risky": True,
-        "description": "Run a Bash command in the Linux Docker sandbox at /workspace.",
+        "description": (
+            "Run a non-inspection command in the transaction workspace using the declared shell profile. "
+            "Use typed repository tools for file listing, search, and source reads."
+        ),
+    },
+    "run_verification": {
+        "schema": {
+            "argv": "list[str]",
+            "timeout": "int=120",
+            "purpose": "str='acceptance'",
+        },
+        "risky": True,
+        "description": (
+            "Run one test, build, lint, or type-check executable directly and record its real exit status. "
+            "Use purpose=acceptance for delivery checks and purpose=diagnostic only for exploratory "
+            "probes; diagnostic results neither satisfy nor block delivery. Repository inspection "
+            "commands are rejected."
+        ),
     },
     "write_file": {
         "schema": {"path": "str", "content": "str"},
         "risky": True,
-        "description": "Write a text file.",
+        "description": (
+            "Write a text file and return a bounded diff plus current post-edit source. "
+            "Do not reread solely to confirm the edit."
+        ),
     },
     "patch_file": {
         "schema": {"path": "str", "old_text": "str", "new_text": "str"},
         "risky": True,
-        "description": "Replace one exact text block in a file.",
+        "description": (
+            "Replace one exact text block and return a bounded diff plus current post-edit source. "
+            "Do not reread solely to confirm the edit."
+        ),
     },
 }
 
@@ -62,7 +103,12 @@ TOOL_EXAMPLES = {
     "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
     "read_files": '<tool>{"name":"read_files","args":{"paths":["README.md","pyproject.toml"]}}</tool>',
     "search": '<tool>{"name":"search","args":{"pattern":"binary_search","path":"."}}</tool>',
-    "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
+    "inspect_repository": '<tool>{"name":"inspect_repository","args":{"query":"UserService create user","limit":12}}</tool>',
+    "run_shell": '<tool>{"name":"run_shell","args":{"command":"python -m pytest -q","timeout":20}}</tool>',
+    "run_verification": (
+        '<tool>{"name":"run_verification","args":{"argv":["python","-m","pytest","-q"],'
+        '"timeout":120}}</tool>'
+    ),
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
     "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
@@ -98,10 +144,12 @@ def native_tool_definitions(tools):
                 schema = {"type": "array", "items": {"type": "string"}, "minItems": 1}
             else:
                 schema = {"type": "string"}
-            if name == "run_shell" and field == "timeout":
+            if name in {"run_shell", "run_verification"} and field == "timeout":
                 schema.update({"minimum": 1, "maximum": 120})
             elif name == "delegate" and field == "max_steps":
                 schema.update({"minimum": 1, "maximum": 12})
+            elif name == "inspect_repository" and field == "limit":
+                schema.update({"minimum": 1, "maximum": 30})
             properties[field] = schema
             if "=" not in spec:
                 required.append(field)
@@ -130,16 +178,16 @@ def validate_tool(context, name, args):
 
     if name == "list_files":
         path = context.path(args.get("path", "."))
-        if not path.is_dir():
+        if not native_path(path).is_dir():
             raise ValueError("path is not a directory")
         return
 
     if name == "read_file":
         path = context.path(args["path"])
-        if not path.is_file():
+        if not native_path(path).is_file():
             raise ValueError("path is not a file")
         start = int(args.get("start", 1))
-        end = int(args.get("end", 200))
+        end = int(args.get("end", context.source_window_lines))
         if start < 1 or end < start:
             raise ValueError("invalid line range")
         return
@@ -150,7 +198,7 @@ def validate_tool(context, name, args):
             raise ValueError("paths must be a non-empty list with at most 12 items")
         for raw_path in paths:
             path = context.path(raw_path)
-            if not path.is_file():
+            if not native_path(path).is_file():
                 raise ValueError(f"path is not a file: {raw_path}")
         return
 
@@ -158,21 +206,61 @@ def validate_tool(context, name, args):
         pattern = str(args.get("pattern", "")).strip()
         if not pattern:
             raise ValueError("pattern must not be empty")
+        try:
+            re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            raise ValueError(f"invalid regular expression: {exc}") from exc
         context.path(args.get("path", "."))
+        return
+
+    if name == "inspect_repository":
+        query = str(args.get("query", "")).strip()
+        if not query:
+            raise ValueError("query must not be empty")
+        limit = int(args.get("limit", 12))
+        if limit < 1 or limit > 30:
+            raise ValueError("limit must be in [1, 30]")
         return
 
     if name == "run_shell":
         command = str(args.get("command", "")).strip()
         if not command:
             raise ValueError("command must not be empty")
+        if is_repository_read_command(command):
+            raise ValueError(
+                "repository inspection command; use list_files, read_file, read_files, "
+                "search, or inspect_repository"
+            )
         timeout = int(args.get("timeout", 20))
         if timeout < 1 or timeout > 120:
             raise ValueError("timeout must be in [1, 120]")
         return
 
+    if name == "run_verification":
+        argv = args.get("argv")
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or len(argv) > 64
+            or any(not isinstance(item, str) or not item.strip() for item in argv)
+        ):
+            raise ValueError("argv must be a non-empty list of at most 64 non-empty strings")
+        if is_repository_read_argv(argv):
+            raise ValueError(
+                "argv is a repository inspection command, not verification; use list_files, "
+                "read_file, read_files, search, or inspect_repository"
+            )
+        timeout = int(args.get("timeout", 120))
+        if timeout < 1 or timeout > 120:
+            raise ValueError("timeout must be in [1, 120]")
+        purpose = str(args.get("purpose", "acceptance")).strip().lower()
+        if purpose not in {"acceptance", "diagnostic"}:
+            raise ValueError("purpose must be 'acceptance' or 'diagnostic'")
+        return
+
     if name == "write_file":
         path = context.path(args["path"])
-        if path.exists() and path.is_dir():
+        if native_path(path).exists() and native_path(path).is_dir():
             raise ValueError("path is a directory")
         if "content" not in args:
             raise ValueError("missing content")
@@ -182,14 +270,14 @@ def validate_tool(context, name, args):
         # patch_file 故意做得很严格：old_text 必须精确命中且只能出现一次，
         # 这样修改行为才是确定的，失败原因也更容易解释。
         path = context.path(args["path"])
-        if not path.is_file():
+        if not native_path(path).is_file():
             raise ValueError("path is not a file")
         old_text = str(args.get("old_text", ""))
         if not old_text:
             raise ValueError("old_text must not be empty")
         if "new_text" not in args:
             raise ValueError("missing new_text")
-        text = path.read_text(encoding="utf-8")
+        text = read_text_document(path).text
         count = text.count(old_text)
         if count != 1:
             raise ValueError(f"old_text must occur exactly once, found {count}")
@@ -206,10 +294,11 @@ def validate_tool(context, name, args):
 
 def tool_list_files(context, args):
     path = context.path(args.get("path", "."))
-    if not path.is_dir():
+    io_path = native_path(path)
+    if not io_path.is_dir():
         raise ValueError("path is not a directory")
     entries = [
-        item for item in sorted(path.iterdir(), key=lambda item: (item.is_file(), item.name.lower()))
+        logical_path(item) for item in sorted(io_path.iterdir(), key=lambda item: (item.is_file(), item.name.lower()))
         if item.name not in IGNORED_PATH_NAMES
     ]
     lines = []
@@ -221,45 +310,65 @@ def tool_list_files(context, args):
 
 def tool_read_file(context, args):
     path = context.path(args["path"])
-    if not path.is_file():
+    if not native_path(path).is_file():
         raise ValueError("path is not a file")
     start = int(args.get("start", 1))
-    end = int(args.get("end", 200))
+    end = int(args.get("end", context.source_window_lines))
     if start < 1 or end < start:
         raise ValueError("invalid line range")
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
-    return f"# {path.relative_to(context.root)}\n{body}"
+    document = read_text_document(path)
+    lines = document.text.splitlines()
+    return render_reads([(path.relative_to(context.root).as_posix(), document.encoding,
+                          lines, start, end)], context.observation_char_budget)
 
 
 def tool_read_files(context, args):
     paths = args.get("paths")
     if not isinstance(paths, list) or not paths or len(paths) > 12:
         raise ValueError("paths must be a non-empty list with at most 12 items")
-    return "\n\n".join(
-        tool_read_file(context, {"path": raw_path, "start": 1, "end": 500})
-        for raw_path in paths
-    )
+    documents = []
+    for raw_path in paths:
+        path = context.path(raw_path)
+        document = read_text_document(path)
+        documents.append((path.relative_to(context.root).as_posix(), document.encoding,
+                          document.text.splitlines(), 1, context.source_window_lines))
+    return render_reads(documents, context.observation_char_budget)
 
 
 def tool_search(context, args):
     pattern = str(args.get("pattern", "")).strip()
     if not pattern:
         raise ValueError("pattern must not be empty")
+    expression = re.compile(pattern, re.IGNORECASE)
     path = context.path(args.get("path", "."))
 
     matches = []
-    files = [path] if path.is_file() else [
-        item for item in path.rglob("*")
-        if item.is_file() and not any(part in IGNORED_PATH_NAMES for part in item.relative_to(context.root).parts)
+    search_root = native_path(path)
+    files = [path] if search_root.is_file() else [
+        logical_path(item) for item in search_root.rglob("*")
+        if item.is_file() and not any(part in IGNORED_PATH_NAMES for part in logical_path(item).relative_to(context.root).parts)
     ]
     for file_path in files:
-        for number, line in enumerate(file_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
-            if pattern.lower() in line.lower():
+        try:
+            document = read_text_document(file_path)
+        except (OSError, TextDecodingError):
+            continue
+        for number, line in enumerate(document.text.splitlines(), start=1):
+            if expression.search(line):
                 matches.append(f"{file_path.relative_to(context.root)}:{number}:{line}")
                 if len(matches) >= 200:
                     return "\n".join(matches)
     return "\n".join(matches) or "(no matches)"
+
+
+def tool_inspect_repository(context, args):
+    query = str(args.get("query", ""))
+    limit = int(args.get("limit", 12))
+    if context.repository_inspector is not None:
+        return context.repository_inspector(query, limit).render()
+    from .repository_graph import RepositoryGraph
+
+    return RepositoryGraph(context.root).query(query, limit=limit)
 
 
 def tool_run_shell(context, args):
@@ -271,32 +380,63 @@ def tool_run_shell(context, args):
         raise ValueError("timeout must be in [1, 120]")
     if context.command_runner is None:
         raise RuntimeError("shell_runtime_unavailable: no execution runtime is attached to this transaction")
-    return format_shell_result(context.command_runner.run(command, timeout=timeout))
+    return format_shell_result(
+        context.command_runner.run(command, timeout=timeout),
+        char_budget=context.observation_char_budget,
+    )
+
+
+def tool_run_verification(context, args):
+    argv = args.get("argv")
+    timeout = int(args.get("timeout", 120))
+    if context.command_runner is None:
+        raise RuntimeError("shell_runtime_unavailable: no execution runtime is attached to this transaction")
+    return format_shell_result(
+        context.command_runner.run_argv(argv, timeout=timeout),
+        char_budget=context.observation_char_budget,
+    )
 
 
 def tool_write_file(context, args):
     path = context.path(args["path"])
     content = str(args["content"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    return f"wrote {path.relative_to(context.root)} ({len(content)} chars)"
+    existing = read_text_document(path) if native_path(path).is_file() else None
+    write_text_document(path, content, existing)
+    relative = path.relative_to(context.root).as_posix()
+    return render_mutation_observation(
+        relative,
+        existing.text if existing is not None else "",
+        read_text_document(path),
+        "write_file",
+        context.observation_char_budget,
+        context.source_window_lines,
+    )
 
 
 def tool_patch_file(context, args):
     path = context.path(args["path"])
-    if not path.is_file():
+    if not native_path(path).is_file():
         raise ValueError("path is not a file")
     old_text = str(args.get("old_text", ""))
     if not old_text:
         raise ValueError("old_text must not be empty")
     if "new_text" not in args:
         raise ValueError("missing new_text")
-    text = path.read_text(encoding="utf-8")
+    document = read_text_document(path)
+    text = document.text
     count = text.count(old_text)
     if count != 1:
         raise ValueError(f"old_text must occur exactly once, found {count}")
-    path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
-    return f"patched {path.relative_to(context.root)}"
+    write_text_document(path, text.replace(old_text, str(args["new_text"]), 1), document)
+    relative = path.relative_to(context.root).as_posix()
+    return render_mutation_observation(
+        relative,
+        document.text,
+        read_text_document(path),
+        "patch_file",
+        context.observation_char_budget,
+        context.source_window_lines,
+    )
 
 
 def tool_delegate(context, args):
@@ -313,7 +453,9 @@ _TOOL_RUNNERS = {
     "read_file": tool_read_file,
     "read_files": tool_read_files,
     "search": tool_search,
+    "inspect_repository": tool_inspect_repository,
     "run_shell": tool_run_shell,
+    "run_verification": tool_run_verification,
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,
 }

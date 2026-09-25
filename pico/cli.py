@@ -14,6 +14,8 @@ import textwrap
 from pathlib import Path
 
 from .config import load_project_env, provider_env
+from .interaction_policy import PACKAGE_LAYOUTS, PreferenceError
+from .progress_output import ConsoleProgressRenderer
 from .providers.clients import (
     AnthropicCompatibleModelClient,
     OllamaModelClient,
@@ -56,7 +58,12 @@ HELP_DETAILS = textwrap.dedent(
     /memory  Show the agent's distilled working memory.
     /session Show the path to the saved session file.
     /reset   Clear the current session history and memory.
+    /preferences                         Show workspace coding preferences.
+    /set package-layout <layout>         Set follow_repository, layer_first, or feature_first.
+    /unset package-layout                Restore follow_repository.
     /exit    Exit the agent.
+
+    Press Ctrl+C during a run to interrupt it and return to this prompt.
     """
 ).strip()
 
@@ -127,6 +134,15 @@ def _configured_secret_names(args):
     return sorted(configured_secret_names)
 
 
+def _optional_positive_int(value, name):
+    if value in (None, ""):
+        return None
+    parsed = int(value)
+    if parsed < 1:
+        raise ValueError(f"{name} must be positive")
+    return parsed
+
+
 def _build_model_client(args):
     provider = _effective_provider(args)
     # CLI 只负责把 provider 选择翻译成具体 client。
@@ -148,6 +164,16 @@ def _build_model_client(args):
                 getattr(args, "openai_reasoning_effort", None)
                 or provider_env("PICO_OPENAI_REASONING_EFFORT")
                 or None
+            ),
+            context_window=_optional_positive_int(
+                getattr(args, "model_context_window", None)
+                or provider_env("PICO_MODEL_CONTEXT_WINDOW"),
+                "model context window",
+            ),
+            max_output_tokens=_optional_positive_int(
+                getattr(args, "model_max_output_tokens", None)
+                or provider_env("PICO_MODEL_MAX_OUTPUT_TOKENS"),
+                "model maximum output tokens",
             ),
         )
     if provider == "anthropic":
@@ -289,6 +315,8 @@ def build_agent(args):
             soft_discovery_limit=getattr(args, "soft_discovery_limit", None),
             hard_discovery_limit=getattr(args, "hard_discovery_limit", None),
             model_execution_policy=getattr(args, "model_execution_policy", "adaptive"),
+            package_layout=getattr(args, "package_layout", None),
+            semantic_index=getattr(args, "semantic_index", "auto"),
         )
     return Pico(
         model_client=model,
@@ -303,6 +331,8 @@ def build_agent(args):
         soft_discovery_limit=getattr(args, "soft_discovery_limit", None),
         hard_discovery_limit=getattr(args, "hard_discovery_limit", None),
         model_execution_policy=getattr(args, "model_execution_policy", "adaptive"),
+        package_layout=getattr(args, "package_layout", None),
+        semantic_index=getattr(args, "semantic_index", "auto"),
     )
 
 
@@ -340,7 +370,31 @@ def build_arg_parser():
         default="adaptive",
         help="Per-turn thinking policy. An explicit --openai-reasoning-effort still takes precedence.",
     )
+    parser.add_argument(
+        "--model-context-window",
+        type=int,
+        default=None,
+        help="Authoritative model context-window capability when the compatible API does not publish it.",
+    )
+    parser.add_argument(
+        "--model-max-output-tokens",
+        type=int,
+        default=None,
+        help="Authoritative model output capability; this is not a per-turn target.",
+    )
+    parser.add_argument(
+        "--semantic-index",
+        choices=("auto", "off"),
+        default="auto",
+        help="Use optional Python/Java language-server evidence when pico[lsp] is installed.",
+    )
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
+    parser.add_argument(
+        "--package-layout",
+        choices=tuple(sorted(PACKAGE_LAYOUTS)),
+        default=None,
+        help="Per-process package layout override; workspace preference is used when omitted.",
+    )
     parser.add_argument("--approval", choices=("ask", "auto", "never"), default="ask", help="Approval policy for risky tools.")
     parser.add_argument(
         "--commit-policy",
@@ -360,15 +414,31 @@ def build_arg_parser():
         "--soft-discovery-limit",
         type=int,
         default=None,
-        help="Exploratory tool streak that triggers a soft progress intervention.",
+        help="Deprecated compatibility option; progress advice no longer depends on a discovery quota.",
     )
     parser.add_argument(
         "--hard-discovery-limit",
         type=int,
         default=None,
-        help="Exploratory tool streak that triggers a forced-decision intervention.",
+        help="Deprecated compatibility option; exploration no longer restricts tools or forces a phase transition.",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
+    parser.add_argument(
+        "--max-output-cap",
+        "--max-new-tokens",
+        dest="max_new_tokens",
+        type=int,
+        default=None,
+        help=(
+            "Optional hard ceiling for a model turn. By default Pico lets the "
+            "adaptive policy and provider capabilities choose; --max-new-tokens "
+            "is retained as a deprecated alias."
+        ),
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable live runtime progress events on stderr.",
+    )
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
     return parser
@@ -407,13 +477,26 @@ def review_transaction(agent):
         print("staged transaction retained for resume")
 
 
+def run_exit_code(agent):
+    outcome = getattr(agent, "last_run_outcome", None)
+    if outcome is not None:
+        return int(outcome.exit_code)
+    task_state = getattr(agent, "current_task_state", None)
+    if task_state is None or task_state.exit_code is None:
+        return 1
+    return int(task_state.exit_code)
+
+
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     try:
         agent = build_agent(args)
-    except SessionError as exc:
+    except (SessionError, PreferenceError) as exc:
         print_safe(str(exc), file=sys.stderr)
         return 2
+
+    if not args.no_progress:
+        agent.progress_sink = ConsoleProgressRenderer(max_steps=getattr(agent, "max_steps", None))
 
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
     host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", DEFAULT_OLLAMA_HOST)))
@@ -431,10 +514,13 @@ def main(argv=None):
             try:
                 print_safe(agent.ask(prompt))
                 review_transaction(agent)
+            except KeyboardInterrupt:
+                print_safe("\nRun interrupted; staged workspace was preserved for the next request.", file=sys.stderr)
+                return 130
             except RuntimeError as exc:
                 print_safe(str(exc), file=sys.stderr)
                 return 1
-        return 0
+        return run_exit_code(agent)
 
     while True:
         # 交互模式：每次读取一条用户输入，交给同一个 agent，
@@ -462,10 +548,30 @@ def main(argv=None):
             agent.reset()
             print("session reset")
             continue
+        if user_input == "/preferences":
+            try:
+                print_safe(json.dumps(agent.preferences_view(), ensure_ascii=False, indent=2))
+            except PreferenceError as exc:
+                print_safe(str(exc), file=sys.stderr)
+            continue
+        if user_input.startswith("/set package-layout "):
+            value = user_input.removeprefix("/set package-layout ").strip()
+            try:
+                agent.set_workspace_package_layout(value)
+                print_safe(f"package-layout set to {value}")
+            except PreferenceError as exc:
+                print_safe(str(exc), file=sys.stderr)
+            continue
+        if user_input == "/unset package-layout":
+            agent.reset_workspace_package_layout()
+            print_safe("package-layout reset to follow_repository")
+            continue
 
         print()
         try:
             print_safe(agent.ask(user_input))
             review_transaction(agent)
+        except KeyboardInterrupt:
+            print_safe("\nRun interrupted; staged workspace was preserved. Enter the next request.", file=sys.stderr)
         except RuntimeError as exc:
             print_safe(str(exc), file=sys.stderr)

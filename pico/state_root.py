@@ -11,6 +11,9 @@ from pathlib import Path
 
 def default_state_root(env=None):
     env = os.environ if env is None else env
+    configured = str(env.get("PICO_STATE_ROOT", "")).strip()
+    if configured:
+        return Path(configured).expanduser()
     if os.name == "nt":
         base = env.get("LOCALAPPDATA")
         if base:
@@ -35,7 +38,9 @@ def workspace_identity(source_root):
     git_dir = _git_value(source_root, "rev-parse", "--absolute-git-dir")
     remote = _git_value(source_root, "config", "--get", "remote.origin.url")
     if git_dir:
-        identity = f"git:{remote or Path(git_dir).resolve()}"
+        # A remote identifies project lineage, not one local working copy.
+        # Separate clones must never share live sessions or transactions.
+        identity = f"git:{remote}:{Path(git_dir).resolve()}:{source_root}"
     else:
         identity = f"path:{source_root}"
     workspace_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]

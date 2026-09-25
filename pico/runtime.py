@@ -17,56 +17,75 @@ from . import security as securitylib
 from . import tools as toolkit
 from .checkpoint import CHECKPOINT_NONE_STATUS
 from .context_manager import ContextManager
+from .context_projection import ContextProjector, project_model_events
 from .execution import ExecutionLease, WorkspaceCommandRunner
 from .execution_policy import ModelExecutionPolicy
 from .features import memory as memorylib
+from .interaction_policy import (
+    PACKAGE_LAYOUTS,
+    PreferenceError,
+    WorkspacePreferenceStore,
+    build_interaction_contract,
+    path_matches_patterns,
+)
+from .memory_admission import extract_explicit_memory
+from .outcome import RunOutcome
+from .path_support import logical_path, native_path
+from .progress import ExecutionLedger
 from .prompt_prefix import build_prompt_prefix, tool_signature
+from .repository_intelligence import RepositoryIntelligence
 from .run_store import RunStore
 from .security import REDACTED_VALUE, SecretBoundary
 from .session_store import SessionStore
 from .state_root import WorkspaceState
 from .task_state import TaskState
+from .text_document import TextDecodingError
 from .tool_context import ToolContext
 from .tool_executor import ToolExecutor
 from .transaction_context import TransactionContext
-from .transactional_workspace import TransactionalWorkspace
-from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
+from .transactional_workspace import (
+    COPY_EXCLUDES,
+    TERMINAL_STATES,
+    TransactionalWorkspace,
+)
+from .workspace import MAX_HISTORY, WorkspaceContext, clip, now
 
 DEFAULT_SHELL_ENV_ALLOWLIST = (
+    "APPDATA",
     "COMSPEC",
     "HOME",
+    "GRADLE_HOME",
+    "JAVA_HOME",
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
+    "LOCALAPPDATA",
     "LOGNAME",
+    "MAVEN_HOME",
     "PATH",
+    "PATHEXT",
+    "PROGRAMDATA",
     "PWD",
     "SHELL",
+    "SYSTEMDRIVE",
     "SYSTEMROOT",
     "TERM",
     "TMPDIR",
     "TMP",
     "TEMP",
     "USER",
+    "USERPROFILE",
+    "WINDIR",
 )
+MAX_SESSION_HISTORY_ITEMS = 128
+MAX_SESSION_HISTORY_CONTENT_CHARS = 4000
+MAX_SESSION_TOOL_ARGUMENT_CHARS = 2000
 DEFAULT_FEATURE_FLAGS = {
     "memory": True,
     "relevant_memory": True,
     "context_reduction": True,
     "prompt_cache": True,
 }
-DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
-DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
-DURABLE_MEMORY_LINE_PATTERNS = (
-    ("project-conventions", re.compile(r"(?i)^Project convention:\s*(.+)$")),
-    ("key-decisions", re.compile(r"(?i)^Decision:\s*(.+)$")),
-    ("dependency-facts", re.compile(r"(?i)^Dependency:\s*(.+)$")),
-    ("user-preferences", re.compile(r"(?i)^Preference:\s*(.+)$")),
-    ("project-conventions", re.compile(r"^项目约定：\s*(.+)$")),
-    ("key-decisions", re.compile(r"^决策：\s*(.+)$")),
-    ("dependency-facts", re.compile(r"^依赖：\s*(.+)$")),
-    ("user-preferences", re.compile(r"^偏好：\s*(.+)$")),
-)
 SECRET_SHAPED_TEXT_PATTERN = re.compile(
     r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,}|<redacted>)"
 )
@@ -84,7 +103,7 @@ class Pico:
         run_store=None,
         approval_policy="ask",
         max_steps=6,
-        max_new_tokens=512,
+        max_new_tokens=None,
         depth=0,
         max_depth=1,
         read_only=False,
@@ -99,18 +118,33 @@ class Pico:
         soft_discovery_limit=None,
         hard_discovery_limit=None,
         model_execution_policy="adaptive",
+        progress_sink=None,
+        package_layout=None,
+        semantic_index="auto",
     ):
         self.model_client = model_client
         self.workspace = workspace
         self.source_root = Path(workspace.repo_root).resolve()
         self.root = self.source_root
         self.session_store = session_store
-        self.approval_policy = approval_policy
-        self.max_steps = max_steps
-        self.max_new_tokens = max_new_tokens
+        self.approval_policy = str(approval_policy)
+        if self.approval_policy not in {"ask", "auto", "never"}:
+            raise ValueError("approval_policy must be 'ask', 'auto', or 'never'")
+        self.max_steps = int(max_steps)
+        self.max_new_tokens = (
+            int(max_new_tokens) if max_new_tokens not in (None, "") else None
+        )
+        if self.max_steps < 1:
+            raise ValueError("max_steps must be positive")
+        if self.max_new_tokens is not None and self.max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive")
         self.soft_discovery_limit = soft_discovery_limit
         self.hard_discovery_limit = hard_discovery_limit
         self.model_execution_policy = ModelExecutionPolicy(model_execution_policy)
+        self.progress_sink = progress_sink
+        self.semantic_index = str(semantic_index or "auto").strip().lower()
+        if self.semantic_index not in {"auto", "off"}:
+            raise ValueError("semantic_index must be 'auto' or 'off'")
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
@@ -142,8 +176,19 @@ class Pico:
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
+        fallback_state_root = Path(self.session_store.root).parent
+        self.semantic_cache_root = (
+            self.workspace_state.root if self.workspace_state else fallback_state_root
+        ) / "lsp"
+        preference_root = self.workspace_state.root if self.workspace_state else fallback_state_root
+        self.preference_store = WorkspacePreferenceStore(preference_root / "preferences.json")
+        self.package_layout_override = str(package_layout).strip() if package_layout else ""
+        if self.package_layout_override and self.package_layout_override not in PACKAGE_LAYOUTS:
+            choices = ", ".join(sorted(PACKAGE_LAYOUTS))
+            raise PreferenceError(f"package_layout must be one of: {choices}")
+        self.current_interaction = {}
         self.run_store = run_store or RunStore(
-            self.workspace_state.runs if self.workspace_state else Path(workspace.repo_root) / ".pico" / "runs"
+            self.workspace_state.runs if self.workspace_state else fallback_state_root / "runs"
         )
         self.run_store.secret_boundary = self.secret_boundary
         self.session = session or {
@@ -154,6 +199,9 @@ class Pico:
             "memory": memorylib.default_memory_state(),
         }
         self._ensure_session_shape()
+        self.model_execution_policy.load_usage(
+            self.session.get("model_usage_samples", [])
+        )
         active_transaction_id = str(self.session.get("active_transaction_id", "")).strip()
         if self.transaction_context is None and active_transaction_id:
             transaction = TransactionalWorkspace.load(
@@ -162,25 +210,33 @@ class Pico:
                 active_transaction_id,
                 secret_boundary=self.secret_boundary,
             )
-            if not transaction.execution_root.exists():
+            if transaction.state in TERMINAL_STATES:
+                # The transaction record is authoritative. A process may stop
+                # after commit/discard persisted its terminal state and removed
+                # the shadow, but before the session pointer is cleared.
+                self.session.pop("active_transaction_id", None)
+                transaction.cleanup_terminal_artifacts()
+                self.session_path = self.session_store.save(self.session)
+            elif not transaction.execution_root.exists():
                 raise RuntimeError("RECOVERY_UNAVAILABLE: transaction shadow workspace is missing")
-            runner = WorkspaceCommandRunner(
-                transaction.execution_root,
-                self.secret_boundary,
-                env_allowlist=self.shell_env_allowlist,
-            )
-            self.transaction_context = TransactionContext(
-                transaction_id=transaction.transaction_id,
-                workspace=transaction,
-                secret_boundary=self.secret_boundary,
-                execution_lease=ExecutionLease(runner),
-                owns_context=True,
-            )
-            self.root = transaction.execution_root
+            else:
+                runner = WorkspaceCommandRunner(
+                    transaction.execution_root,
+                    self.secret_boundary,
+                    env_allowlist=self.shell_env_allowlist,
+                )
+                self.transaction_context = TransactionContext(
+                    transaction_id=transaction.transaction_id,
+                    workspace=transaction,
+                    secret_boundary=self.secret_boundary,
+                    execution_lease=ExecutionLease(runner),
+                    owns_context=True,
+                )
+                self.root = transaction.execution_root
         self.memory = memorylib.LayeredMemory(
             self.session.setdefault("memory", memorylib.default_memory_state()),
             workspace_root=self.root,
-            durable_root=(self.workspace_state.memory if self.workspace_state else self.source_root / ".pico" / "memory"),
+            durable_root=(self.workspace_state.memory if self.workspace_state else fallback_state_root / "memory"),
         )
         self.session["memory"] = self.memory.to_dict()
         self.tools = self._apply_tool_allowlist(self.build_tools())
@@ -199,8 +255,13 @@ class Pico:
         self.last_durable_rejections = []
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
-        self.last_shell_validation_succeeded = None
+        self.last_verification_succeeded = None
+        self.verification_stale = False
+        self.last_shell_validation_succeeded = None  # compatibility for persisted V1 state
+        self.last_run_outcome = None
         self.progress_controller = None
+        self.repository_intelligence = None
+        self.last_repository_evidence = {}
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
@@ -208,10 +269,93 @@ class Pico:
         self._recover_orphaned_runs()
         self.session_path = self.session_store.save(self.session)
 
+    def effective_package_layout(self):
+        if self.package_layout_override:
+            return self.package_layout_override
+        return self.preference_store.load()["package_layout"]
+
+    def preferences_view(self):
+        stored = self.preference_store.load()
+        return {
+            "package_layout": self.effective_package_layout(),
+            "workspace_package_layout": stored["package_layout"],
+            "source": "command_line" if self.package_layout_override else "workspace",
+        }
+
+    def set_workspace_package_layout(self, value):
+        values = self.preference_store.set_package_layout(value)
+        self.package_layout_override = ""
+        return values
+
+    def reset_workspace_package_layout(self):
+        values = self.preference_store.reset_package_layout()
+        self.package_layout_override = ""
+        return values
+
+    def interaction_contract(self, user_message):
+        contract = build_interaction_contract(
+            user_message, self.effective_package_layout()
+        )
+        continuation = str(user_message or "").strip().casefold() in {
+            "continue", "continue.", "继续", "继续吧", "好的，继续", "ok, continue",
+        }
+        requirements = dict(self.session.get("transaction_requirements", {}) or {})
+        if continuation and self.transaction_context is not None and requirements:
+            contract["mode"] = "implement"
+            contract["mutation_allowed"] = True
+            contract["validation_required"] = bool(
+                requirements.get("validation_required")
+            )
+            contract["test_artifact_required"] = bool(
+                requirements.get("test_artifact_required")
+            )
+            contract["protected_paths"] = list(
+                requirements.get("protected_paths", ())
+            )
+        return contract
+
+    def repository_evidence(self, user_message, limit=10):
+        try:
+            bundle = self.inspect_repository(user_message, limit, include_semantic=False)
+            self.last_repository_evidence = bundle.ledger_seed()
+            return clip(bundle.render(), 2400)
+        except (OSError, TextDecodingError, ValueError):
+            self.last_repository_evidence = {}
+            return ""
+
+    def inspect_repository(self, query, limit=12, include_semantic=True):
+        if (
+            self.repository_intelligence is None
+            or self.repository_intelligence.root != Path(self.root).resolve()
+        ):
+            self.close_repository_intelligence()
+            self.repository_intelligence = RepositoryIntelligence(
+                self.root,
+                semantic_mode=self.semantic_index,
+                semantic_cache_root=self.semantic_cache_root,
+            )
+        bundle = self.repository_intelligence.inspect(
+            query,
+            limit=limit,
+            include_semantic=include_semantic,
+        )
+        self.last_repository_evidence = bundle.ledger_seed()
+        if self.progress_controller is not None:
+            self.progress_controller.ledger.seed_repository_evidence(
+                self.last_repository_evidence
+            )
+        return bundle
+
+    def close_repository_intelligence(self):
+        if self.repository_intelligence is not None:
+            self.repository_intelligence.close()
+            self.repository_intelligence = None
+
     def _recover_orphaned_runs(self):
         for payload in self.run_store.claim_orphaned_runs():
             task_state = TaskState.from_dict(payload)
             transaction_error = ""
+            delivered_paths = []
             transaction_id = str(task_state.transaction_id or "").strip()
             if transaction_id:
                 try:
@@ -229,10 +373,19 @@ class Pico:
                         )
                     transaction.interrupt("orphaned_run")
                     task_state.transaction_state = transaction.state
+                    if transaction.state == "COMMITTED":
+                        delivered_paths = [
+                            change["path"] for change in transaction.committed_changes()
+                        ]
                 except Exception as exc:  # noqa: BLE001 - orphan recovery must still close the run record
                     transaction_error = self.redact_text(str(exc))
             final = "Recovered a run left active without a live process owner."
             task_state.stop_orphaned(final)
+            self.capture_run_outcome(
+                task_state,
+                staged_paths=delivered_paths,
+                delivered_paths=delivered_paths,
+            )
             self.run_store.write_task_state(task_state)
             self.emit_trace(
                 task_state,
@@ -263,6 +416,9 @@ class Pico:
             self.source_root,
             self.transactions_root,
             secret_boundary=self.secret_boundary,
+            source_excludes=(
+                (self.workspace_state.global_root,) if self.workspace_state else ()
+            ),
         ).begin()
         runner = WorkspaceCommandRunner(
             transaction.execution_root,
@@ -279,15 +435,38 @@ class Pico:
         self.root = transaction.execution_root
         self.workspace = WorkspaceContext.build(self.root, repo_root_override=self.root)
         self.session["active_transaction_id"] = transaction.transaction_id
+        self.last_verification_succeeded = None
+        self.verification_stale = False
         self.last_shell_validation_succeeded = None
         self.memory.workspace_root = self.root
         self.tools = self._apply_tool_allowlist(self.build_tools())
         self._apply_prefix_state(self.build_prefix())
-        self.session_path = self.session_store.save(self.session)
+        try:
+            self.session_path = self.session_store.save(self.session)
+        except Exception:
+            # The session pointer is the ownership record for a live shadow.
+            # If it cannot be persisted, the untouched new shadow must not be
+            # left orphaned and undiscoverable.
+            self.session.pop("active_transaction_id", None)
+            self.transaction_context.execution_lease.stop()
+            try:
+                transaction.discard()
+            except OSError:
+                pass
+            self.transaction_context = None
+            self.root = self.source_root
+            self.workspace = WorkspaceContext.build(
+                self.source_root, repo_root_override=self.source_root
+            )
+            self.memory.workspace_root = self.source_root
+            self.tools = self._apply_tool_allowlist(self.build_tools())
+            self._apply_prefix_state(self.build_prefix())
+            raise
         return self.transaction_context
 
     def _restore_source_view(self, clear_context=True):
         context = self.transaction_context
+        self.close_repository_intelligence()
         self.root = self.source_root
         self.workspace = WorkspaceContext.build(self.source_root, repo_root_override=self.source_root)
         self.memory.workspace_root = self.source_root
@@ -296,6 +475,8 @@ class Pico:
                 context.execution_lease.stop()
             self.transaction_context = None
             self.session.pop("active_transaction_id", None)
+            self.session.pop("transaction_requirements", None)
+            self.session["execution_ledger"] = {}
         self.tools = self._apply_tool_allowlist(self.build_tools())
         self._apply_prefix_state(self.build_prefix())
         self.session_path = self.session_store.save(self.session)
@@ -306,8 +487,25 @@ class Pico:
             return {"state": "COMMITTED", "changes": [], "conflicts": []}
         transaction = context.workspace
         changes = transaction.stage()
-        if self.last_shell_validation_succeeded is False:
-            conflicts = transaction.block_validation("last_shell_command_failed")
+        requirements = dict(self.session.get("transaction_requirements", {}) or {})
+        protected_paths = sorted(
+            set(requirements.get("protected_paths", ()))
+            | set((self.current_interaction or {}).get("protected_paths", ()))
+        )
+        scope_violations = [
+            change["path"]
+            for change in changes
+            if path_matches_patterns(change["path"], protected_paths)
+        ]
+        if scope_violations:
+            conflicts = transaction.block_validation(
+                "scope_constraint_violation",
+                paths=scope_violations,
+            )
+            return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
+        verification_error = self.verification_failure_reason(changes)
+        if verification_error:
+            conflicts = transaction.block_validation(verification_error)
             return {"state": transaction.state, "changes": changes, "conflicts": conflicts}
         conflicts = transaction.validate_commit()
         if conflicts:
@@ -319,6 +517,62 @@ class Pico:
             self._restore_source_view(clear_context=True)
             return result
         return {"state": transaction.state, "changes": changes, "conflicts": []}
+
+    def verification_failure_reason(self, changes=None):
+        """Inspect delivery evidence without staging or closing the repair cycle."""
+        if self.transaction_context is None or not self.transaction_context.owns_context:
+            return ""
+        if changes is None:
+            changes = self.transaction_context.workspace.diff()
+        requirements = dict(self.session.get("transaction_requirements", {}) or {})
+        ledger = (
+            self.progress_controller.ledger
+            if self.progress_controller is not None
+            else ExecutionLedger.from_dict(self.session.get("execution_ledger", {}))
+        )
+        validation_records = [
+            item
+            for item in ledger.validations
+            if item.get("kind") == "validation"
+        ]
+        unresolved_failures = bool(
+            ledger.unresolved_failures or ledger.unresolved_failure_count
+        )
+        unverified_changes = bool(
+            ledger.unverified_changes or ledger.unverified_change_count
+        )
+        validation_passed = bool(
+            any(item.get("status") == "ok" for item in validation_records)
+            and not unresolved_failures
+            and not unverified_changes
+        )
+        if unresolved_failures:
+            return "verification_failed"
+        if self.verification_stale or (validation_records and unverified_changes):
+            return "verification_stale"
+        if self.last_verification_succeeded is False:
+            return "verification_failed"
+        if (
+            changes
+            and (
+                requirements.get("validation_required")
+                or (self.current_interaction or {}).get("validation_required")
+            )
+            and not (validation_passed or self.last_verification_succeeded is True)
+        ):
+            return "verification_required"
+        return ""
+
+    def capture_run_outcome(self, task_state, staged_paths=(), delivered_paths=(), conflicts=()):
+        outcome = RunOutcome.from_task_state(
+            task_state,
+            staged_paths=staged_paths,
+            delivered_paths=delivered_paths,
+            conflicts=conflicts,
+        )
+        task_state.record_outcome(outcome)
+        self.last_run_outcome = outcome
+        return outcome
 
     def apply_transaction(self):
         if self.transaction_context is None:
@@ -332,6 +586,12 @@ class Pico:
         if self.current_task_state is not None:
             self.current_task_state.transaction_state = transaction.state
             self.current_task_state.finish_success(self.current_task_state.final_answer)
+            paths = [change["path"] for change in committed_changes]
+            self.capture_run_outcome(
+                self.current_task_state,
+                staged_paths=paths,
+                delivered_paths=paths,
+            )
             self.run_store.write_task_state(self.current_task_state)
             self.run_store.write_report(
                 self.current_task_state,
@@ -348,6 +608,7 @@ class Pico:
         if self.current_task_state is not None:
             self.current_task_state.transaction_state = transaction.state
             self.current_task_state.stop("transaction_discarded", final_answer=self.current_task_state.final_answer)
+            self.capture_run_outcome(self.current_task_state)
             self.run_store.write_task_state(self.current_task_state)
             self.run_store.write_report(
                 self.current_task_state,
@@ -371,20 +632,79 @@ class Pico:
         )
 
     def _ensure_session_shape(self):
-        self.session.setdefault("history", [])
-        self.session.setdefault("memory", memorylib.default_memory_state())
+        history = self.session.setdefault("history", [])
+        if not isinstance(history, list):
+            self.session["history"] = []
+        else:
+            normalized_history = []
+            for raw_item in history[-MAX_SESSION_HISTORY_ITEMS:]:
+                if not isinstance(raw_item, dict):
+                    continue
+                item = dict(raw_item)
+                item["role"] = str(item.get("role", ""))
+                item["content"] = clip(
+                    str(item.get("content", "")),
+                    MAX_SESSION_HISTORY_CONTENT_CHARS,
+                )
+                if item["role"] == "tool":
+                    item["name"] = str(item.get("name", ""))
+                    raw_args = item.get("args", {})
+                    item["args"] = self.compact_tool_args(
+                        raw_args if isinstance(raw_args, dict) else {}
+                    )
+                    raw_evidence = item.get("read_evidence", [])
+                    item["read_evidence"] = [
+                        dict(record)
+                        for record in raw_evidence
+                        if isinstance(record, dict)
+                    ]
+                normalized_history.append(item)
+            self.session["history"] = normalized_history
+        memory = self.session.setdefault("memory", memorylib.default_memory_state())
+        if not isinstance(memory, dict):
+            self.session["memory"] = memorylib.default_memory_state()
         model_events = self.session.setdefault("model_events", [])
         if not isinstance(model_events, list):
             self.session["model_events"] = []
+        else:
+            self.session["model_events"], _ = project_model_events(
+                model_events,
+                event_limit=None,
+                char_budget=ContextProjector(self).event_char_budget,
+            )
+        usage_samples = self.session.setdefault("model_usage_samples", [])
+        if not isinstance(usage_samples, list):
+            self.session["model_usage_samples"] = []
+        else:
+            self.session["model_usage_samples"] = [
+                dict(item) for item in usage_samples[-32:] if isinstance(item, dict)
+            ]
         execution_ledger = self.session.setdefault("execution_ledger", {})
         if not isinstance(execution_ledger, dict):
             self.session["execution_ledger"] = {}
+        else:
+            self.session["execution_ledger"] = ExecutionLedger.from_dict(
+                execution_ledger
+            ).to_dict()
         checkpoints = self.session.setdefault("checkpoints", {})
         if not isinstance(checkpoints, dict):
             checkpoints = {}
             self.session["checkpoints"] = checkpoints
         checkpoints.setdefault("current_id", "")
-        checkpoints.setdefault("items", {})
+        checkpoint_items = checkpoints.setdefault("items", {})
+        if not isinstance(checkpoint_items, dict):
+            checkpoints["items"] = {}
+        else:
+            retained_items = {}
+            for checkpoint_id, raw_checkpoint in list(checkpoint_items.items())[
+                -checkpointlib.MAX_CHECKPOINTS:
+            ]:
+                normalized = checkpointlib.normalize_checkpoint(raw_checkpoint)
+                if normalized is not None:
+                    retained_items[str(checkpoint_id)] = normalized
+            checkpoints["items"] = retained_items
+            if checkpoints.get("current_id") not in retained_items:
+                checkpoints["current_id"] = next(reversed(retained_items), "")
         runtime_identity = self.session.setdefault("runtime_identity", {})
         if not isinstance(runtime_identity, dict):
             self.session["runtime_identity"] = {}
@@ -422,7 +742,22 @@ class Pico:
         del bucket[:-limit]
 
     def build_tools(self):
-        return toolkit.build_tool_registry(self.tool_context())
+        tools = toolkit.build_tool_registry(self.tool_context())
+        if "run_shell" in tools:
+            dialect = self.execution_profile_view().get("dialect", "unavailable")
+            tools["run_shell"]["description"] = (
+                f"Run a non-inspection {dialect} command in the transaction workspace. "
+                "Use typed repository tools for listing, searching, and source reads; "
+                "use `python -m pytest` for Python validation."
+            )
+        if "run_verification" in tools:
+            tools["run_verification"]["description"] = (
+                "Run one verification executable directly in the transaction workspace. "
+                "Pass argv as separate elements. Use purpose=acceptance only for a real test, "
+                "build, lint, or type check whose exit status is authoritative; use "
+                "purpose=diagnostic for an exploratory probe that must not satisfy or block delivery."
+            )
+        return tools
 
     @staticmethod
     def _normalize_allowed_tools(allowed_tools):
@@ -517,11 +852,41 @@ class Pico:
         return prompt
 
     def record(self, item):
-        self.session["history"].append(self.redact_artifact(item))
+        history = self.session["history"]
+        item = self.redact_artifact(item)
+        if isinstance(item, dict):
+            item = dict(item)
+            if "content" in item:
+                item["content"] = clip(
+                    item["content"], MAX_SESSION_HISTORY_CONTENT_CHARS
+                )
+            if item.get("role") == "tool":
+                item["args"] = self.compact_tool_args(item.get("args", {}))
+        history.append(item)
+        del history[:-MAX_SESSION_HISTORY_ITEMS]
         self.session_path = self.session_store.save(self.session)
 
+    @staticmethod
+    def compact_tool_args(args):
+        compact = {}
+        for key, value in dict(args or {}).items():
+            if isinstance(value, str) and len(value) > MAX_SESSION_TOOL_ARGUMENT_CHARS:
+                compact[key] = (
+                    f"[compacted argument; original_chars={len(value)}]\n"
+                    + clip(value, 600)
+                )
+                compact[f"{key}_chars"] = len(value)
+            else:
+                compact[key] = value
+        return compact
+
     def record_model_events(self, events, execution_ledger=None):
-        self.session["model_events"] = self.redact_artifact(list(events)[-24:])
+        projected, _ = project_model_events(
+            events,
+            event_limit=None,
+            char_budget=ContextProjector(self).event_char_budget,
+        )
+        self.session["model_events"] = self.redact_artifact(projected)
         if execution_ledger is not None:
             self.session["execution_ledger"] = self.redact_artifact(execution_ledger)
         self.session_path = self.session_store.save(self.session)
@@ -556,6 +921,11 @@ class Pico:
             allowlist=self.shell_env_allowlist,
             extra={"PWD": "/workspace"},
         )
+
+    def execution_profile_view(self):
+        if self.transaction_context is None:
+            return {"dialect": "unavailable", "executable": ""}
+        return self.transaction_context.execution_lease.runner.profile_view()
 
     def prompt_metadata(self, user_message, prompt):
         _, metadata = self._build_prompt_and_metadata(user_message)
@@ -599,6 +969,11 @@ class Pico:
         payload["created_at"] = now()
         # trace 是运行中的逐事件时间线，适合回答“这一轮 agent 到底做了什么”。
         self.run_store.append_trace(task_state, payload)
+        if self.progress_sink is not None:
+            try:
+                self.progress_sink(event, dict(payload), task_state)
+            except (OSError, UnicodeError):
+                pass
         return payload
 
     def capture_workspace_snapshot(self):
@@ -608,7 +983,7 @@ class Pico:
                 relative_parts = path.relative_to(self.root).parts
             except ValueError:
                 continue
-            if any(part in IGNORED_PATH_NAMES for part in relative_parts):
+            if any(part in COPY_EXCLUDES for part in relative_parts):
                 continue
             if not path.is_file():
                 continue
@@ -724,37 +1099,30 @@ class Pico:
             return "noisy_output"
         return ""
 
-    def extract_durable_promotions(self, user_message, final_answer):
-        user_text = str(user_message or "")
-        if not (DURABLE_MEMORY_INTENT_PATTERN.search(user_text) or DURABLE_MEMORY_INTENT_ZH_PATTERN.search(user_text)):
-            return [], []
+    def extract_durable_promotions(self, user_message, final_answer=None):
+        # The model's final answer is deliberately not a memory source.  Only
+        # explicit user-authored facts can cross the durable-memory boundary.
+        del final_answer
+        admission = extract_explicit_memory(user_message)
         promotions = []
-        rejections = []
-        for line in str(final_answer or "").splitlines():
-            text = line.strip()
-            if not text:
-                continue
-            for topic, pattern in DURABLE_MEMORY_LINE_PATTERNS:
-                match = pattern.match(text)
-                if not match:
-                    continue
-                note_text = match.group(1).strip()
-                if note_text:
-                    reason = self.reject_durable_reason(note_text)
-                    if reason:
-                        rejections.append(f"{topic}:{reason}")
-                        break
-                    promotions.append((topic, note_text))
-                break
+        rejections = list(admission.rejections)
+        for candidate in admission.candidates:
+            reason = self.reject_durable_reason(candidate["text"])
+            if reason:
+                rejections.append(f"{candidate['topic']}:{reason}")
+            else:
+                promotions.append(dict(candidate))
         return promotions, rejections
 
-    def promote_durable_memory(self, user_message, final_answer):
+    def promote_durable_memory(self, user_message, final_answer=None):
         promotions, rejections = self.extract_durable_promotions(user_message, final_answer)
         promoted, superseded = self.memory.promote_durable(promotions)
         self.session["memory"] = self.memory.to_dict()
         self.last_durable_promotions = promoted
         self.last_durable_rejections = rejections
         self.last_durable_superseded = superseded
+        if promoted or rejections or superseded:
+            self.session_path = self.session_store.save(self.session)
         return promoted, rejections, superseded
 
     def ask(self, user_message):
@@ -799,7 +1167,7 @@ class Pico:
         if direct_transaction and self.commit_policy == "auto" and result.metadata.get("read_only") is False:
             if result.metadata.get("tool_status") == "ok":
                 outcome = self.finalize_transaction()
-                if outcome["state"] == "CONFLICTED":
+                if outcome.get("conflicts"):
                     return "error: workspace conflict: " + json.dumps(outcome["conflicts"], ensure_ascii=False)
             else:
                 self.interrupt_transaction(result.metadata.get("tool_error_code") or "tool_failed")
@@ -816,6 +1184,14 @@ class Pico:
     def build_report(self, task_state):
         # report 是一次运行的最终摘要；
         # 和 trace 的区别在于，trace 关注过程，report 关注结果与关键指标。
+        interaction = dict(self.current_interaction)
+        if not interaction or task_state.run_id != getattr(self.current_task_state, "run_id", ""):
+            interaction = {
+                "mode": task_state.request_mode,
+                "request_profile": task_state.request_profile,
+                "package_layout": task_state.package_layout,
+                "relative_adjustment": task_state.relative_adjustment,
+            }
         return {
             "run_id": task_state.run_id,
             "task_id": task_state.task_id,
@@ -834,6 +1210,16 @@ class Pico:
             "redacted_env": self.detected_secret_env_summary(),
             "transaction_id": task_state.transaction_id,
             "transaction_state": task_state.transaction_state,
+            "run_outcome": (
+                self.last_run_outcome.to_dict()
+                if self.last_run_outcome is not None
+                and task_state.run_id == getattr(self.current_task_state, "run_id", "")
+                else RunOutcome.from_task_state(
+                    task_state,
+                    staged_paths=task_state.staged_paths,
+                    delivered_paths=task_state.delivered_paths,
+                ).to_dict()
+            ),
             "blocked_repeats": task_state.blocked_repeats,
             "intervention_count": task_state.intervention_count,
             "steps_to_first_mutation": task_state.steps_to_first_mutation,
@@ -843,10 +1229,52 @@ class Pico:
             "model_incomplete_count": task_state.model_incomplete_count,
             "model_protocol_error_count": task_state.model_protocol_error_count,
             "model_transport_failure_count": task_state.model_transport_failure_count,
+            "model_duration_ms": task_state.model_duration_ms,
+            "tool_duration_ms": task_state.tool_duration_ms,
+            "provider_retry_count": task_state.provider_retry_count,
+            "model_recovery_count": task_state.model_recovery_count,
+            "completion_quality": task_state.completion_quality(),
             "model_execution_policy": self.model_execution_policy.mode,
+            "adaptive_budget": {
+                "hard_output_cap": self.max_new_tokens,
+                "last_requested_output_tokens": self.last_completion_metadata.get(
+                    "requested_output_tokens"
+                ),
+                "last_input_tokens": self.last_completion_metadata.get(
+                    "input_tokens"
+                ),
+                "last_output_tokens": self.last_completion_metadata.get(
+                    "output_tokens"
+                ),
+                "last_incomplete_reason": self.last_completion_metadata.get(
+                    "incomplete_reason", ""
+                ),
+                "usage_sample_count": len(
+                    self.model_execution_policy.usage_snapshot()
+                ),
+            },
             "execution_backend": "workspace-process",
             "execution_isolation": "deployment-boundary",
             "session_revision": int(self.session.get("revision", 0)),
+            "interaction": interaction,
+            "evidence": {
+                # changed_paths is retained for report-schema compatibility. It is
+                # scoped to this ask(), while transaction_paths is the authoritative
+                # aggregate delivered or staged by a resumed transaction.
+                "changed_paths": list(task_state.changed_paths),
+                "run_changed_paths": list(task_state.changed_paths),
+                "transaction_paths": list(
+                    task_state.delivered_paths or task_state.staged_paths
+                ),
+                "validation_commands": list(task_state.validation_commands),
+                "validation_status": task_state.validation_status,
+                "initial_evidence_count": task_state.initial_evidence_count,
+                "broad_exploration_count": task_state.broad_exploration_count,
+                "targeted_read_count": task_state.targeted_read_count,
+                "evidence_hit_rate": task_state.evidence_hit_rate,
+                "semantic_backend": task_state.semantic_backend,
+                "semantic_status": task_state.semantic_status,
+            },
         }
 
     def tool_example(self, name):
@@ -857,10 +1285,14 @@ class Pico:
         toolkit.validate_tool(self.tool_context(), name, args)
 
     def tool_context(self):
+        projection = ContextProjector(self)
         return ToolContext(
             root=self.root,
             path_resolver=self.path,
             shell_env_provider=self.shell_env,
+            repository_inspector=lambda query, limit: self.inspect_repository(
+                query, limit, include_semantic=True
+            ),
             command_runner=(
                 self.transaction_context.execution_lease.runner
                 if self.transaction_context is not None
@@ -869,6 +1301,8 @@ class Pico:
             depth=self.depth,
             max_depth=self.max_depth,
             spawn_delegate=self.spawn_delegate,
+            observation_char_budget=projection.observation_char_budget,
+            source_window_lines=projection.source_window_lines,
         )
 
     def spawn_delegate(self, args):
@@ -895,6 +1329,9 @@ class Pico:
             soft_discovery_limit=self.soft_discovery_limit,
             hard_discovery_limit=self.hard_discovery_limit,
             model_execution_policy=self.model_execution_policy.mode,
+            semantic_index=self.semantic_index,
+            progress_sink=self.progress_sink,
+            package_layout=self.effective_package_layout(),
         )
         # 委派的目标是“调查”，不是“放权执行”。
         # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
@@ -914,8 +1351,14 @@ class Pico:
     def tool_search(self, args):
         return toolkit.tool_search(self.tool_context(), args)
 
+    def tool_inspect_repository(self, args):
+        return toolkit.tool_inspect_repository(self.tool_context(), args)
+
     def tool_run_shell(self, args):
         return toolkit.tool_run_shell(self.tool_context(), args)
+
+    def tool_run_verification(self, args):
+        return toolkit.tool_run_verification(self.tool_context(), args)
 
     def tool_write_file(self, args):
         return toolkit.tool_write_file(self.tool_context(), args)
@@ -1069,14 +1512,18 @@ class Pico:
         self.memory = memorylib.LayeredMemory(
             self.session["memory"],
             workspace_root=self.root,
-            durable_root=(self.workspace_state.memory if self.workspace_state else self.source_root / ".pico" / "memory"),
+            durable_root=(
+                self.workspace_state.memory
+                if self.workspace_state
+                else Path(self.session_store.root).parent / "memory"
+            ),
         )
         self.session_store.save(self.session)
 
     def path(self, raw_path):
         path = Path(raw_path)
         path = path if path.is_absolute() else self.root / path
-        resolved = path.resolve()
+        resolved = logical_path(native_path(path).resolve())
         # 所有文件类工具都被锚定在 workspace root 之下。
         # 这样既能防住 "../" 逃逸，也能防住符号链接解析后跳出仓库。
         if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):

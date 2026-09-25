@@ -3,8 +3,10 @@
 import re
 from dataclasses import dataclass
 
-from .progress import is_validation_command
-from .workspace import clip
+from .execution import bound_text_observation
+from .features import memory as memorylib
+from .interaction_policy import path_matches_patterns
+from .text_document import TextDecodingError, read_text_document
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,7 @@ def _metadata(
     diff_summary=None,
     executed=False,
     validation=False,
+    verification_purpose="",
 ):
     result = {
         "tool_status": tool_status,
@@ -38,6 +41,8 @@ def _metadata(
         "executed": bool(executed),
         "validation": bool(validation),
     }
+    if verification_purpose:
+        result["verification_purpose"] = str(verification_purpose)
     if workspace_fingerprint:
         result["workspace_fingerprint"] = workspace_fingerprint
     return result
@@ -51,16 +56,29 @@ class ToolExecutor:
         """Normalize deterministic reads to the evidence they can actually return."""
         if name == "read_file":
             path = self.agent.path(args["path"])
-            line_count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+            try:
+                line_count = len(read_text_document(path).text.splitlines())
+            except (OSError, TextDecodingError):
+                line_count = 0
             start = int(args.get("start", 1))
-            end = min(int(args.get("end", 200)), line_count)
+            end = min(
+                int(args.get("end", self.agent.tool_context().source_window_lines)),
+                line_count,
+            )
             return {"path": path.relative_to(self.agent.root).as_posix(), "start": start, "end": end}
         if name == "read_files":
             files = []
             for raw_path in args.get("paths", []):
                 path = self.agent.path(raw_path)
-                line_count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
-                files.append({"path": path.relative_to(self.agent.root).as_posix(), "start": 1, "end": min(500, line_count)})
+                try:
+                    line_count = len(read_text_document(path).text.splitlines())
+                except (OSError, TextDecodingError):
+                    line_count = 0
+                files.append({
+                    "path": path.relative_to(self.agent.root).as_posix(),
+                    "start": 1,
+                    "end": min(self.agent.tool_context().source_window_lines, line_count),
+                })
             return {"files": files}
         if name in {"list_files", "search"}:
             normalized = dict(args)
@@ -81,6 +99,22 @@ class ToolExecutor:
                     "observation_hash": evidence.observation_hash,
                     "progress_reason": evidence.reason,
                 }
+            )
+        self.agent.session["execution_ledger"] = controller.ledger.to_dict()
+        if result.metadata.get("workspace_changed"):
+            interaction = dict(getattr(self.agent, "current_interaction", {}) or {})
+            requirements = self.agent.session.setdefault("transaction_requirements", {})
+            requirements["validation_required"] = bool(
+                requirements.get("validation_required")
+                or interaction.get("validation_required")
+            )
+            requirements["test_artifact_required"] = bool(
+                requirements.get("test_artifact_required")
+                or interaction.get("test_artifact_required")
+            )
+            requirements["protected_paths"] = sorted(
+                set(requirements.get("protected_paths", ()))
+                | set(interaction.get("protected_paths", ()))
             )
         result.metadata.update(controller.metrics())
         return result
@@ -108,6 +142,45 @@ class ToolExecutor:
                     tool_error_code="unknown_tool",
                     risk_level="high",
                     read_only=False,
+                ),
+            ))
+
+        interaction = getattr(agent, "current_interaction", {}) or {}
+        if (
+            tool["risky"]
+            and interaction
+            and not interaction.get("mutation_allowed", True)
+        ):
+            return self._finalize(name, args, ToolExecutionResult(
+                content=(
+                    f"error: interaction_read_only for {name}; the current request was classified "
+                    "as explanation, review, planning, or discussion and does not authorize mutation. "
+                    "Ask the user for an explicit implementation request before changing the workspace."
+                ),
+                metadata=_metadata(
+                    "rejected",
+                    tool_error_code="interaction_read_only",
+                    security_event_type="read_only_block",
+                    risk_level="high",
+                    read_only=False,
+                ),
+            ))
+
+        if name in {"write_file", "patch_file"} and path_matches_patterns(
+            args.get("path", ""), interaction.get("protected_paths", [])
+        ):
+            return self._finalize(name, args, ToolExecutionResult(
+                content=(
+                    f"error: scope_constraint for {name}; {args.get('path', '')} is protected by "
+                    "an explicit no-modification instruction in the current request."
+                ),
+                metadata=_metadata(
+                    "rejected",
+                    tool_error_code="scope_constraint",
+                    security_event_type="scope_constraint",
+                    risk_level="high",
+                    read_only=False,
+                    affected_paths=[str(args.get("path", ""))],
                 ),
             ))
 
@@ -151,9 +224,22 @@ class ToolExecutor:
         preflight = controller.preflight(name, progress_args) if controller is not None else {"allowed": True}
         if not preflight["allowed"]:
             evidence = preflight["evidence"]
+            error_code = (
+                "broad_exploration_after_grounding"
+                if evidence.reason == "broad_exploration_after_grounding"
+                else (
+                    "material_action_required"
+                    if evidence.reason == "material_action_required"
+                    else (
+                        "typed_repository_read_required"
+                        if evidence.reason == "typed_repository_read_required"
+                        else "repeated_no_progress"
+                    )
+                )
+            )
             metadata = _metadata(
                 "rejected",
-                tool_error_code="repeated_no_progress",
+                tool_error_code=error_code,
                 risk_level="high" if tool["risky"] else "low",
                 read_only=not tool["risky"],
             )
@@ -166,9 +252,30 @@ class ToolExecutor:
             )
             return self._finalize(name, args, ToolExecutionResult(
                 content=(
-                    f"error: repeated_no_progress for {name}; this exact read-only call already "
-                    "succeeded and the workspace has not changed. Reuse the previous result or "
-                    "choose a materially different action."
+                    (
+                        f"error: broad_exploration_after_grounding for {name}; high-confidence "
+                        "repository evidence already identified candidate files. Read those "
+                        "targets before another repository-wide listing or search."
+                    )
+                    if error_code == "broad_exploration_after_grounding"
+                    else (
+                        f"error: material_action_required for {name}; the exploration budget is "
+                        "exhausted. Complete related edits with write_file/patch_file, use "
+                        "run_verification, read missing source at known targets, finalize from existing evidence, "
+                        "or identify a blocker."
+                    )
+                    if error_code == "material_action_required"
+                    else (
+                        f"error: typed_repository_read_required for {name}; use read_file, "
+                        "read_files, list_files, search, or inspect_repository so repository "
+                        "evidence remains bounded and auditable."
+                    )
+                    if error_code == "typed_repository_read_required"
+                    else (
+                        f"error: repeated_no_progress for {name}; this exact read-only call already "
+                        "succeeded and the workspace has not changed. Reuse the previous result or "
+                        "choose a materially different action."
+                    )
                 ),
                 metadata=metadata,
             ), progress_recorded=True, progress_args=progress_args)
@@ -188,7 +295,14 @@ class ToolExecutor:
         before_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
-            content = agent.redact_text(clip(tool["run"](args)))
+            raw_result = tool["run"](args)
+            # Tool-specific renderers preserve code ranges and diagnostics.
+            # This final boundary is only an emergency ceiling for legacy or
+            # delegated tools, and uses the same working-set observation
+            # budget instead of the unrelated legacy 4k head-only clip.
+            content = agent.redact_text(bound_text_observation(
+                str(raw_result), agent.tool_context().observation_char_budget
+            ))
             if agent.transaction_context is not None:
                 agent.transaction_context.workspace.enforce_storage_limit()
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
@@ -196,7 +310,7 @@ class ToolExecutor:
             workspace_changed = bool(affected_paths)
             tool_status = "ok"
             tool_error_code = ""
-            if name == "run_shell":
+            if name in {"run_shell", "run_verification"}:
                 match = re.search(r"exit_code:\s*(-?\d+)", content)
                 exit_code = int(match.group(1)) if match else 0
                 if exit_code != 0 and workspace_changed:
@@ -206,6 +320,14 @@ class ToolExecutor:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
             agent.update_memory_after_tool(name, args, content)
+            authoritative_validation = bool(
+                name == "run_verification"
+                and str(args.get("purpose", "acceptance")).lower() == "acceptance"
+            )
+            if workspace_changed and not authoritative_validation and agent.last_verification_succeeded is not None:
+                agent.last_verification_succeeded = None
+                agent.last_shell_validation_succeeded = None
+                agent.verification_stale = True
             metadata = _metadata(
                 tool_status,
                 tool_error_code=tool_error_code,
@@ -216,16 +338,43 @@ class ToolExecutor:
                 workspace_fingerprint=agent.workspace.fingerprint(),
                 diff_summary=diff_summary,
                 executed=True,
-                validation=(name == "run_shell" and is_validation_command(args.get("command", ""))),
+                validation=authoritative_validation,
+                verification_purpose=(
+                    str(args.get("purpose", "acceptance")).lower()
+                    if name == "run_verification"
+                    else ""
+                ),
             )
+            if hasattr(raw_result, "coverage"):
+                metadata["read_coverage"] = [
+                    {
+                        **item,
+                        "freshness": memorylib.file_freshness(
+                            item.get("path", ""), agent.root
+                        ),
+                    }
+                    for item in raw_result.coverage
+                ]
             agent.record_process_note_for_tool(name, metadata)
-            if name == "run_shell" and metadata["validation"]:
-                agent.last_shell_validation_succeeded = tool_status == "ok"
+            if metadata["validation"]:
+                agent.last_verification_succeeded = (
+                    tool_status == "ok" if not workspace_changed else None
+                )
+                agent.last_shell_validation_succeeded = agent.last_verification_succeeded
+                agent.verification_stale = workspace_changed
             return self._finalize(name, args, ToolExecutionResult(content=content, metadata=metadata), progress_args=progress_args)
         except Exception as exc:  # noqa: BLE001 - arbitrary tool implementations terminate at this boundary
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
+            authoritative_validation = bool(
+                name == "run_verification"
+                and str(args.get("purpose", "acceptance")).lower() == "acceptance"
+            )
+            if workspace_changed and not authoritative_validation and agent.last_verification_succeeded is not None:
+                agent.last_verification_succeeded = None
+                agent.last_shell_validation_succeeded = None
+                agent.verification_stale = True
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
             explicit_error_code = str(getattr(exc, "code", "") or "")
             error_code = explicit_error_code or ("tool_partial_success" if workspace_changed else "tool_failed")
@@ -240,11 +389,18 @@ class ToolExecutor:
                 workspace_fingerprint=agent.workspace.fingerprint(),
                 diff_summary=diff_summary,
                 executed=True,
-                validation=(name == "run_shell" and is_validation_command(args.get("command", ""))),
+                validation=authoritative_validation,
+                verification_purpose=(
+                    str(args.get("purpose", "acceptance")).lower()
+                    if name == "run_verification"
+                    else ""
+                ),
             )
             agent.record_process_note_for_tool(name, metadata)
-            if name == "run_shell" and metadata["validation"]:
+            if metadata["validation"]:
+                agent.last_verification_succeeded = False
                 agent.last_shell_validation_succeeded = False
+                agent.verification_stale = workspace_changed
             return self._finalize(
                 name,
                 args,

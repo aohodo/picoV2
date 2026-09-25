@@ -14,6 +14,9 @@ import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .path_support import native_path
+from .text_document import TextDecodingError, read_text_document
+
 MAX_TOOL_OUTPUT = 4000
 MAX_HISTORY = 12000
 # 这些文件最可能直接影响 agent 的行动方式。
@@ -24,7 +27,7 @@ IGNORED_PATH_NAMES = {".git", ".pico", "__pycache__", ".pytest_cache", ".ruff_ca
 
 def remove_workspace_tree(path):
     """Remove an owned workspace tree, including read-only Git files on Windows."""
-    path = Path(path)
+    path = native_path(path)
     if not path.exists():
         return
 
@@ -104,7 +107,10 @@ class WorkspaceContext:
                 key = str(path.relative_to(repo_root))
                 if key in docs:
                     continue
-                docs[key] = clip(path.read_text(encoding="utf-8", errors="replace"), 1200)
+                try:
+                    docs[key] = clip(read_text_document(path).text, 1200)
+                except (OSError, TextDecodingError):
+                    continue
 
         default_branch = git(
             ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], "origin/main"

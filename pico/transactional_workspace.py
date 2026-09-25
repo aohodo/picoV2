@@ -10,10 +10,14 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .path_support import native_path
 from .workspace import IGNORED_PATH_NAMES, remove_workspace_tree
 
 TRANSACTION_SCHEMA_VERSION = "tsw-v1"
 TERMINAL_STATES = {"COMMITTED", "DISCARDED"}
+REPAIRABLE_VERIFICATION_FAILURES = {
+    "verification_failed", "verification_required", "verification_stale",
+}
 COPY_EXCLUDES = set(IGNORED_PATH_NAMES) | {
     ".pico", ".venv", "venv", "node_modules", "target", "build", "dist",
     ".ssh", ".aws", ".azure", ".docker", ".gnupg", ".netrc", "_netrc", ".npmrc", ".pypirc",
@@ -26,7 +30,7 @@ def _now():
 
 def _hash_file(path):
     digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
+    with native_path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -42,9 +46,10 @@ def _safe_relative(value):
     return normalized
 
 
-def _manifest(root, excludes=(), includes=None):
-    root = Path(root)
+def _manifest(root, excludes=(), includes=None, excluded_roots=()):
+    root = native_path(root)
     excluded = set(excludes)
+    excluded_roots = tuple(native_path(path).resolve() for path in excluded_roots)
     result = {}
     if not root.exists():
         return result
@@ -55,12 +60,19 @@ def _manifest(root, excludes=(), includes=None):
     for path in paths:
         if not path.exists() and not path.is_symlink():
             continue
+        resolved = native_path(path).resolve()
+        if any(resolved == item or item in resolved.parents for item in excluded_roots):
+            continue
         relative = path.relative_to(root)
         if any(part in excluded for part in relative.parts):
             continue
         key = relative.as_posix()
         if path.is_symlink():
-            result[key] = {"type": "symlink", "target": os.readlink(path)}
+            result[key] = {
+                "type": "symlink",
+                "target": os.readlink(path),
+                "is_directory": path.is_dir(),
+            }
         elif path.is_file():
             stat = path.stat()
             result[key] = {
@@ -76,7 +88,7 @@ def _git_view_paths(root):
     """Return the Git working view: tracked plus non-ignored untracked files."""
     try:
         result = subprocess.run(
-            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            ["git", "-c", "core.longpaths=true", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
             cwd=root, capture_output=True, check=True, timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -107,7 +119,7 @@ def _is_git_workspace(root):
 def _git_user_owned(root):
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            ["git", "-c", "core.longpaths=true", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=root, capture_output=True, check=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
@@ -124,13 +136,28 @@ def _git_user_owned(root):
     return owned
 
 
-def _copy_view(source, destination, includes=None):
-    source = Path(source)
-    destination = Path(destination)
+def _copy_view(source, destination, includes=None, excluded_roots=()):
+    source = native_path(source)
+    destination = native_path(destination)
+    excluded_roots = tuple(native_path(path).resolve() for path in excluded_roots)
+
+    def excluded(path):
+        resolved = native_path(path).resolve()
+        return any(resolved == item or item in resolved.parents for item in excluded_roots)
+
+    def copy_ignore(current, names):
+        ignored = set(shutil.ignore_patterns(*COPY_EXCLUDES)(current, names))
+        for name in names:
+            if excluded(Path(current) / name):
+                ignored.add(name)
+        return ignored
+
     destination.mkdir(parents=True, exist_ok=True)
     if includes is not None:
         for relative in sorted(includes):
             entry = source / relative
+            if excluded(entry):
+                continue
             if not entry.exists() and not entry.is_symlink():
                 continue
             target = destination / relative
@@ -144,7 +171,7 @@ def _copy_view(source, destination, includes=None):
                 shutil.copy2(entry, target)
         return
     for entry in source.iterdir():
-        if entry.name in COPY_EXCLUDES or entry.name == ".git":
+        if entry.name in COPY_EXCLUDES or entry.name == ".git" or excluded(entry):
             continue
         target = destination / entry.name
         if entry.is_symlink():
@@ -155,7 +182,7 @@ def _copy_view(source, destination, includes=None):
         elif entry.is_dir():
             shutil.copytree(
                 entry, target, symlinks=True,
-                ignore=shutil.ignore_patterns(*COPY_EXCLUDES), dirs_exist_ok=True,
+                ignore=copy_ignore, dirs_exist_ok=True,
             )
         else:
             shutil.copy2(entry, target)
@@ -164,8 +191,13 @@ def _copy_view(source, destination, includes=None):
 class WorkspaceBackend:
     name = "copy"
 
-    def create(self, source_root, execution_root, includes=None):
-        _copy_view(source_root, execution_root, includes=includes)
+    def create(self, source_root, execution_root, includes=None, excluded_roots=()):
+        _copy_view(
+            source_root,
+            execution_root,
+            includes=includes,
+            excluded_roots=excluded_roots,
+        )
 
 
 class CopyWorkspaceBackend(WorkspaceBackend):
@@ -175,14 +207,19 @@ class CopyWorkspaceBackend(WorkspaceBackend):
 class GitShadowBackend(WorkspaceBackend):
     name = "git-shadow"
 
-    def create(self, source_root, execution_root, includes=None):
-        _copy_view(source_root, execution_root, includes=includes)
+    def create(self, source_root, execution_root, includes=None, excluded_roots=()):
+        _copy_view(
+            source_root,
+            execution_root,
+            includes=includes,
+            excluded_roots=excluded_roots,
+        )
 
 
 class TransactionalWorkspace:
     def __init__(
         self, source_root, transaction_root, secret_boundary=None, transaction_id=None,
-        storage_limit_bytes=10 * 1024 ** 3,
+        storage_limit_bytes=10 * 1024 ** 3, source_excludes=(),
     ):
         self.source_root = Path(source_root).resolve()
         self.transaction_id = transaction_id or "txn_" + uuid.uuid4().hex[:12]
@@ -191,6 +228,14 @@ class TransactionalWorkspace:
         self.recovery_root = self.transaction_root / "recovery"
         self.secret_boundary = secret_boundary
         self.storage_limit_bytes = int(storage_limit_bytes)
+        self.source_excludes = {Path(path).resolve() for path in source_excludes}
+        transaction_parent = Path(transaction_root).resolve()
+        try:
+            transaction_parent.relative_to(self.source_root)
+        except ValueError:
+            pass
+        else:
+            self.source_excludes.add(transaction_parent)
         self.transaction_path = self.transaction_root / "transaction.json"
         self.baseline_path = self.transaction_root / "baseline.json"
         self.staged_path = self.transaction_root / "staged-manifest.json"
@@ -217,10 +262,73 @@ class TransactionalWorkspace:
         else:
             instance.baseline = baseline_data
             instance.execution_baseline = baseline_data
-        if instance.state in {"ACTIVE", "COMMITTING"}:
-            instance.state = "RECOVERY_REQUIRED" if instance.recovery_required() else "INTERRUPTED"
+        journal_state = instance.journal_state()
+        uncertain_journal = journal_state in {"COMMITTING", "RECOVERY_REQUIRED"} or (
+            journal_state == "COMMIT_FAILED"
+            and instance.state not in {"COMMIT_FAILED", "RECOVERY_REQUIRED"}
+        )
+        if journal_state == "COMMITTED":
+            instance.state = "COMMITTED"
+            instance._persist(recovered_from=data["state"], commit_reconciled=True)
+            instance.cleanup_terminal_artifacts()
+        elif uncertain_journal:
+            instance.state = "RECOVERY_REQUIRED"
             instance._persist(recovered_from=data["state"])
+        elif instance.state == "COMMITTING":
+            # COMMITTING without a conclusive journal is still an uncertain
+            # source boundary and must never be resumed as ordinary work.
+            instance.state = "RECOVERY_REQUIRED"
+            instance._persist(recovered_from=data["state"])
+        elif instance.state == "ACTIVE":
+            instance.state = "INTERRUPTED"
+            instance._persist(recovered_from=data["state"])
+        elif instance.state == "CONFLICTED":
+            conflicts = data.get("conflicts", [])
+            if conflicts and all(
+                isinstance(item, dict)
+                and item.get("reason") in REPAIRABLE_VERIFICATION_FAILURES
+                for item in conflicts
+            ):
+                instance.state = "INTERRUPTED"
+                instance._persist(
+                    recovered_from=data["state"],
+                    interrupt_reason="validation_failed",
+                    conflicts=conflicts,
+                )
         return instance
+
+    def journal_state(self):
+        if not self.journal_path.exists():
+            return ""
+        try:
+            data = json.loads(self.journal_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return "RECOVERY_REQUIRED"
+        return str(data.get("state", ""))
+
+    def committed_changes(self):
+        """Return the journaled delivery set after an authoritative commit.
+
+        The execution tree is intentionally destroyed after commit, so crash
+        recovery must use the commit journal rather than attempting to diff a
+        Shadow workspace that no longer exists.
+        """
+        if self.journal_state() != "COMMITTED":
+            return []
+        try:
+            data = json.loads(self.journal_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return []
+        changes = []
+        for item in data.get("operations", []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                path = _safe_relative(item.get("path", ""))
+            except ValueError:
+                continue
+            changes.append({**item, "path": path})
+        return changes
 
     def _write_json(self, path, payload):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,11 +365,19 @@ class TransactionalWorkspace:
             is_git = _is_git_workspace(self.source_root)
             view_paths = _git_view_paths(self.source_root) if is_git else None
             self.baseline = _manifest(
-                self.source_root, COPY_EXCLUDES | {".git"}, includes=view_paths
+                self.source_root,
+                COPY_EXCLUDES | {".git"},
+                includes=view_paths,
+                excluded_roots=self.source_excludes,
             )
             self.user_owned_paths = _git_user_owned(self.source_root) if is_git else set()
             backend = GitShadowBackend() if is_git else CopyWorkspaceBackend()
-            backend.create(self.source_root, self.execution_root, includes=view_paths)
+            backend.create(
+                self.source_root,
+                self.execution_root,
+                includes=view_paths,
+                excluded_roots=self.source_excludes,
+            )
             self.backend_name = backend.name
             self._scrub_registered_secrets()
             if is_git:
@@ -284,6 +400,7 @@ class TransactionalWorkspace:
     def _initialize_shadow_git(self):
         commands = (
             ["git", "init"],
+            ["git", "config", "core.longpaths", "true"],
             ["git", "config", "user.email", "pico@localhost.invalid"],
             ["git", "config", "user.name", "Pico Shadow"],
             ["git", "add", "--all"],
@@ -304,7 +421,8 @@ class TransactionalWorkspace:
     def _scrub_registered_secrets(self):
         if not self.secret_boundary or not self.secret_boundary.registered_values:
             return
-        for path in self.execution_root.rglob("*"):
+        execution_root = native_path(self.execution_root)
+        for path in execution_root.rglob("*"):
             if not path.is_file() or path.is_symlink() or ".git" in path.parts:
                 continue
             try:
@@ -315,11 +433,11 @@ class TransactionalWorkspace:
             sanitized = self.secret_boundary.sanitize_text(text)
             if sanitized != text:
                 path.write_text(sanitized, encoding="utf-8")
-                self.protected_paths.add(path.relative_to(self.execution_root).as_posix())
+                self.protected_paths.add(path.relative_to(execution_root).as_posix())
 
     def _enforce_storage_limit(self):
         size = 0
-        for path in self.execution_root.rglob("*"):
+        for path in native_path(self.execution_root).rglob("*"):
             if path.is_file() and not path.is_symlink():
                 size += path.stat().st_size
                 if size > self.storage_limit_bytes:
@@ -355,9 +473,19 @@ class TransactionalWorkspace:
         return changes
 
     def interrupt(self, reason="interrupted"):
-        if self.state not in TERMINAL_STATES:
+        if self.state in {"ACTIVE", "STAGED", "VALIDATING", "INTERRUPTED"}:
             self.state = "INTERRUPTED"
             self._persist(interrupt_reason=reason)
+
+    def resume_editing(self):
+        """Reopen a preserved shadow for a new repair turn."""
+        if self.state not in {"ACTIVE", "INTERRUPTED"}:
+            raise RuntimeError(f"transaction cannot resume editing from {self.state}")
+        if self.state != "ACTIVE":
+            previous = self.state
+            self.state = "ACTIVE"
+            self._persist(resumed_from=previous)
+        return self
 
     def validate_commit(self):
         if self.state not in {"STAGED", "VALIDATING", "READY_FOR_REVIEW"}:
@@ -365,6 +493,11 @@ class TransactionalWorkspace:
         self.state = "VALIDATING"
         self._persist()
         changes = self.diff()
+        staged = json.loads(self.staged_path.read_text(encoding="utf-8"))
+        if changes != staged.get("changes"):
+            # Review and verification describe the staged change set. Reusing
+            # their authorization after a shadow edit would deliver other code.
+            return self.block_validation("staged_workspace_changed")
         conflicts = []
         current_paths = _git_view_paths(self.source_root) if self.backend_name == "git-shadow" else None
         current = _manifest(
@@ -392,12 +525,15 @@ class TransactionalWorkspace:
         self._persist(change_count=len(changes))
         return []
 
-    def block_validation(self, reason):
+    def block_validation(self, reason, paths=()):
         if self.state not in {"STAGED", "VALIDATING", "READY_FOR_REVIEW"}:
             raise RuntimeError(f"transaction cannot block validation from {self.state}")
-        conflicts = [{"path": "", "reason": str(reason)}]
-        self.state = "CONFLICTED"
-        self._persist(conflicts=conflicts)
+        paths = [str(path) for path in paths if str(path)] or [""]
+        conflicts = [{"path": path, "reason": str(reason)} for path in paths]
+        self.state = (
+            "INTERRUPTED" if reason in REPAIRABLE_VERIFICATION_FAILURES else "CONFLICTED"
+        )
+        self._persist(conflicts=conflicts, interrupt_reason=str(reason))
         return conflicts
 
     def commit(self):
@@ -416,7 +552,8 @@ class TransactionalWorkspace:
             "created_at": _now(),
         }
         self._write_json(self.journal_path, journal)
-        self.recovery_root.mkdir(parents=True, exist_ok=True)
+        self._persist(commit_started_at=_now(), change_count=len(changes))
+        native_path(self.recovery_root).mkdir(parents=True, exist_ok=True)
         try:
             for change in changes:
                 self._apply_change(change)
@@ -434,28 +571,42 @@ class TransactionalWorkspace:
         self._write_json(self.journal_path, journal)
         self.state = "COMMITTED"
         self._persist(committed_at=_now(), change_count=len(changes))
-        shutil.rmtree(self.recovery_root, ignore_errors=True)
+        self.cleanup_terminal_artifacts(change_count=len(changes))
+        return changes
+
+    def cleanup_terminal_artifacts(self, change_count=None):
+        if self.state not in TERMINAL_STATES:
+            return False
+        errors = []
+        try:
+            shutil.rmtree(self.recovery_root, ignore_errors=False)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            errors.append(str(exc))
         try:
             remove_workspace_tree(self.execution_root)
         except OSError as exc:
-            self._persist(
-                committed_at=_now(),
-                change_count=len(changes),
-                shadow_cleanup_pending=True,
-                shadow_cleanup_error=str(exc),
-            )
-        return changes
+            errors.append(str(exc))
+        if errors:
+            extra = {
+                "shadow_cleanup_pending": True,
+                "shadow_cleanup_error": "; ".join(errors),
+            }
+            if change_count is not None:
+                extra["change_count"] = int(change_count)
+            self._persist(**extra)
+            return False
+        return True
 
     def _apply_change(self, change):
         relative = _safe_relative(change["path"])
-        source = self.source_root / relative
-        staged = self.execution_root / relative
-        recovery = self.recovery_root / relative
+        source = native_path(self.source_root / relative)
+        staged = native_path(self.execution_root / relative)
+        recovery = native_path(self.recovery_root / relative)
         if source.exists() or source.is_symlink():
             recovery.parent.mkdir(parents=True, exist_ok=True)
-            if source.is_symlink():
-                recovery.write_text(json.dumps({"symlink": os.readlink(source)}), encoding="utf-8")
-            else:
+            if not source.is_symlink():
                 shutil.copy2(source, recovery)
         if change["operation"] == "delete":
             source.unlink()
@@ -477,12 +628,22 @@ class TransactionalWorkspace:
         for change in reversed(changes):
             if change["path"] not in completed:
                 continue
-            target = self.source_root / change["path"]
-            recovery = self.recovery_root / change["path"]
+            target = native_path(self.source_root / change["path"])
+            recovery = native_path(self.recovery_root / change["path"])
             try:
                 if change["before"] is None:
                     if target.exists() or target.is_symlink():
                         target.unlink()
+                elif change["before"].get("type") == "symlink":
+                    if target.exists() or target.is_symlink():
+                        target.unlink()
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(
+                        change["before"]["target"],
+                        target_is_directory=bool(
+                            change["before"].get("is_directory", False)
+                        ),
+                    )
                 elif recovery.exists():
                     target.parent.mkdir(parents=True, exist_ok=True)
                     recovery.replace(target)
@@ -490,14 +651,15 @@ class TransactionalWorkspace:
                 self.state = "RECOVERY_REQUIRED"
 
     def discard(self):
-        if self.state in {"COMMITTING", "COMMITTED"}:
+        if self.state in {"COMMITTING", "COMMITTED", "RECOVERY_REQUIRED"}:
             raise RuntimeError(f"transaction cannot discard from {self.state}")
         self.state = "DISCARDED"
         self._persist(discarded_at=_now())
         remove_workspace_tree(self.execution_root)
 
     def recovery_required(self):
-        if not self.journal_path.exists():
-            return False
-        data = json.loads(self.journal_path.read_text(encoding="utf-8"))
-        return data.get("state") in {"COMMITTING", "COMMIT_FAILED", "RECOVERY_REQUIRED"}
+        return self.journal_state() in {
+            "COMMITTING",
+            "COMMIT_FAILED",
+            "RECOVERY_REQUIRED",
+        }

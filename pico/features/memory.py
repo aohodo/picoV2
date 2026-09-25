@@ -6,6 +6,7 @@ session history 负责保存完整事件流；这个模块只保存更小的一�
 """
 
 import hashlib
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,8 @@ from ..workspace import clip, now
 WORKING_FILE_LIMIT = 8
 EPISODIC_NOTE_LIMIT = 12
 FILE_SUMMARY_LIMIT = 6
+NOTE_TAG_LIMIT = 16
+NOTE_TAG_CHAR_LIMIT = 120
 
 DURABLE_TOPIC_DEFAULTS = {
     "project-conventions": {
@@ -61,6 +64,7 @@ class DurableMemoryStore:
         self.root = Path(root)
         self.index_path = self.root / "MEMORY.md"
         self.topics_dir = self.root / "topics"
+        self.records_path = self.root / "records.json"
 
     def topic_slugs(self):
         return [topic["topic"] for topic in self.load_index()]
@@ -94,7 +98,7 @@ class DurableMemoryStore:
                 current["tags"] = [tag.strip() for tag in tags_match.group(1).split(",") if tag.strip()]
         return topics
 
-    def load_topic_notes(self, topic):
+    def _load_legacy_topic_notes(self, topic):
         path = self.topics_dir / f"{topic}.md"
         if not path.exists():
             return []
@@ -123,6 +127,51 @@ class DurableMemoryStore:
                 )
         return notes
 
+    def load_records(self):
+        if self.records_path.exists():
+            try:
+                data = json.loads(self.records_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return []
+            return [dict(item) for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+        records = []
+        for topic in self.load_index():
+            slug = topic["topic"]
+            for note in self._load_legacy_topic_notes(slug):
+                text = note["text"]
+                created_at = note.get("created_at") or now()
+                records.append(
+                    {
+                        "id": hashlib.sha256(f"{slug}:{created_at}:{text}".encode()).hexdigest()[:16],
+                        "topic": slug,
+                        "subject": self._subject_key(text) or " ".join(sorted(_tokenize(text))[:8]),
+                        "text": text,
+                        "source": slug,
+                        "created_at": created_at,
+                        "status": "active",
+                        "supersedes": [],
+                    }
+                )
+        return records
+
+    def load_topic_notes(self, topic):
+        if not self.records_path.exists():
+            return self._load_legacy_topic_notes(topic)
+        meta = DURABLE_TOPIC_DEFAULTS.get(topic, {})
+        return [
+            {
+                "text": record.get("text", ""),
+                "tags": list(meta.get("tags", [])),
+                "source": record.get("source", topic),
+                "created_at": record.get("created_at", now()),
+                "kind": "durable",
+                "status": record.get("status", "active"),
+            }
+            for record in self.load_records()
+            if record.get("topic") == topic and record.get("status", "active") in {"active", "ambiguous"}
+        ]
+
     @staticmethod
     def _subject_key(text):
         text = str(text).strip()
@@ -131,8 +180,13 @@ class DurableMemoryStore:
             r"^(.+?)\s+are\s+.+$",
             r"^(.+?)\s+uses?\s+.+$",
             r"^(.+?)\s+should\s+.+$",
+            r"^(.+?)\s+must\s+.+$",
+            r"^(.+?)\s+prefers?\s+.+$",
             r"^(.+?)是.+$",
             r"^(.+?)使用.+$",
+            r"^(.+?)采用.+$",
+            r"^(.+?)应该.+$",
+            r"^(.+?)必须.+$",
         )
         for pattern in patterns:
             match = re.match(pattern, text, re.IGNORECASE)
@@ -144,8 +198,19 @@ class DurableMemoryStore:
     def retrieval_candidates(self, query, limit=3):
         query_tokens = _tokenize(query)
         ranked = []
-        for topic in self.load_index():
-            notes = self.load_topic_notes(topic["topic"])
+        topics = {topic["topic"]: topic for topic in self.load_index()}
+        for record in self.load_records():
+            if record.get("status", "active") not in {"active", "ambiguous"}:
+                continue
+            topic = topics.get(record.get("topic"), {})
+            notes = [{
+                "text": record.get("text", ""),
+                "tags": list(DURABLE_TOPIC_DEFAULTS.get(record.get("topic"), {}).get("tags", [])),
+                "source": record.get("source", record.get("topic", "")),
+                "created_at": record.get("created_at", ""),
+                "kind": "durable",
+                "status": record.get("status", "active"),
+            }]
             for note in notes:
                 note_tags = {tag.lower() for tag in note.get("tags", [])}
                 note_tokens = _tokenize(note.get("text", "")) | _tokenize(topic.get("title", "")) | note_tags
@@ -185,14 +250,30 @@ class DurableMemoryStore:
             lines.append(f"- {note}")
         (self.topics_dir / f"{topic}.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
+    def _write_records(self, records):
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.records_path.write_text(
+            json.dumps(records, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
     def promote(self, promotions):
         if not promotions:
             return [], []
         topics = {topic["topic"]: topic for topic in self.load_index()}
-        topic_notes = {slug: [note["text"] for note in self.load_topic_notes(slug)] for slug in topics}
+        records = self.load_records()
         results = []
         superseded = []
-        for topic, note_text in promotions:
+        for promotion in promotions:
+            if isinstance(promotion, dict):
+                topic = str(promotion["topic"])
+                note_text = str(promotion["text"])
+                subject = str(promotion.get("subject") or self._subject_key(note_text) or " ".join(sorted(_tokenize(note_text))[:8]))
+                source = str(promotion.get("source") or "user_explicit")
+            else:
+                topic, note_text = promotion
+                subject = self._subject_key(note_text) or " ".join(sorted(_tokenize(note_text))[:8])
+                source = "user_explicit"
             meta = DURABLE_TOPIC_DEFAULTS[topic]
             topics.setdefault(
                 topic,
@@ -203,23 +284,43 @@ class DurableMemoryStore:
                     "tags": list(meta["tags"]),
                 },
             )
-            existing = topic_notes.setdefault(topic, [])
-            if note_text in existing:
+            active = [
+                record for record in records
+                if record.get("topic") == topic and record.get("status", "active") == "active"
+            ]
+            if any(record.get("text") == note_text for record in active):
                 continue
-            new_subject = self._subject_key(note_text)
-            replaced = False
-            if new_subject:
-                for index, old_text in enumerate(list(existing)):
-                    if self._subject_key(old_text) == new_subject:
-                        superseded.append(f"{topic}: {old_text} -> {note_text}")
-                        existing[index] = note_text
-                        replaced = True
-                        break
-            if not replaced:
-                existing.append(note_text)
+            replaced_ids = []
+            for old_record in active:
+                if subject and old_record.get("subject") == subject:
+                    old_record["status"] = "superseded"
+                    old_record["superseded_at"] = now()
+                    replaced_ids.append(old_record.get("id", ""))
+                    superseded.append(f"{topic}: {old_record.get('text', '')} -> {note_text}")
+            created_at = now()
+            record_id = hashlib.sha256(
+                f"{topic}:{subject}:{created_at}:{note_text}".encode()
+            ).hexdigest()[:16]
+            records.append(
+                {
+                    "id": record_id,
+                    "topic": topic,
+                    "subject": subject,
+                    "text": note_text,
+                    "source": source,
+                    "created_at": created_at,
+                    "status": "active",
+                    "supersedes": [item for item in replaced_ids if item],
+                }
+            )
             results.append(f"{topic}: {note_text}")
         self._write_index([topics[slug] for slug in sorted(topics)])
-        for topic, notes in topic_notes.items():
+        self._write_records(records)
+        for topic in topics:
+            notes = [
+                record.get("text", "") for record in records
+                if record.get("topic") == topic and record.get("status", "active") in {"active", "ambiguous"}
+            ]
             self._write_topic(topic, notes)
         return results, superseded
 
@@ -323,7 +424,11 @@ def _normalize_note(note, index):
     kind = str(note.get("kind", "episodic")).strip() or "episodic"
     return {
         "text": text,
-        "tags": _dedupe_preserve_order(tags),
+        "tags": _dedupe_preserve_order(
+            clip(str(tag).strip(), NOTE_TAG_CHAR_LIMIT)
+            for tag in tags
+            if str(tag).strip()
+        )[-NOTE_TAG_LIMIT:],
         "source": source,
         "created_at": created_at,
         "note_index": note_index,
@@ -345,6 +450,8 @@ def normalize_memory_state(state, workspace_root=None):
     working.setdefault("task_summary", "")
     working.setdefault("recent_files", [])
     working["task_summary"] = clip(str(working.get("task_summary", "")).strip(), 300)
+    working["work_note"] = clip(str(working.get("work_note", "")).strip(), 500)
+    working["work_scope"] = str(working.get("work_scope", ""))
     working["recent_files"] = _dedupe_preserve_order(
         [
             canonicalize_path(path, workspace_root)
@@ -407,7 +514,18 @@ def normalize_memory_state(state, workspace_root=None):
             "created_at": created_at,
             "freshness": freshness,
         }
-    state["file_summaries"] = normalized_file_summaries
+    recent_paths = [
+        path
+        for path in working["recent_files"]
+        if path in normalized_file_summaries
+    ]
+    other_paths = [
+        path for path in normalized_file_summaries if path not in recent_paths
+    ]
+    retained_paths = (other_paths + recent_paths)[-FILE_SUMMARY_LIMIT:]
+    state["file_summaries"] = {
+        path: normalized_file_summaries[path] for path in retained_paths
+    }
 
     next_note_index = state.get("next_note_index")
     if not isinstance(next_note_index, int) or next_note_index < 0:
@@ -450,8 +568,12 @@ def append_note(state, text, tags=(), source="", created_at=None, workspace_root
         return state
 
     normalized_tags = _dedupe_preserve_order(
-        [str(tag).strip() for tag in _ensure_list(tags) if str(tag).strip()]
-    )
+        [
+            clip(str(tag).strip(), NOTE_TAG_CHAR_LIMIT)
+            for tag in _ensure_list(tags)
+            if str(tag).strip()
+        ]
+    )[-NOTE_TAG_LIMIT:]
     note = {
         "text": text,
         "tags": normalized_tags,
@@ -487,6 +609,12 @@ def invalidate_file_summary(state, path, workspace_root=None):
     if not path:
         return state
     state["file_summaries"].pop(path, None)
+    state["episodic_notes"] = [
+        item
+        for item in state["episodic_notes"]
+        if item.get("source") != path and path not in item.get("tags", [])
+    ]
+    state["notes"] = [item["text"] for item in state["episodic_notes"]]
     return state
 
 
@@ -499,6 +627,12 @@ def invalidate_stale_file_summaries(state, workspace_root=None):
             continue
         invalidated.append(path)
         state["file_summaries"].pop(path, None)
+        state["episodic_notes"] = [
+            item
+            for item in state["episodic_notes"]
+            if item.get("source") != path and path not in item.get("tags", [])
+        ]
+    state["notes"] = [item["text"] for item in state["episodic_notes"]]
     return state, invalidated
 
 
@@ -565,6 +699,7 @@ def render_memory_text(state, workspace_root=None):
     lines = [
         "Memory:",
         f"- task: {state['working']['task_summary'] or '-'}",
+        f"- tentative work note (model-authored, not verified; current evidence and request take precedence): {state['working']['work_note'] or '-'}",
         f"- recent_files: {', '.join(state['working']['recent_files']) or '-'}",
     ]
 
@@ -618,6 +753,18 @@ class LayeredMemory:
 
     def set_task_summary(self, summary):
         self.state = set_task_summary(self.state, summary, self.workspace_root)
+        return self
+
+    def set_work_scope(self, scope):
+        self.state = normalize_memory_state(self.state, self.workspace_root)
+        if self.state["working"]["work_scope"] != str(scope):
+            self.state["working"]["work_note"] = ""
+        self.state["working"]["work_scope"] = str(scope)
+        return self
+
+    def set_work_note(self, text):
+        self.state = normalize_memory_state(self.state, self.workspace_root)
+        self.state["working"]["work_note"] = clip(str(text).strip(), 500)
         return self
 
     def remember_file(self, path):
