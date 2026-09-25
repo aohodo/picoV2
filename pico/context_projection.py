@@ -430,8 +430,18 @@ class ContextProjector:
         else:
             write_rule = "Mutation tools execute only after interactive approval and remain isolated in the Shadow workspace."
         shell_profile = self.agent.execution_profile_view()
+        available_commands = ", ".join(
+            shell_profile.get("available_commands") or []
+        ) or "none discovered"
         shell_rule = (
-            f"Shell commands use the {shell_profile.get('dialect', 'unavailable')} dialect. "
+            "Execution environment (authoritative runtime facts): "
+            f"host OS={shell_profile.get('host_os', 'unknown')}; "
+            f"shell dialect={shell_profile.get('dialect', 'unavailable')}; "
+            f"path style={shell_profile.get('path_style', 'unknown')}; "
+            f"Python command={shell_profile.get('python_command', 'python')}; "
+            f"discovered build/runtime commands={available_commands}. "
+            "Do not assume an unlisted language or build executable such as python3 exists. "
+            "Use repository-relative paths in tool calls. "
             "Use run_verification with argv elements for tests and builds; its direct process exit status is authoritative. "
         )
         return (

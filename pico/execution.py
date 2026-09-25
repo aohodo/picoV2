@@ -6,6 +6,7 @@ environment; it does not claim to be a host security sandbox.
 """
 
 import os
+import platform
 import re
 import shutil
 import signal
@@ -68,9 +69,22 @@ class ExecutionProfile:
     argv_prefix: tuple
     dialect: str
     executable: str
+    host_os: str = ""
+    path_style: str = ""
+    python_command: str = "python"
+    python_executable: str = ""
+    available_commands: tuple = ()
 
     def view(self):
-        return {"dialect": self.dialect, "executable": self.executable}
+        return {
+            "dialect": self.dialect,
+            "executable": self.executable,
+            "host_os": self.host_os,
+            "path_style": self.path_style,
+            "python_command": self.python_command,
+            "python_executable": self.python_executable,
+            "available_commands": list(self.available_commands),
+        }
 
 
 class WorkspaceCommandRunner:
@@ -88,7 +102,22 @@ class WorkspaceCommandRunner:
         self._profile_error = ""
         try:
             prefix, dialect = self.shell()
-            self._profile = ExecutionProfile(tuple(prefix), dialect, str(prefix[0]))
+            known_commands = (
+                "git", "python", "uv", "java", "mvn", "node", "npm", "docker"
+            )
+            available_commands = tuple(
+                name for name in known_commands if shutil.which(name)
+            )
+            self._profile = ExecutionProfile(
+                tuple(prefix),
+                dialect,
+                str(prefix[0]),
+                host_os=platform.system() or os.name,
+                path_style="windows" if os.name == "nt" else "posix",
+                python_command="python",
+                python_executable=str(Path(sys.executable).resolve()),
+                available_commands=available_commands,
+            )
         except ExecutionRuntimeUnavailable as exc:
             self._profile_error = str(exc)
 

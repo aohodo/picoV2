@@ -744,11 +744,15 @@ class Pico:
     def build_tools(self):
         tools = toolkit.build_tool_registry(self.tool_context())
         if "run_shell" in tools:
-            dialect = self.execution_profile_view().get("dialect", "unavailable")
+            profile = self.execution_profile_view()
+            dialect = profile.get("dialect", "unavailable")
+            host_os = profile.get("host_os", "unknown")
+            python_command = profile.get("python_command", "python")
             tools["run_shell"]["description"] = (
-                f"Run a non-inspection {dialect} command in the transaction workspace. "
+                f"Run a non-inspection {dialect} command on {host_os} in the transaction workspace. "
+                f"Use {python_command} for Python; do not assume python3 exists. "
                 "Use typed repository tools for listing, searching, and source reads; "
-                "use `python -m pytest` for Python validation."
+                f"use `{python_command} -m pytest` for Python validation."
             )
         if "run_verification" in tools:
             tools["run_verification"]["description"] = (
