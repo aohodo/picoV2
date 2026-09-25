@@ -6,10 +6,17 @@
 
 import difflib
 import re
+from copy import deepcopy
 from functools import partial
 
 from .execution import format_shell_result
 from .mutation_observation import render_mutation_observation
+from .patch_set import (
+    adapt_edit_to_document,
+    commit_patch_set,
+    plan_patch_set,
+    render_patch_set_observation,
+)
 from .path_support import logical_path, native_path
 from .progress import is_repository_read_argv, is_repository_read_command
 from .read_observation import DEFAULT_SOURCE_WINDOW_LINES, render_reads
@@ -88,6 +95,31 @@ BASE_TOOL_SPECS = {
             "Do not reread solely to confirm the edit."
         ),
     },
+    "apply_patch": {
+        "schema": {
+            "edits": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "old_text": {"type": "string"},
+                        "new_text": {"type": "string"},
+                    },
+                    "required": ["path", "old_text", "new_text"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "risky": True,
+        "description": (
+            "Apply several exact replacements across one or more files as one work unit. "
+            "Every old_text is matched against the same pre-edit snapshot; if any edit is "
+            "missing, ambiguous, or overlapping, no file is changed. Prefer this for related "
+            "multi-location edits."
+        ),
+    },
 }
 
 
@@ -123,6 +155,12 @@ TOOL_EXAMPLES = {
     ),
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
+    "apply_patch": (
+        '<tool>{"name":"apply_patch","args":{"edits":['
+        '{"path":"service.py","old_text":"return 1","new_text":"return 2"},'
+        '{"path":"test_service.py","old_text":"== 1","new_text":"== 2"}'
+        ']}}</tool>'
+    ),
     "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
 }
 
@@ -148,6 +186,10 @@ def native_tool_definitions(tools):
         properties = {}
         required = []
         for field, type_spec in tool["schema"].items():
+            if isinstance(type_spec, dict):
+                properties[field] = deepcopy(type_spec)
+                required.append(field)
+                continue
             spec = str(type_spec)
             base = spec.split("=", 1)[0]
             if base == "int":
@@ -289,6 +331,29 @@ def validate_tool(context, name, args):
             raise ValueError("old_text must not be empty")
         if "new_text" not in args:
             raise ValueError("missing new_text")
+        return
+
+    if name == "apply_patch":
+        edits = args.get("edits")
+        if not isinstance(edits, list) or not edits:
+            raise ValueError("edits must be a non-empty list")
+        for index, edit in enumerate(edits, start=1):
+            if not isinstance(edit, dict):
+                raise TypeError(f"edit {index} must be an object")
+            unknown = set(edit) - {"path", "old_text", "new_text"}
+            if unknown:
+                raise ValueError(
+                    f"edit {index} has unknown fields: {', '.join(sorted(unknown))}"
+                )
+            if not isinstance(edit.get("path"), str) or not edit["path"].strip():
+                raise ValueError(f"edit {index} path must be a non-empty string")
+            path = context.path(edit["path"])
+            if not native_path(path).is_file():
+                raise ValueError(f"edit {index} path is not a file: {edit['path']}")
+            if not isinstance(edit.get("old_text"), str) or not edit["old_text"]:
+                raise ValueError(f"edit {index} old_text must be a non-empty string")
+            if "new_text" not in edit or not isinstance(edit["new_text"], str):
+                raise ValueError(f"edit {index} new_text must be a string")
         return
 
     if name == "delegate":
@@ -440,6 +505,9 @@ def tool_patch_file(context, args):
         raise ValueError("missing new_text")
     document = read_text_document(path)
     text = document.text
+    old_text, new_text = adapt_edit_to_document(
+        text, old_text, str(args["new_text"])
+    )
     count = text.count(old_text)
     if count != 1:
         lines = text.splitlines()
@@ -479,7 +547,7 @@ def tool_patch_file(context, args):
             "do not reread solely to recover this patch.",
             observation,
         )
-    write_text_document(path, text.replace(old_text, str(args["new_text"]), 1), document)
+    write_text_document(path, text.replace(old_text, new_text, 1), document)
     relative = path.relative_to(context.root).as_posix()
     return render_mutation_observation(
         relative,
@@ -489,6 +557,26 @@ def tool_patch_file(context, args):
         context.observation_char_budget,
         context.source_window_lines,
     )
+
+
+def tool_apply_patch(context, args):
+    plans = plan_patch_set(context, args["edits"])
+    commit_patch_set(plans)
+    return render_patch_set_observation(context, plans)
+
+
+def mutation_paths(name, args):
+    """Return every path targeted by a typed mutation call."""
+    if name in {"write_file", "patch_file"}:
+        path = str((args or {}).get("path", "")).strip()
+        return [path] if path else []
+    if name == "apply_patch":
+        return list(dict.fromkeys(
+            str(edit.get("path", "")).strip()
+            for edit in (args or {}).get("edits", ())
+            if isinstance(edit, dict) and str(edit.get("path", "")).strip()
+        ))
+    return []
 
 
 def tool_delegate(context, args):
@@ -510,4 +598,5 @@ _TOOL_RUNNERS = {
     "run_verification": tool_run_verification,
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,
+    "apply_patch": tool_apply_patch,
 }

@@ -393,6 +393,18 @@ def test_read_only_interaction_rejects_every_risky_tool(tmp_path):
     }
     for name, args in (
         ("write_file", {"path": "app.py", "content": "VALUE = 9\n"}),
+        (
+            "apply_patch",
+            {
+                "edits": [
+                    {
+                        "path": "app.py",
+                        "old_text": "VALUE = 1",
+                        "new_text": "VALUE = 9",
+                    }
+                ]
+            },
+        ),
         ("run_shell", {"command": "echo changed > app.py"}),
         ("run_verification", {"argv": [sys.executable, "-c", "print(1)"]}),
     ):

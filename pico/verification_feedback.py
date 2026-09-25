@@ -8,6 +8,12 @@ MAX_VERIFICATION_FEEDBACK_CHARS = 4_000
 WORK_GUIDANCE = (
     "Work from the current question, not file coverage. Read to resolve a specific uncertainty; "
     "a small runnable change can test an idea before the whole repository is understood. "
+    "Use the runtime work_focus as the shared evidence frontier: preserve facts already known, "
+    "name the concrete missing fact a new read will supply, and transition to implementation "
+    "when the named targets are grounded. A read that merely expands context is not the same as "
+    "one that reduces an open question. When work_focus.phase is implement, the default next "
+    "action is a mutation based on current evidence. Explore again only for a specific unresolved "
+    "dependency that changes that mutation, and use the answer immediately. "
     "When your understanding changes, you may give a brief public work note: the current question, "
     "observed evidence, a tentative explanation, and the next discriminating check. "
     "This is optional, not a required format or a request for private reasoning. "

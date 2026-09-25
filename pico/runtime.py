@@ -314,6 +314,13 @@ class Pico:
             contract["protected_paths"] = list(
                 requirements.get("protected_paths", ())
             )
+            for key in (
+                "referenced_paths",
+                "requested_existing_paths",
+                "requested_missing_paths",
+                "unresolved_path_mentions",
+            ):
+                contract[key] = list(requirements.get(key, ()))
         return contract
 
     def repository_evidence(self, user_message, limit=10):
@@ -1049,21 +1056,25 @@ class Pico:
         """
         if not self.feature_enabled("memory"):
             return
-        path = args.get("path")
-        if not path:
+        paths = toolkit.mutation_paths(name, args)
+        if name == "read_file" and args.get("path"):
+            paths = [args["path"]]
+        if not paths:
             return
-
-        canonical_path = self.memory.canonical_path(path)
         # 不是所有工具结果都进入工作记忆。
         # 读文件会生成摘要；写文件/patch 会让旧摘要失效，因为它们可能过期了。
-        if name in {"read_file", "write_file", "patch_file"}:
-            self.memory.remember_file(canonical_path)
+        canonical_paths = [self.memory.canonical_path(path) for path in paths]
+        if name in {"read_file", "write_file", "patch_file", "apply_patch"}:
+            for canonical_path in canonical_paths:
+                self.memory.remember_file(canonical_path)
         if name == "read_file":
+            canonical_path = canonical_paths[0]
             summary = memorylib.summarize_read_result(result)
             self.memory.set_file_summary(canonical_path, summary)
             self.memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
-        elif name in {"write_file", "patch_file"}:
-            self.memory.invalidate_file_summary(canonical_path)
+        elif name in {"write_file", "patch_file", "apply_patch"}:
+            for canonical_path in canonical_paths:
+                self.memory.invalidate_file_summary(canonical_path)
 
     def note_tool(self, name, args, result):
         self.update_memory_after_tool(name, args, result)
@@ -1387,6 +1398,9 @@ class Pico:
 
     def tool_patch_file(self, args):
         return toolkit.tool_patch_file(self.tool_context(), args)
+
+    def tool_apply_patch(self, args):
+        return toolkit.tool_apply_patch(self.tool_context(), args)
 
     def tool_delegate(self, args):
         return toolkit.tool_delegate(self.tool_context(), args)

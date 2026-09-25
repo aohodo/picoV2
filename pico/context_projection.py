@@ -11,6 +11,7 @@ from .read_observation import (
     visible_read_coverage,
 )
 from .verification_feedback import WORK_GUIDANCE
+from .working_set import project_current_working_set
 
 DEFAULT_EVENT_LIMIT = None
 DEFAULT_RUNTIME_STATE_CHAR_BUDGET = 8_000
@@ -186,7 +187,7 @@ def _compact_group(group, recent, observation_limit, keep_observation=False, har
     # Mutation arguments duplicate intended content. The mutation receipt is
     # authoritative post-edit evidence, so keep the action identity but spend
     # the working-set budget on what actually reached disk.
-    mutation = call.get("name") in {"write_file", "patch_file"}
+    mutation = call.get("name") in {"write_file", "patch_file", "apply_patch"}
     call["arguments"] = _compact_arguments(
         call.get("arguments", "{}"),
         summary_limit if mutation else argument_limit,
@@ -199,7 +200,9 @@ def _compact_group(group, recent, observation_limit, keep_observation=False, har
         else (observation_limit if recent or keep_observation else summary_limit)
     )
     if len(raw_output) > output_limit:
-        if call.get("name") in {"read_file", "read_files", "write_file", "patch_file"}:
+        if call.get("name") in {
+            "read_file", "read_files", "write_file", "patch_file", "apply_patch"
+        }:
             output["output"] = compact_read_observation(raw_output, output_limit)
         else:
             excerpt = _head_tail(raw_output, max(80, output_limit - 100))
@@ -330,6 +333,7 @@ def _project_runtime_state(state, char_budget=DEFAULT_RUNTIME_STATE_CHAR_BUDGET)
     validations = list(ledger.get("validations", []))[-4:]
     validation_share = max(1, char_budget // (8 * max(1, len(validations))))
     compact = {
+        "work_focus": state.get("work_focus", {}),
         "progress": state.get("progress", {}),
         "ledger": {
             key: ledger.get(key)
@@ -374,11 +378,22 @@ def _project_runtime_state(state, char_budget=DEFAULT_RUNTIME_STATE_CHAR_BUDGET)
         compact["checkpoint"] = _head_tail(state["checkpoint"], 800)
     if state.get("memory"):
         compact["memory"] = _head_tail(state["memory"], 1200)
+    if state.get("working_set"):
+        compact["working_set"] = _head_tail(
+            state["working_set"], max(1, char_budget // 3)
+        )
     rendered = json.dumps(compact, ensure_ascii=False, sort_keys=True)
     if len(rendered) > char_budget:
         compact.pop("memory", None)
         compact.pop("checkpoint", None)
         compact["context_compacted_further"] = True
+        rendered = json.dumps(compact, ensure_ascii=False, sort_keys=True)
+    if len(rendered) > char_budget and compact.get("working_set"):
+        excess = len(rendered) - char_budget
+        compact["working_set"] = _head_tail(
+            compact["working_set"],
+            max(1, len(compact["working_set"]) - excess),
+        )
         rendered = json.dumps(compact, ensure_ascii=False, sort_keys=True)
     return rendered, {
         "raw_runtime_state_chars": raw_chars,
@@ -457,7 +472,7 @@ class ContextProjector:
             "Unresolved failures include real diagnostics: use them to test a cause, change the relevant code or test, "
             "and rerun verification. Distinguish a suspected cause from one demonstrated by evidence. "
             "Use already available source and tool results; reread only when missing information or changed files require it. "
-            "A successful write_file or patch_file result contains the current post-edit source around the change; "
+            "A successful write_file, patch_file, or apply_patch result contains the current post-edit source around the change; "
             "treat it as fresh evidence and do not reread merely to confirm that the requested edit landed. "
             "Definition candidates are navigation hints, not proof of dispatch or behavior. "
             "Compacted source bodies marked omitted cannot support detailed code claims. "
@@ -486,6 +501,13 @@ class ContextProjector:
     ):
         self.agent.invalidate_stale_memory()
         state = controller.runtime_state_view()
+        working_set = project_current_working_set(
+            getattr(self.agent, "initial_working_set", ""),
+            getattr(self.agent, "initial_working_set_coverage", ()),
+            controller.ledger.path_revision,
+        )
+        if working_set:
+            state["working_set"] = working_set
         state["memory"] = (
             self.agent.memory_text()
             + "\n"

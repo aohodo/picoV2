@@ -127,6 +127,39 @@ def extract_protected_paths(user_message):
     return sorted(patterns)
 
 
+def extract_referenced_paths(user_message):
+    """Return concrete repository path mentions in request order.
+
+    These are navigation evidence, not a write allowlist.  A user who names a
+    source file has already done part of repository discovery for the agent;
+    discarding that fact forces the model to rediscover the same target from a
+    compressed transcript.  Globs and URLs are deliberately excluded because
+    neither identifies one concrete workspace artifact.
+    """
+    paths = []
+    seen = set()
+    for token in _PATH_TOKEN.findall(str(user_message or "")):
+        normalized = token.replace("\\", "/")
+        if normalized.startswith(("//", "/")) or re.match(
+            r"^[A-Za-z]:/", normalized
+        ):
+            continue
+        normalized = normalized.removeprefix("./")
+        parts = normalized.split("/")
+        if (
+            not normalized
+            or "://" in normalized
+            or any(character in normalized for character in "*?[]")
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            continue
+        key = normalized.casefold()
+        if key not in seen:
+            seen.add(key)
+            paths.append(normalized)
+    return paths
+
+
 def path_matches_patterns(path, patterns):
     normalized = str(path or "").replace("\\", "/").lstrip("./").casefold()
     return any(fnmatch.fnmatchcase(normalized, str(pattern).casefold()) for pattern in patterns or ())
@@ -244,6 +277,7 @@ def build_interaction_contract(user_message, package_layout):
             _TEST_ARTIFACT_REQUIRED.search(str(user_message or ""))
         ),
         "protected_paths": extract_protected_paths(user_message),
+        "referenced_paths": extract_referenced_paths(user_message),
         "package_layout": package_layout,
         "instruction_priority": [
             "current_user_request",

@@ -38,7 +38,10 @@ def tool_signature(tools):
 def build_prompt_prefix(workspace, tools, built_at=None):
     tool_lines = []
     for name, tool in tools.items():
-        fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
+        fields = ", ".join(
+            f"{key}: {json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else value}"
+            for key, value in tool["schema"].items()
+        )
         risk = "approval required" if tool["risky"] else "safe"
         tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
     tool_text = "\n".join(tool_lines)
@@ -50,6 +53,10 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         "    return -1\n</content></tool>\n"
         '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text>'
         "<new_text>return mid</new_text></tool>\n"
+        '<tool>{"name":"apply_patch","args":{"edits":['
+        '{"path":"service.py","old_text":"return 1","new_text":"return 2"},'
+        '{"path":"test_service.py","old_text":"== 1","new_text":"== 2"}'
+        ']}}</tool>\n'
         '<tool>{"name":"run_verification","args":{"argv":["python","-m","pytest","-q"],'
         '"timeout":120}}</tool>\n'
         "<final>Done.</final>"
@@ -72,7 +79,8 @@ def build_prompt_prefix(workspace, tools, built_at=None):
           <final>your answer</final>
         - Never invent tool results.
         - Keep answers concise and concrete.
-        - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
+        - If the user asks you to create or update a specific file and the path is clear, use write_file, patch_file, or apply_patch instead of repeatedly listing files.
+        - Use apply_patch for related exact edits across multiple locations or files. It validates the complete work unit before writing; if one edit fails, correct that patch set from the returned current source.
         - Before writing tests for existing code, read the implementation first.
         - Work from the requested behavior, follow relevant calls and data, implement a focused change, and use test results to correct it. Use inspect_repository when symbol or dependency navigation helps.
         - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
@@ -81,7 +89,7 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         - Use run_verification, not run_shell, for tests, builds, lint, and type checks. It runs one argv directly and preserves the real exit status.
         - Set run_verification purpose=acceptance only for real delivery checks that must pass. Use purpose=diagnostic for generated probes or experiments; diagnostic results do not satisfy or block delivery.
         - Do not use run_verification for listing, searching, or reading repository files; use the typed read tools.
-        - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, run_verification, or delegate with args={{}}.
+        - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, apply_patch, run_shell, run_verification, or delegate with args={{}}.
 
         Tools:
         {tool_text}
