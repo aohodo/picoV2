@@ -49,6 +49,78 @@ def test_overlapping_ranges_use_union_not_call_signature():
     )["allowed"]
 
 
+def test_read_files_uses_per_file_evidence_across_different_batches():
+    controller = ProgressController(24)
+    controller.set_visible_tool_outputs([])
+    files = {
+        "a.py": ["A = 1"],
+        "b.py": ["B = 1"],
+        "c.py": ["C = 1"],
+    }
+    first_output = render_reads(
+        [(path, "utf-8", files[path], 1, 100) for path in ("a.py", "b.py")],
+        4000,
+    )
+    first_metadata = {
+        "executed": True,
+        "tool_status": "ok",
+        "read_coverage": first_output.coverage,
+    }
+    controller.observe(
+        "read_files", {"paths": ["a.py", "b.py"]}, first_output, first_metadata
+    )
+    events = [{
+        "type": "function_call_output",
+        "call_id": "batch-1",
+        "output": str(first_output),
+        "_read_evidence": first_metadata["read_evidence"],
+    }]
+    controller.set_visible_tool_outputs(events)
+
+    assert not controller.preflight(
+        "read_files", {"paths": ["a.py", "b.py"]}
+    )["allowed"]
+    assert controller.preflight(
+        "read_files", {"paths": ["a.py", "c.py"]}
+    )["allowed"]
+    assert not controller.preflight(
+        "read_file", {"path": "a.py", "start": 1, "end": 100}
+    )["allowed"]
+
+
+def test_read_files_revision_changes_only_invalidate_changed_path():
+    controller = ProgressController(24)
+    controller.set_visible_tool_outputs([])
+    output = render_reads(
+        [
+            ("a.py", "utf-8", ["A = 1"], 1, 100),
+            ("b.py", "utf-8", ["B = 1"], 1, 100),
+        ],
+        4000,
+    )
+    metadata = {
+        "executed": True,
+        "tool_status": "ok",
+        "read_coverage": output.coverage,
+    }
+    controller.observe("read_files", {"paths": ["a.py", "b.py"]}, output, metadata)
+    controller.set_visible_tool_outputs([{
+        "type": "function_call_output",
+        "call_id": "batch",
+        "output": str(output),
+        "_read_evidence": metadata["read_evidence"],
+    }])
+    controller.observe("patch_file", {"path": "a.py"}, "changed", {
+        "executed": True,
+        "tool_status": "ok",
+        "workspace_changed": True,
+        "affected_paths": ["a.py"],
+    })
+
+    assert controller.preflight("read_file", {"path": "a.py"})["allowed"]
+    assert not controller.preflight("read_file", {"path": "b.py"})["allowed"]
+
+
 def test_old_revision_is_not_visible_after_mutation():
     controller = ProgressController(24)
     controller.set_visible_tool_outputs([])

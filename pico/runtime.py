@@ -170,6 +170,19 @@ class Pico:
         else:
             self.transactions_root = Path(self.session_store.root).parent / "transactions"
             self.transactions_root.mkdir(parents=True, exist_ok=True)
+        configured_package_cache = str(
+            os.environ.get("PICO_PACKAGE_CACHE_ROOT", "")
+        ).strip()
+        self.package_cache_root = (
+            Path(configured_package_cache).expanduser()
+            if configured_package_cache
+            else (
+                self.workspace_state.cache
+                if self.workspace_state
+                else Path(self.session_store.root).parent / "cache"
+            )
+        ).resolve()
+        self.package_cache_root.mkdir(parents=True, exist_ok=True)
         self.transaction_context = transaction_context
         if transaction_context is not None:
             self.root = Path(transaction_context.execution_root)
@@ -226,6 +239,7 @@ class Pico:
                     self.secret_boundary,
                     env_allowlist=self.shell_env_allowlist,
                     source_root=self.source_root,
+                    cache_root=self.package_cache_root,
                 )
                 self.transaction_context = TransactionContext(
                     transaction_id=transaction.transaction_id,
@@ -434,6 +448,7 @@ class Pico:
             self.secret_boundary,
             env_allowlist=self.shell_env_allowlist,
             source_root=self.source_root,
+            cache_root=self.package_cache_root,
         )
         self.transaction_context = TransactionContext(
             transaction_id=transaction.transaction_id,

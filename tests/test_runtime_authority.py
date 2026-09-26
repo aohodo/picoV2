@@ -525,6 +525,21 @@ def test_timeout_terminates_descendants_holding_output_pipes(tmp_path):
     assert time.monotonic() - started < 5
 
 
+def test_completed_parent_cannot_leave_background_child_holding_output(tmp_path):
+    parent = (
+        "import subprocess,sys; "
+        "subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'])"
+    )
+    started = time.monotonic()
+
+    result = WorkspaceCommandRunner._run_process(
+        [sys.executable, "-c", parent], tmp_path, dict(os.environ), 5
+    )
+
+    assert result["exit_code"] == 0
+    assert time.monotonic() - started < 5
+
+
 def test_retrieved_durable_fact_enters_native_request(tmp_path):
     agent = make_agent(tmp_path)
     fact = "Project convention: deployment target is AUDIT_NEPTUNE_CLUSTER."

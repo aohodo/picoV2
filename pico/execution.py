@@ -17,6 +17,103 @@ from dataclasses import dataclass
 from pathlib import Path
 
 MAX_CAPTURE_BYTES_PER_STREAM = 256 * 1024
+PIPE_DRAIN_GRACE_SECONDS = 2
+
+
+class _WindowsProcessJob:
+    """Own one Windows process tree and terminate it when the job closes."""
+
+    KILL_ON_JOB_CLOSE = 0x00002000
+    EXTENDED_LIMIT_INFORMATION = 9
+
+    def __init__(self, process):
+        self.handle = None
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class BasicLimitInformation(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                    ("PerJobUserTimeLimit", ctypes.c_longlong),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class IoCounters(ctypes.Structure):
+                _fields_ = [
+                    ("ReadOperationCount", ctypes.c_ulonglong),
+                    ("WriteOperationCount", ctypes.c_ulonglong),
+                    ("OtherOperationCount", ctypes.c_ulonglong),
+                    ("ReadTransferCount", ctypes.c_ulonglong),
+                    ("WriteTransferCount", ctypes.c_ulonglong),
+                    ("OtherTransferCount", ctypes.c_ulonglong),
+                ]
+
+            class ExtendedLimitInformation(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", BasicLimitInformation),
+                    ("IoInfo", IoCounters),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel32.SetInformationJobObject.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            ]
+            kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            kernel32.AssignProcessToJobObject.argtypes = [
+                wintypes.HANDLE,
+                wintypes.HANDLE,
+            ]
+            kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.CreateJobObjectW(None, None)
+            if not handle:
+                return
+            info = ExtendedLimitInformation()
+            info.BasicLimitInformation.LimitFlags = self.KILL_ON_JOB_CLOSE
+            configured = kernel32.SetInformationJobObject(
+                handle,
+                self.EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+            assigned = configured and kernel32.AssignProcessToJobObject(
+                handle, wintypes.HANDLE(process._handle)
+            )
+            if not assigned:
+                kernel32.CloseHandle(handle)
+                return
+            self.handle = handle
+            self._kernel32 = kernel32
+        except (AttributeError, OSError, TypeError):
+            self.handle = None
+
+    @property
+    def active(self):
+        return self.handle is not None
+
+    def close(self):
+        if self.handle is not None:
+            self._kernel32.CloseHandle(self.handle)
+            self.handle = None
 
 
 class _BoundedCapture:
@@ -93,9 +190,17 @@ class WorkspaceCommandRunner:
     backend = "workspace-process"
     isolation = "deployment-boundary"
 
-    def __init__(self, execution_root, secret_boundary, env_allowlist=(), source_root=None):
+    def __init__(
+        self,
+        execution_root,
+        secret_boundary,
+        env_allowlist=(),
+        source_root=None,
+        cache_root=None,
+    ):
         self.execution_root = Path(execution_root).resolve()
         self.source_root = Path(source_root).resolve() if source_root else None
+        self.cache_root = Path(cache_root).resolve() if cache_root else None
         self.secret_boundary = secret_boundary
         self.env_allowlist = tuple(env_allowlist)
         self.started = False
@@ -196,7 +301,11 @@ class WorkspaceCommandRunner:
             "npm_prefix": runtime_root / "npm",
             "npm_cache": runtime_root / "cache" / "npm",
             "gradle_home": runtime_root / "gradle",
-            "maven_repo": runtime_root / "maven",
+            "maven_repo": (
+                self.cache_root / "maven"
+                if self.cache_root is not None
+                else runtime_root / "maven"
+            ),
         }
         for path in paths.values():
             path.mkdir(parents=True, exist_ok=True)
@@ -209,6 +318,7 @@ class WorkspaceCommandRunner:
                 "PICO_AGENT": "1",
                 "PICO_SHELL_DIALECT": shell_kind,
                 "PICO_RUNTIME_ROOT": str(runtime_root),
+                "PICO_CACHE_ROOT": str(self.cache_root or runtime_root / "cache"),
                 "TMP": str(paths["temp"]),
                 "TEMP": str(paths["temp"]),
                 "TMPDIR": str(paths["temp"]),
@@ -272,6 +382,7 @@ class WorkspaceCommandRunner:
             stderr=subprocess.PIPE,
             **process_options,
         )
+        process_job = _WindowsProcessJob(process)
         stdout_capture = _BoundedCapture()
         stderr_capture = _BoundedCapture()
         stdout_thread = threading.Thread(
@@ -286,10 +397,14 @@ class WorkspaceCommandRunner:
         )
         stdout_thread.start()
         stderr_thread.start()
+        timeout_error = None
         try:
             exit_code = process.wait(timeout=int(timeout))
         except subprocess.TimeoutExpired as exc:
-            if os.name == "nt":
+            timeout_error = exc
+            if process_job.active:
+                process_job.close()
+            elif os.name == "nt":
                 subprocess.run(
                     ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                     stdout=subprocess.DEVNULL,
@@ -305,11 +420,31 @@ class WorkspaceCommandRunner:
             if process.poll() is None:
                 process.kill()
             process.wait()
-            stdout_thread.join()
-            stderr_thread.join()
-            raise TimeoutError(f"command timed out after {timeout}s") from exc
-        stdout_thread.join()
-        stderr_thread.join()
+        finally:
+            # A shell command may daemonize a child that inherited stdout or
+            # stderr.  Treat the complete process tree as one tool action: no
+            # descendant may survive the action or keep capture threads open.
+            if process_job.active:
+                process_job.close()
+            elif os.name != "nt":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for thread in (stdout_thread, stderr_thread):
+                thread.join(timeout=PIPE_DRAIN_GRACE_SECONDS)
+            for stream, thread in (
+                (process.stdout, stdout_thread),
+                (process.stderr, stderr_thread),
+            ):
+                if thread.is_alive():
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+                    thread.join(timeout=0.1)
+        if timeout_error is not None:
+            raise TimeoutError(f"command timed out after {timeout}s") from timeout_error
         return {
             "exit_code": exit_code,
             "stdout": stdout_capture.value(),

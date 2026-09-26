@@ -583,6 +583,40 @@ class AgentLoop:
         agent.progress_controller = None
         return final
 
+    def _finish_verified_without_model_final(
+        self, task_state, user_message, run_started_at, failure_reason
+    ):
+        """Deliver runtime-verified work when only presentation failed.
+
+        A model-authored summary is useful to the user, but it is not delivery
+        authority.  The transaction and verification ledger already own that
+        decision.  This fallback is deliberately limited to mutation tasks
+        whose commit boundary reports no unresolved verification condition.
+        """
+        agent = self.agent
+        transaction = agent.transaction_context
+        interaction = agent.current_interaction or {}
+        if (
+            transaction is None
+            or not interaction.get("mutation_allowed", False)
+            or agent.read_only
+            or not transaction.workspace.diff()
+            or agent.verification_failure_reason()
+        ):
+            return None
+        if agent.progress_controller is not None:
+            agent.progress_controller.complete_delivery_review()
+        agent.emit_trace(
+            task_state,
+            "runtime_finalization_fallback",
+            {"reason": str(failure_reason)},
+        )
+        final = (
+            "Implementation was verified and delivered. The model did not produce "
+            "a usable final summary; inspect the run report for the validated change set."
+        )
+        return self._finish_success(task_state, user_message, final, run_started_at)
+
     def _close_aborted_run(self, user_message, stop_reason, error_text=""):
         agent = self.agent
         task_state = agent.current_task_state
@@ -829,6 +863,7 @@ class AgentLoop:
             )
 
         attempts = 0
+        finalization_requested = False
         stuck_final = None
         contract_failure_final = None
         contract_failures = 0
@@ -1078,6 +1113,11 @@ class AgentLoop:
                     deferred_reason = ""
                     if task_state.tool_steps >= agent.max_steps:
                         deferred_reason = "the configured tool budget was exhausted"
+                    elif finalization_requested:
+                        deferred_reason = (
+                            "authoritative acceptance verification already passed; "
+                            "finalization is active"
+                        )
                     elif (
                         batch_failure_reason
                         and agent.tools.get(name, {}).get("risky", True)
@@ -1100,6 +1140,19 @@ class AgentLoop:
                         batch_failure_reason = (
                             "an earlier call failed; inspect its result before requesting further actions"
                         )
+                    elif (
+                        controller.state.delivery_review_pending
+                        and interaction.get("mutation_allowed")
+                        and not agent.read_only
+                        and not agent.verification_failure_reason()
+                    ):
+                        # Delivery readiness is a runtime phase transition, not
+                        # advice that the model may ignore. Once authoritative
+                        # acceptance covers the current diff, close the action
+                        # phase and request prose-only finalization. Calls later
+                        # in the same batch still receive paired outputs, but
+                        # cannot reopen exploration or mutate the verified tree.
+                        finalization_requested = True
                 if controller.state.stuck_detected:
                     stuck_final = (
                         "Stopped because the agent continued without observable progress after "
@@ -1109,6 +1162,16 @@ class AgentLoop:
                         task_state,
                         "agent_stuck",
                         {"name": calls[-1][0], **controller.metrics()},
+                    )
+                    break
+                if finalization_requested:
+                    agent.emit_trace(
+                        task_state,
+                        "finalization_entered",
+                        {
+                            "reason": "authoritative_acceptance_passed",
+                            **controller.metrics(),
+                        },
                     )
                     break
                 continue
@@ -1210,10 +1273,13 @@ class AgentLoop:
             task_state.record_progress(controller.metrics())
             return self._finish_success(task_state, user_message, final, run_started_at)
 
-        if task_state.tool_steps >= agent.max_steps:
+        if finalization_requested or task_state.tool_steps >= agent.max_steps:
             finalization_failures = 0
             finalization_reason = ""
-            while attempts < max_attempts:
+            finalization_attempts = 0
+            max_finalization_attempts = 1 + agent.model_execution_policy.max_recoveries
+            while finalization_attempts < max_finalization_attempts:
+                finalization_attempts += 1
                 attempts += 1
                 task_state.record_attempt()
                 agent.run_store.write_task_state(task_state)
@@ -1387,9 +1453,19 @@ class AgentLoop:
 
             if finalization_failures and contract_failure_final is None:
                 contract_failure_final = (
-                    "Stopped because finalization exhausted the remaining request "
+                    "Stopped because finalization exhausted its independent request "
                     f"budget: {finalization_reason}"
                 )
+
+        if contract_failure_final is not None:
+            delivered = self._finish_verified_without_model_final(
+                task_state,
+                user_message,
+                run_started_at,
+                contract_failure_final,
+            )
+            if delivered is not None:
+                return delivered
 
         if stuck_final is not None:
             final = stuck_final

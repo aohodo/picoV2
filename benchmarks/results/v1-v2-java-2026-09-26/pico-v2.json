@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "task_set_id": "bid-info-push-java-history",
+  "task_set_revision": "87f5e4c4-5618f92d",
+  "runs": [
+    {
+      "system_id": "pico-v2-c6d87bd",
+      "task_id": "java-startup-config",
+      "run_index": 1,
+      "repository_revision": "afbd908596308a900a64895076aed62001a7d626",
+      "provider": "openai-compatible",
+      "model": "qwen3.8-flash",
+      "success": true,
+      "verifier_exit_code": 0,
+      "tests_unchanged": true,
+      "failure_category": "",
+      "source_case_id": "87f5e4c4-pre-human",
+      "task_commit": "87f5e4c476b7d0710895ec6f787349f488bffb3a",
+      "metrics": {
+        "first_write_step": 7,
+        "model_calls": 22,
+        "tool_steps": 20,
+        "total_seconds": 178.109,
+        "retries": 0
+      }
+    },
+    {
+      "system_id": "pico-v2-c6d87bd",
+      "task_id": "java-response-envelope",
+      "run_index": 1,
+      "repository_revision": "87f5e4c476b7d0710895ec6f787349f488bffb3a",
+      "provider": "openai-compatible",
+      "model": "qwen3.8-flash",
+      "success": true,
+      "verifier_exit_code": 0,
+      "tests_unchanged": true,
+      "failure_category": "",
+      "source_case_id": "5618f92d-pre-human",
+      "task_commit": "5618f92de0078ab453991a358fa185f0451cfc81",
+      "metrics": {
+        "first_write_step": 5,
+        "model_calls": 8,
+        "tool_steps": 6,
+        "total_seconds": 52.921,
+        "retries": 0
+      }
+    }
+  ]
+}

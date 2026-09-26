@@ -52,6 +52,7 @@ class WorkspaceState:
         self.source_root = Path(source_root).resolve()
         self.workspace_id, self.identity = workspace_identity(self.source_root)
         self.global_root = Path(root or default_state_root()).resolve()
+        self.cache = self.global_root / "cache"
         self.root = self.global_root / "workspaces" / self.workspace_id
         self.sessions = self.root / "sessions"
         self.runs = self.root / "runs"
@@ -59,7 +60,7 @@ class WorkspaceState:
         self.memory = self.root / "memory"
 
     def ensure(self):
-        for path in (self.sessions, self.runs, self.transactions, self.memory):
+        for path in (self.cache, self.sessions, self.runs, self.transactions, self.memory):
             path.mkdir(parents=True, exist_ok=True)
         metadata = {
             "workspace_id": self.workspace_id,

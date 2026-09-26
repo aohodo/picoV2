@@ -172,7 +172,7 @@ def test_direct_verification_preserves_process_exit_status(tmp_path):
     assert agent.last_verification_succeeded is False
 
 
-def test_change_after_passing_verification_is_not_delivered(tmp_path):
+def test_passing_verification_closes_action_phase_before_later_mutation(tmp_path):
     agent, workspace_root = build_agent(
         tmp_path,
         [
@@ -195,7 +195,7 @@ def test_change_after_passing_verification_is_not_delivered(tmp_path):
 
     answer = agent.ask("Fix, verify, and finish the change.")
 
-    assert "validation failed" in answer
-    assert (workspace_root / "sample.py").read_text(encoding="utf-8") == "value = 1\n"
-    assert agent.current_task_state.validation_status == "stale"
-    assert agent.last_run_outcome.status == "validation_failed"
+    assert answer == "Done."
+    assert (workspace_root / "sample.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert agent.current_task_state.validation_status == "passed"
+    assert agent.last_run_outcome.status == "committed"

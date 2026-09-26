@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "task_set_id": "bid-info-push-java-history",
+  "task_set_revision": "87f5e4c4-5618f92d",
+  "comparability": {
+    "systems": [
+      "pico-v1-bd90c9a",
+      "pico-v2-c6d87bd"
+    ],
+    "common_task_ids": [
+      "java-response-envelope",
+      "java-startup-config"
+    ],
+    "all_task_ids": [
+      "java-response-envelope",
+      "java-startup-config"
+    ],
+    "complete_task_matrix": true
+  },
+  "systems": [
+    {
+      "system_id": "pico-v1-bd90c9a",
+      "provider_models": [
+        "openai-compatible:qwen3.8-flash"
+      ],
+      "task_count": 2,
+      "run_count": 2,
+      "success_count": 0,
+      "success_rate": 0.0,
+      "pass_at_1": 0.0,
+      "stable_task_rate": 0.0,
+      "tests_unchanged_rate": 1.0,
+      "failure_categories": {
+        "step_limit_no_production_diff": 2
+      },
+      "averages": {
+        "first_write_step": null,
+        "model_calls": 45,
+        "tool_steps": 24,
+        "total_seconds": 387.703,
+        "input_tokens": null,
+        "output_tokens": null,
+        "retries": null
+      }
+    },
+    {
+      "system_id": "pico-v2-c6d87bd",
+      "provider_models": [
+        "openai-compatible:qwen3.8-flash"
+      ],
+      "task_count": 2,
+      "run_count": 2,
+      "success_count": 2,
+      "success_rate": 1.0,
+      "pass_at_1": 1.0,
+      "stable_task_rate": 1.0,
+      "tests_unchanged_rate": 1.0,
+      "failure_categories": {},
+      "averages": {
+        "first_write_step": 6,
+        "model_calls": 15,
+        "tool_steps": 13,
+        "total_seconds": 115.515,
+        "input_tokens": null,
+        "output_tokens": null,
+        "retries": 0
+      }
+    }
+  ]
+}

@@ -56,6 +56,27 @@ def test_shell_and_direct_commands_share_transaction_local_tool_state(tmp_path):
     assert captured[1]["env"]["PICO_SHELL_DIALECT"] == "direct"
 
 
+def test_maven_cache_is_shared_runtime_state_not_transaction_source(tmp_path):
+    shadow = tmp_path / "shadow"
+    cache = tmp_path / "state" / "cache"
+    shadow.mkdir()
+    runner = WorkspaceCommandRunner(
+        shadow,
+        SecretBoundary(env={"PATH": ""}),
+        cache_root=cache,
+    )
+    captured = []
+    runner._run_process = lambda argv, cwd, env, timeout: (
+        captured.append(env)
+        or {"exit_code": 0, "stdout": b"", "stderr": b""}
+    )
+
+    runner.run_argv(["mvn", "-q", "test"])
+
+    assert str((cache / "maven").resolve()) in captured[0]["MAVEN_OPTS"]
+    assert not (shadow / ".pico" / "runtime" / "maven").exists()
+
+
 def test_transaction_runtime_state_never_enters_source_diff(tmp_path):
     source = tmp_path / "source"
     transactions = tmp_path / "transactions"

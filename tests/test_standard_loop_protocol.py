@@ -212,9 +212,43 @@ def test_successful_verification_uses_existing_final_turn_for_delivery_review(tm
     assert "delivery review is active" in final_input
     assert "not fetching the same evidence again" in final_input
     assert "Passing authored tests are evidence" in final_input
+    assert model.requests[2]["tools"] == []
     assert agent.current_task_state.validation_status == "passed"
     assert agent.current_task_state.transaction_state == "COMMITTED"
     assert agent.current_task_state.to_dict()["delivery_review_status"] == "completed"
+
+
+def test_successful_acceptance_rejects_later_tools_in_same_batch(tmp_path):
+    agent, model = make_agent(
+        tmp_path,
+        [
+            call("write_file", {"path": "app.py", "content": "VALUE = 2\n"}, "write"),
+            ModelTurn(
+                kind="tool_batch",
+                tool_calls=(
+                    ModelToolCall(
+                        "run_verification",
+                        {"argv": [sys.executable, "-c", "import app; assert app.VALUE == 2"]},
+                        "verify",
+                    ),
+                    ModelToolCall("read_file", {"path": "app.py"}, "late-read"),
+                ),
+                response_status="completed",
+            ),
+            final("Implemented and verified."),
+        ],
+    )
+
+    assert agent.ask("Update app.py VALUE to 2 and run tests") == "Implemented and verified."
+    final_items = model.requests[2]["input_items"]
+    outputs = {
+        item["call_id"]: item["output"]
+        for item in final_items
+        if item.get("type") == "function_call_output"
+    }
+    assert "finalization is active" in outputs["late-read"]
+    assert model.requests[2]["tools"] == []
+    assert agent.current_task_state.tool_steps == 2
 
 
 def test_step_budget_finalization_cannot_bypass_delivery_review(tmp_path):
@@ -239,6 +273,59 @@ def test_step_budget_finalization_cannot_bypass_delivery_review(tmp_path):
     assert "delivery review is active" in final_input
     assert agent.current_task_state.delivery_review_status == "completed"
     assert agent.current_task_state.transaction_state == "COMMITTED"
+
+
+def test_finalization_keeps_its_own_request_budget_after_action_attempts_are_spent(tmp_path):
+    agent, model = make_agent(
+        tmp_path,
+        [
+            ModelTurn(kind="invalid", protocol_error="temporary malformed response"),
+            call("write_file", {"path": "app.py", "content": "VALUE = 2\n"}, "write"),
+            ModelTurn(kind="invalid", protocol_error="another temporary malformed response"),
+            call("read_file", {}, "rejected-read"),
+            call(
+                "run_verification",
+                {"argv": [sys.executable, "-c", "import app; assert app.VALUE == 2"]},
+                "verify",
+            ),
+            final("Implemented, reviewed, and verified."),
+        ],
+        max_steps=2,
+    )
+
+    answer = agent.ask("Update app.py VALUE to 2 and run tests")
+
+    assert answer == "Implemented, reviewed, and verified."
+    assert len(model.requests) == 6
+    assert model.requests[-1]["tools"] == []
+    assert agent.current_task_state.transaction_state == "COMMITTED"
+    assert (agent.source_root / "app.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+
+
+def test_verified_delivery_does_not_depend_on_model_final_text(tmp_path):
+    agent, model = make_agent(
+        tmp_path,
+        [
+            call("write_file", {"path": "app.py", "content": "VALUE = 2\n"}, "write"),
+            call(
+                "run_verification",
+                {"argv": [sys.executable, "-c", "import app; assert app.VALUE == 2"]},
+                "verify",
+            ),
+            ModelTurn(kind="invalid", protocol_error="missing final text"),
+            ModelTurn(kind="invalid", protocol_error="still missing final text"),
+        ],
+        max_steps=2,
+    )
+
+    answer = agent.ask("Update app.py VALUE to 2 and run tests")
+
+    assert "verified and delivered" in answer.lower()
+    assert len(model.requests) == 4
+    assert all(request["tools"] == [] for request in model.requests[2:])
+    assert agent.current_task_state.transaction_state == "COMMITTED"
+    assert agent.current_task_state.validation_status == "passed"
+    assert (agent.source_root / "app.py").read_text(encoding="utf-8") == "VALUE = 2\n"
 
 
 def test_repaired_expectation_requires_original_check_before_delivery(tmp_path):

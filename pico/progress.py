@@ -77,6 +77,28 @@ MAX_LEDGER_GROUNDING_PATHS = 24
 MAX_LEDGER_PATH_REVISIONS = 256
 
 
+def read_file_items(args):
+    """Return one canonical evidence item per requested batch path.
+
+    Public tool calls carry ``paths`` while ToolExecutor enriches them into
+    revisionable ``files`` ranges before the progress boundary. Supporting
+    both forms here keeps call identity, visibility, and persisted evidence
+    aligned instead of letting each layer interpret the schema differently.
+    """
+    files = args.get("files")
+    if files is not None:
+        return [dict(item) for item in files if item.get("path")]
+    return [
+        {
+            "path": str(path),
+            "start": 1,
+            "end": DEFAULT_SOURCE_WINDOW_LINES,
+        }
+        for path in args.get("paths", ())
+        if str(path)
+    ]
+
+
 def is_validation_command(command):
     return bool(VALIDATION_COMMAND.search(str(command or "")))
 
@@ -204,7 +226,7 @@ class ExecutionLedger:
         elif tool_name == "read_file":
             items = [args]
         elif tool_name == "read_files":
-            items = args.get("files", [])
+            items = read_file_items(args)
         else:
             items = []
         for item in items:
@@ -502,8 +524,8 @@ class ProgressController:
             return f"{path}:{self.ledger.path_revision(path)}"
         if tool_name == "read_files":
             return "|".join(
-                f"{item.get('path', '')}:{self.ledger.path_revision(item.get('path', ''))}"
-                for item in args.get("files", [])
+                f"{item['path']}:{self.ledger.path_revision(item['path'])}"
+                for item in read_file_items(args)
             )
         return str(self.state.workspace_revision)
 
@@ -591,7 +613,7 @@ class ProgressController:
             targets.append(str(args["path"]))
         elif tool_name == "read_files":
             targets.extend(
-                str(item.get("path", "")) for item in args.get("files", ())
+                str(item["path"]) for item in read_file_items(args)
             )
         targets.extend(str(path) for path in metadata.get("affected_paths", ()))
         return list(dict.fromkeys(path for path in targets if path))
@@ -868,22 +890,41 @@ class ProgressController:
 
     def _read_is_visible(self, tool_name, args):
         signature = self.signature(tool_name, args)
-        if tool_name != "read_file":
+        if tool_name not in {"read_file", "read_files"}:
             content = self._read_contents.get(signature.key)
             return bool(content) and content in (self._visible_outputs or set())
         if self._visible_reads is None:
             content = self._read_contents.get(signature.key)
             return bool(content) and content in (self._visible_outputs or set())
-        items = [args]
+        items = (
+            [args]
+            if tool_name == "read_file"
+            else read_file_items(args)
+        )
         return bool(items) and all(
-            ranges_cover(
-                self._visible_reads,
+            self._visible_source_covers(
                 item.get("path", ""),
-                self.ledger.path_revision(item.get("path", "")),
                 int(item.get("start", 1)),
                 int(item.get("end", DEFAULT_SOURCE_WINDOW_LINES)),
             )
             for item in items
+        )
+
+    def _visible_source_covers(self, path, start, end):
+        revision = self.ledger.path_revision(path)
+        if ranges_cover(self._visible_reads, path, revision, start, end):
+            return True
+        # A short file can end before the requested source window.  The read
+        # is still complete when the renderer says it was not truncated and
+        # the original request covered the same range.
+        return any(
+            item.get("path") == path
+            and item.get("revision", 0) == revision
+            and item.get("delivered")
+            and not item.get("truncated", False)
+            and int(item.get("start", 1)) <= start
+            and int(item.get("requested_end", item.get("end", 0))) >= end
+            for item in self._visible_reads
         )
 
     def preflight(self, tool_name, args):
