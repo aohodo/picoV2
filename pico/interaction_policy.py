@@ -49,9 +49,18 @@ _VALIDATION_REQUIRED = re.compile(
     r"\bverify\b|(?:运行|执行|跑)(?:[^，。；\n]{0,24})?(?:测试|构建|校验|验证)|"
     r"(?:测试|构建)(?:[^，。；\n]{0,12})?(?:通过|成功)"
 )
+# A test artifact is a hard delivery obligation, so prefer false negatives over
+# turning a nearby mention of implementation and tests into an impossible gate.
+# Keep the action and its test object in one compact noun phrase. Broader
+# quality guidance still encourages tests when this explicit intent is absent.
 _TEST_ARTIFACT_REQUIRED = re.compile(
-    r"(?i)\b(?:add|create|write|implement|update)\b[^.\n]{0,48}\btests?\b|"
-    r"(?:新增|添加|创建|编写|实现|更新)[^，。；\n]{0,24}(?:测试|用例)"
+    r"(?i)\b(?:add|create|write|implement|update)\s+"
+    r"(?:(?:a|an|the|new|failing|unit|integration|regression|acceptance|automated)\s+){0,4}"
+    r"tests?\b|"
+    r"(?:新增|添加|创建|编写|实现|更新)"
+    r"(?:(?:一个|一组|新的|相关|对应|单元|集成|回归|验收|自动化))?"
+    r"(?:测试|用例)|"
+    r"(?:新增|添加|创建|编写|实现|更新)(?:针对|覆盖)[^，。；\n]{1,20}的?(?:测试|用例)"
 )
 _TEMPORARY = re.compile(r"(?i)\b(?:this\s+time|this\s+task|temporarily|for\s+now)\b|本次|这次|本轮|暂时|临时")
 _DURABLE = re.compile(r"(?i)\b(?:from\s+now\s+on|always|default|remember|long[- ]term)\b|以后|今后|默认|长期|记住")

@@ -444,7 +444,15 @@ def build_arg_parser():
         default=[],
         help="Extra environment variable names to treat as secrets for trace/report redaction.",
     )
-    parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=6,
+        help=(
+            "Maximum tool executions per request; bounded protocol recovery "
+            "and finalization turns are accounted for separately."
+        ),
+    )
     parser.add_argument(
         "--soft-discovery-limit",
         type=int,
