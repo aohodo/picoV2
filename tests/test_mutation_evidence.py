@@ -447,6 +447,24 @@ def test_apply_patch_native_schema_describes_structured_edits(tmp_path):
     ]
 
 
+def test_native_tools_expose_work_plan_and_decision_links_without_changing_core_requirements(tmp_path):
+    agent = make_agent(tmp_path)
+    definitions = {
+        item["name"]: item for item in native_tool_definitions(agent.tools)
+    }
+
+    plan = definitions["update_work_plan"]["parameters"]
+    assert plan["required"] == ["items", "active_id"]
+    assert plan["properties"]["items"]["items"]["required"] == [
+        "id",
+        "requirement",
+    ]
+    assert "decision_effect" in definitions["read_file"]["parameters"]["properties"]
+    assert definitions["read_file"]["parameters"]["required"] == ["path"]
+    assert "obligation_ids" in definitions["apply_patch"]["parameters"]["properties"]
+    assert definitions["apply_patch"]["parameters"]["required"] == ["edits"]
+
+
 def test_nearby_mutation_windows_are_merged_without_duplicate_source_lines():
     before = ["shared header", "old a", "shared middle", "old b", "shared tail"]
     after = ["shared header", "new a", "shared middle", "new b", "shared tail"]

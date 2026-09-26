@@ -16,6 +16,7 @@ from .read_observation import (
     visible_read_coverage,
 )
 from .verification_feedback import verification_observation
+from .work_plan import WorkPlanLedger
 
 NEW_EVIDENCE = "NEW_EVIDENCE"
 MATERIAL_PROGRESS = "MATERIAL_PROGRESS"
@@ -23,6 +24,16 @@ NO_PROGRESS = "NO_PROGRESS"
 INTERVENTION_NORMAL = "NORMAL"
 INTERVENTION_SOFT = "SOFT_INTERVENTION"
 INTERVENTION_FORCED = "FORCED_DECISION"
+ACTION_INTENT_ARGS = frozenset(
+    {
+        "obligation_id",
+        "obligation_ids",
+        "decision_question",
+        "decision_effect",
+        "change_hypothesis",
+        "expected_outcome",
+    }
+)
 STABLE_READ_TOOLS = frozenset({"list_files", "read_file", "read_files", "search", "inspect_repository"})
 DISCOVERY_TOOLS = frozenset({"list_files", "read_file", "read_files", "search", "inspect_repository", "delegate"})
 VALIDATION_COMMAND = re.compile(
@@ -106,7 +117,14 @@ class ActionSignature:
 
     @classmethod
     def create(cls, tool_name, args, revision):
-        canonical = json.dumps(args or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        identity_args = {
+            key: value
+            for key, value in (args or {}).items()
+            if key not in ACTION_INTENT_ARGS
+        }
+        canonical = json.dumps(
+            identity_args, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
         return cls(str(tool_name), canonical, str(revision))
 
     @property
@@ -150,6 +168,12 @@ class ExecutionLedger:
     frontier_reduction_count: int = 0
     evidence_expansion_count: int = 0
     no_progress_count: int = 0
+    unscoped_discovery_count: int = 0
+    last_decision_question: str = ""
+    last_change_hypothesis: str = ""
+    last_expected_outcome: str = ""
+    work_plan: WorkPlanLedger = field(default_factory=WorkPlanLedger)
+    evidence_only_count: int = 0
 
     def path_revision(self, path):
         return int(self.path_revisions.get(str(path), 0))
@@ -292,6 +316,12 @@ class ExecutionLedger:
             "frontier_reduction_count": self.frontier_reduction_count,
             "evidence_expansion_count": self.evidence_expansion_count,
             "no_progress_count": self.no_progress_count,
+            "unscoped_discovery_count": self.unscoped_discovery_count,
+            "last_decision_question": self.last_decision_question,
+            "last_change_hypothesis": self.last_change_hypothesis,
+            "last_expected_outcome": self.last_expected_outcome,
+            "work_plan": self.work_plan.view(),
+            "evidence_only_count": self.evidence_only_count,
         }
 
     def to_dict(self):
@@ -348,6 +378,20 @@ class ExecutionLedger:
             data.get("evidence_expansion_count", 0)
         )
         ledger.no_progress_count = int(data.get("no_progress_count", 0))
+        ledger.unscoped_discovery_count = int(
+            data.get("unscoped_discovery_count", 0)
+        )
+        ledger.last_decision_question = str(
+            data.get("last_decision_question", "")
+        )
+        ledger.last_change_hypothesis = str(
+            data.get("last_change_hypothesis", "")
+        )
+        ledger.last_expected_outcome = str(
+            data.get("last_expected_outcome", "")
+        )
+        ledger.work_plan = WorkPlanLedger.from_dict(data.get("work_plan", {}))
+        ledger.evidence_only_count = int(data.get("evidence_only_count", 0))
         ledger.observed_file_count = max(
             len(ledger.observed_files), int(data.get("observed_file_count", 0))
         )
@@ -507,18 +551,36 @@ class ProgressController:
         frontier = {
             ("requested_path", path) for path in self._unread_requested_paths()
         }
-        frontier.update(
-            ("candidate_path", path) for path in self._unread_candidate_paths()
-        )
-        frontier.update(
-            (
-                "definition",
-                str(item.get("path", "")),
-                int(item.get("start", 0)),
-            )
-            for item in self.ledger.view()["pending_definition_candidates"]
-        )
+        frontier.update(self.ledger.work_plan.blockers())
         return frontier
+
+    def _work_item(self, identifier=None):
+        return self.ledger.work_plan.active(identifier)
+
+    def _update_work_plan(self, args):
+        changed = self.ledger.work_plan.update(args)
+        active = self._work_item()
+        if active is not None:
+            self.ledger.last_change_hypothesis = str(active.get("hypothesis", ""))
+            self.ledger.last_expected_outcome = str(
+                active.get("expected_observation", "")
+            )
+        return changed
+
+    def _bind_discovery_to_work_item(self, args, targets):
+        return self.ledger.work_plan.bind_evidence(
+            args.get("obligation_id"), targets
+        )
+
+    def _mark_work_items_implemented(self, args, targets):
+        self.ledger.work_plan.mark_implemented(
+            args.get("obligation_ids", ()), targets
+        )
+
+    def _mark_work_items_verified(self, args, passed):
+        self.ledger.work_plan.mark_verified(
+            args.get("obligation_ids", ()), passed
+        )
 
     @staticmethod
     def _action_targets(tool_name, args, metadata, read_evidence):
@@ -550,18 +612,31 @@ class ProgressController:
             for path in self._requested_existing_paths()
             if path in self.ledger.observed_files
         ]
+        observed_grounded = [
+            path
+            for path in sorted(self.ledger.grounding_paths)
+            if path in self.ledger.observed_files or path in self.ledger.mutations
+        ]
         pending_definitions = self.ledger.view()["pending_definition_candidates"]
         failures_present = bool(
             self.ledger.unresolved_failures
             or self.ledger.unresolved_failure_count
         )
         unverified = sorted(self.ledger.unverified_changes)
+        active_item = self._work_item()
+        pending_work_items = self.ledger.work_plan.pending()
 
         if failures_present:
             phase = "repair_failure"
             priority = (
                 "Interpret the newest unresolved failure first; change or rerun "
                 "only what that evidence justifies."
+            )
+        elif (unverified or self.ledger.unverified_change_count) and pending_work_items:
+            phase = "continue_work_plan"
+            priority = (
+                "Continue the declared work plan from the active obligation; preserve the "
+                "current mutations and verify the coherent change set when remaining obligations are implemented."
             )
         elif unverified or self.ledger.unverified_change_count:
             phase = "complete_and_verify_changes"
@@ -578,46 +653,178 @@ class ProgressController:
                 "Read the named existing targets needed for the requested behavior. "
                 "Broaden exploration only for a concrete unresolved dependency."
             )
-        elif unread_candidates:
-            phase = "inspect_candidate_paths"
+        elif active_item is not None:
+            status = str(active_item.get("status", "orienting"))
+            if status == "needs_evidence":
+                phase = "resolve_active_blocker"
+                priority = (
+                    "Resolve only the active work item's declared blocker, then update the "
+                    "plan with the resulting hypothesis or candidate action."
+                )
+            elif status == "decision_due":
+                phase = "interpret_active_evidence"
+                priority = (
+                    "Interpret the evidence just gathered for the active work item. Update its "
+                    "hypothesis and candidate action before requesting more repository evidence."
+                )
+            elif status == "actionable":
+                phase = "implement"
+                priority = (
+                    "The active work item has an evidence-backed candidate action and no declared "
+                    "blocker. Implement the smallest coherent change now."
+                )
+            elif status == "repair":
+                phase = "repair_failure"
+                priority = "Repair the active work item from the authoritative failure evidence."
+            elif status in {"implemented", "verified"} and pending_work_items:
+                phase = "select_next_work_item"
+                priority = "Select the next unfinished obligation in the work plan and make it active."
+            elif status == "implemented":
+                phase = "complete_and_verify_changes"
+                priority = "Run focused acceptance verification for the implemented work plan."
+            elif status == "verified":
+                phase = "delivery_review"
+                priority = "All declared work items are verified; review the delivery and finish."
+            else:
+                phase = "frame_active_work_item"
+                priority = (
+                    "Frame the active obligation as a local hypothesis, one concrete blocker if "
+                    "needed, and a candidate action."
+                )
+        elif (
+            not self.read_only
+            and not self.ledger.work_plan.items
+            and not self.ledger.observed_files
+        ):
+            phase = "frame_or_locate_work"
             priority = (
-                "Inspect the grounded candidate paths before broad repository exploration."
+                "Before broad discovery, decide whether this is one local change or several "
+                "delivery obligations. For several obligations, create a concise work plan; "
+                "for one local change, inspect the strongest grounded target."
             )
-        elif pending_definitions:
-            phase = "inspect_candidate_definitions"
-            priority = "Inspect the pending definition candidates that bear on the request."
         elif self.read_only:
-            phase = "answer_from_evidence"
-            priority = (
-                "Answer from current evidence, or make one targeted read for a clearly "
-                "missing fact."
-            )
-        elif observed_requested or self.ledger.observed_files:
+            if not self.ledger.observed_files and unread_candidates:
+                phase = "inspect_candidate_paths"
+                priority = "Inspect the strongest grounded candidate needed to answer the request."
+            elif not self.ledger.observed_files and pending_definitions:
+                phase = "inspect_candidate_definitions"
+                priority = "Inspect the strongest pending definition needed to answer the request."
+            else:
+                phase = "answer_from_evidence"
+                priority = (
+                    "Answer from current evidence, or make one targeted read for a clearly "
+                    "missing fact."
+                )
+        elif observed_requested or observed_grounded or self.ledger.observed_files:
             phase = "implement"
             priority = (
-                "The named targets have source evidence. Implement now unless one concrete "
-                "dependency is still unknown."
+                "A local implementation surface is grounded. Form the smallest coherent change "
+                "and implement now unless one concrete unknown could change that decision."
             )
+        elif unread_candidates:
+            phase = "inspect_candidate_paths"
+            priority = "Inspect the strongest grounded candidate needed to form a local change hypothesis."
+        elif pending_definitions:
+            phase = "inspect_candidate_definitions"
+            priority = "Inspect the strongest pending definition needed to form a local change hypothesis."
         else:
             phase = "locate_relevant_code"
             priority = "Locate the smallest source set that can answer the current request."
 
+        blocking_unknowns = []
+        if unread:
+            blocking_unknowns.extend(
+                f"source for explicitly requested path {path}" for path in unread
+            )
+        elif active_item is not None and active_item.get("blocker"):
+            blocking_unknowns.append(str(active_item["blocker"]))
+        elif phase == "inspect_candidate_paths" and unread_candidates:
+            blocking_unknowns.append(
+                f"implementation evidence from a grounded candidate such as {unread_candidates[0]}"
+            )
+        elif phase == "inspect_candidate_definitions" and pending_definitions:
+            item = pending_definitions[0]
+            blocking_unknowns.append(
+                "definition evidence at "
+                f"{item.get('path', '')}:{item.get('start', 0)}"
+            )
+        elif phase == "locate_relevant_code":
+            blocking_unknowns.append("the local implementation surface for the request")
+
+        if phase in {"implement", "repair_failure"} or (
+            phase == "continue_work_plan"
+            and active_item is not None
+            and active_item.get("status") in {"actionable", "repair"}
+        ):
+            readiness = "ready_to_act"
+        elif phase == "interpret_active_evidence" or (
+            phase == "continue_work_plan"
+            and active_item is not None
+            and active_item.get("status") == "decision_due"
+        ):
+            readiness = "decision_due"
+        elif phase in {
+            "frame_active_work_item",
+            "frame_or_locate_work",
+            "select_next_work_item",
+        }:
+            readiness = "decision_needed"
+        elif phase == "complete_and_verify_changes":
+            readiness = "ready_to_verify"
+        elif phase == "delivery_review":
+            readiness = "ready_to_deliver"
+        elif phase == "answer_from_evidence":
+            readiness = "ready_to_answer"
+        else:
+            readiness = "evidence_needed"
+
+        optional_candidates = unread_candidates[:8]
+        optional_definitions = pending_definitions[:8]
+        action_readiness = {
+            "status": readiness,
+            "blocking_unknowns": blocking_unknowns,
+        }
+        if self.ledger.last_change_hypothesis:
+            action_readiness["working_hypothesis"] = (
+                self.ledger.last_change_hypothesis
+            )
+        if self.ledger.last_decision_question:
+            action_readiness["last_decision_question"] = (
+                self.ledger.last_decision_question
+            )
+        if self.ledger.last_expected_outcome:
+            action_readiness["expected_observation"] = (
+                self.ledger.last_expected_outcome
+            )
+
         return {
             "phase": phase,
             "priority": priority,
+            "action_readiness": action_readiness,
             "known": {
                 "observed_requested_paths": observed_requested,
+                "observed_grounded_paths": observed_grounded,
                 "modified_paths": list(self.ledger.mutations[-8:]),
                 "last_action": dict(self.state.last_action),
             },
             "open": {
                 "unread_requested_paths": unread,
-                "unread_candidate_paths": unread_candidates,
                 "named_missing_paths": self._requested_missing_paths(),
-                "pending_definition_candidates": pending_definitions[:8],
                 "unverified_changes": unverified[-12:],
                 "unresolved_failure_count": self.ledger.unresolved_failure_count,
             },
+            "optional_evidence": {
+                "candidate_paths": optional_candidates[:4],
+                "definition_candidates": [
+                    {
+                        key: item.get(key)
+                        for key in ("path", "start", "symbol")
+                        if item.get(key) not in (None, "")
+                    }
+                    for item in optional_definitions[:4]
+                ],
+            },
+            "work_plan": self.ledger.work_plan.view(),
             "action_value_counts": {
                 "frontier_reducing": self.ledger.frontier_reduction_count,
                 "evidence_expanding": self.ledger.evidence_expansion_count,
@@ -733,6 +940,18 @@ class ProgressController:
 
     def observe(self, tool_name, args, content, metadata):
         frontier_before = self._evidence_frontier()
+        phase_before = self.work_focus_view()["phase"]
+        obligation_id = str(args.get("obligation_id", "")).strip()
+        decision_question = str(args.get("decision_question", "")).strip()
+        decision_effect = str(args.get("decision_effect", "")).strip()
+        change_hypothesis = str(args.get("change_hypothesis", "")).strip()
+        expected_outcome = str(args.get("expected_outcome", "")).strip()
+        if decision_question:
+            self.ledger.last_decision_question = decision_question
+        if change_hypothesis:
+            self.ledger.last_change_hypothesis = change_hypothesis
+        if expected_outcome:
+            self.ledger.last_expected_outcome = expected_outcome
         signature = self.signature(tool_name, args)
         observation_hash = hashlib.sha256(str(content).encode("utf-8")).hexdigest()
         identity = f"{signature.key}:{observation_hash}"
@@ -925,9 +1144,26 @@ class ProgressController:
                         self.ledger.unresolved_failure_count += 1
                     elif len(previous) > 1:
                         self.ledger.unresolved_failure_count -= len(previous) - 1
-        frontier_after = self._evidence_frontier()
         targets = self._action_targets(tool_name, args, metadata, read_evidence)
+        plan_changed = bool(
+            executed
+            and status == "ok"
+            and tool_name == "update_work_plan"
+            and self._update_work_plan(args)
+        )
+        if executed and status == "ok" and tool_name in DISCOVERY_TOOLS:
+            self._bind_discovery_to_work_item(args, targets)
         if changed:
+            self._mark_work_items_implemented(args, targets)
+        if authoritative_verification and executed:
+            self._mark_work_items_verified(args, status == "ok" and not changed)
+        frontier_after = self._evidence_frontier()
+        if plan_changed:
+            action_value = "decision_progress"
+            self.ledger.frontier_reduction_count += 1
+            self.state.evidence_expansion_streak = 0
+            self.state.no_progress_streak = 0
+        elif changed:
             action_value = "material_change"
             self.ledger.frontier_reduction_count += 1
             self.state.evidence_expansion_streak = 0
@@ -944,10 +1180,21 @@ class ProgressController:
             action_value = "frontier_reduced"
             self.ledger.frontier_reduction_count += 1
             self.state.evidence_expansion_streak = 0
+        elif evidence.reason == "context_restored":
+            action_value = "context_restored"
+            self.state.no_progress_streak = 0
         elif evidence.kind == NEW_EVIDENCE:
-            action_value = "evidence_expanded"
+            action_value = "evidence_only"
             self.ledger.evidence_expansion_count += 1
+            self.ledger.evidence_only_count += 1
             self.state.evidence_expansion_streak += 1
+            if phase_before in {
+                "implement",
+                "interpret_active_evidence",
+                "complete_and_verify_changes",
+                "continue_work_plan",
+            }:
+                self.state.no_progress_streak += 1
         else:
             action_value = "no_progress"
             self.ledger.no_progress_count += 1
@@ -959,8 +1206,14 @@ class ProgressController:
         }
         current_phase = self.work_focus_view()["phase"]
         if (
-            action_value == "evidence_expanded"
-            and current_phase in {"implement", "complete_and_verify_changes"}
+            action_value == "evidence_only"
+            and current_phase
+            in {
+                "implement",
+                "interpret_active_evidence",
+                "complete_and_verify_changes",
+                "continue_work_plan",
+            }
         ):
             self.state.pending_notices.append(
                 "Runtime decision feedback: the last action added context but did not "
@@ -969,6 +1222,30 @@ class ProgressController:
                 "the still-open fact it will decide; otherwise implement or verify the "
                 "current work unit. Tools remain available for a genuinely new dependency."
             )
+        if tool_name in DISCOVERY_TOOLS and executed:
+            if obligation_id and decision_question and decision_effect:
+                self.state.pending_notices.append(
+                    "Runtime decision feedback: evidence was gathered for work item "
+                    f"{obligation_id} to decide: {decision_question} Its declared effect was: "
+                    f"{decision_effect} Update the work plan with the resulting hypothesis, "
+                    "blocker, or candidate action before requesting more repository evidence."
+                )
+            elif phase_before in {
+                "implement",
+                "repair_failure",
+                "complete_and_verify_changes",
+                "continue_work_plan",
+                "interpret_active_evidence",
+                "resolve_active_blocker",
+            }:
+                self.ledger.unscoped_discovery_count += 1
+                self.state.pending_notices.append(
+                    "Runtime decision feedback: the implementation surface was already grounded, "
+                    "but this discovery action did not state what decision it could change. "
+                    "Use the evidence now; before another read, name the concrete blocking unknown "
+                    "with obligation_id, decision_question, and decision_effect; otherwise "
+                    "update the work plan, implement, or verify."
+                )
         self._maybe_intervene()
         return evidence
 
@@ -1074,6 +1351,11 @@ class ProgressController:
             "evidence_expansion_count": self.ledger.evidence_expansion_count,
             "no_progress_count": self.ledger.no_progress_count,
             "evidence_expansion_streak": self.state.evidence_expansion_streak,
+            "unscoped_discovery_count": self.ledger.unscoped_discovery_count,
+            "decision_progress_count": (
+                self.ledger.work_plan.decision_progress_count
+            ),
+            "evidence_only_count": self.ledger.evidence_only_count,
             "delivery_review_status": (
                 "completed"
                 if self.state.delivery_review_completed

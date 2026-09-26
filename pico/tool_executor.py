@@ -55,6 +55,18 @@ class ToolExecutor:
 
     def _progress_args(self, name, args):
         """Normalize deterministic reads to the evidence they can actually return."""
+        intent = {
+            key: args[key]
+            for key in (
+                "obligation_id",
+                "obligation_ids",
+                "decision_question",
+                "decision_effect",
+                "change_hypothesis",
+                "expected_outcome",
+            )
+            if str(args.get(key, "")).strip()
+        }
         if name == "read_file":
             path = self.agent.path(args["path"])
             try:
@@ -66,7 +78,12 @@ class ToolExecutor:
                 int(args.get("end", self.agent.tool_context().source_window_lines)),
                 line_count,
             )
-            return {"path": path.relative_to(self.agent.root).as_posix(), "start": start, "end": end}
+            return {
+                "path": path.relative_to(self.agent.root).as_posix(),
+                "start": start,
+                "end": end,
+                **intent,
+            }
         if name == "read_files":
             files = []
             for raw_path in args.get("paths", []):
@@ -80,13 +97,13 @@ class ToolExecutor:
                     "start": 1,
                     "end": min(self.agent.tool_context().source_window_lines, line_count),
                 })
-            return {"files": files}
+            return {"files": files, **intent}
         if name in {"list_files", "search"}:
             normalized = dict(args)
             path = self.agent.path(args.get("path", "."))
             normalized["path"] = path.relative_to(self.agent.root).as_posix() or "."
-            return normalized
-        return args
+            return {**normalized, **intent}
+        return {**args, **intent}
 
     def _finalize(self, name, args, result, progress_recorded=False, progress_args=None):
         controller = getattr(self.agent, "progress_controller", None)
