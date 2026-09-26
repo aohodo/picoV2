@@ -1,7 +1,7 @@
 import json
 from types import SimpleNamespace
 
-from pico.context_projection import (
+from pico.context.context_projection import (
     DEFAULT_EVENT_CHAR_BUDGET,
     ContextProjector,
     _head_tail,
@@ -9,8 +9,8 @@ from pico.context_projection import (
     discard_stale_read_groups,
     project_model_events,
 )
-from pico.features import memory as memorylib
-from pico.read_observation import render_reads, visible_read_coverage
+from pico.context.read_observation import render_reads, visible_read_coverage
+from pico.memory import memory_store as memorylib
 
 
 def test_compaction_marker_cannot_exceed_tiny_remaining_budget():

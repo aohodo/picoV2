@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 from http.client import RemoteDisconnected
 
-from ..model_contract import ModelCapabilities, ModelToolCall, ModelTurn
+from ..domain.model_contract import ModelCapabilities, ModelToolCall, ModelTurn
 
 OPENAI_COMPATIBLE_USER_AGENT = "pico/0.1"
 MAX_PROVIDER_RESPONSE_BYTES = 16 * 1024 * 1024

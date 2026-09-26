@@ -3,16 +3,16 @@ import os
 import pytest
 
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
-from pico.checkpoint import (
+from pico.domain.task_state import TaskState
+from pico.memory.memory_store import FILE_SUMMARY_LIMIT, NOTE_TAG_LIMIT, LayeredMemory
+from pico.persistence.checkpoint_store import (
     MAX_CHECKPOINT_GOAL_CHARS,
     MAX_CHECKPOINTS,
     create_checkpoint,
 )
-from pico.features.memory import FILE_SUMMARY_LIMIT, NOTE_TAG_LIMIT, LayeredMemory
+from pico.persistence.state_root import WorkspaceState
 from pico.runtime import MAX_SESSION_HISTORY_ITEMS
-from pico.state_root import WorkspaceState
-from pico.task_state import TaskState
-from pico.transactional_workspace import TransactionalWorkspace
+from pico.workspace.transactional_workspace import TransactionalWorkspace
 
 
 def _agent(tmp_path):

@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from pico import Pico, SessionStore, WorkspaceContext
-from pico.model_contract import ModelToolCall, ModelTurn
+from pico.domain.model_contract import ModelToolCall, ModelTurn
 from pico.providers.clients import OpenAICompatibleModelClient, ProviderResponseError
 
 

@@ -3,17 +3,17 @@ import time
 
 import pytest
 
+from pico.persistence.session_store import SessionStore
 from pico.providers.clients import FakeModelClient
-from pico.repository_graph import RepositoryGraph
-from pico.repository_intelligence import (
+from pico.runtime import Pico
+from pico.workspace import WorkspaceContext
+from pico.workspace.repository_graph import RepositoryGraph
+from pico.workspace.repository_intelligence import (
     MultilspySemanticBackend,
     RepositoryIntelligence,
     SemanticEvidence,
     SemanticLocation,
 )
-from pico.runtime import Pico
-from pico.session_store import SessionStore
-from pico.workspace import WorkspaceContext
 
 
 def test_python_graph_reports_symbols_and_reverse_dependencies(tmp_path):

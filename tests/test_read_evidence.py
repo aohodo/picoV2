@@ -3,9 +3,9 @@ from types import SimpleNamespace
 import pytest
 
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
-from pico.context_projection import project_model_events
+from pico.context.context_projection import project_model_events
+from pico.context.read_observation import render_reads
 from pico.progress import ExecutionLedger
-from pico.read_observation import render_reads
 from pico.tools import tool_search, validate_tool
 
 

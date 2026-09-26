@@ -4,10 +4,10 @@ import sys
 from pathlib import Path
 
 from pico.cli import _build_model_client, build_arg_parser
-from pico.config import load_project_env
-from pico.progress_output import ConsoleProgressRenderer
+from pico.cli.config_loader import load_project_env
+from pico.cli.progress_output import ConsoleProgressRenderer
+from pico.persistence.session_store import SessionStore
 from pico.runtime import Pico
-from pico.session_store import SessionStore
 from pico.workspace import WorkspaceContext
 
 CASES = {

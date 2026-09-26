@@ -1,0 +1,113 @@
+"""Stable prompt prefix construction."""
+
+import hashlib
+import json
+import textwrap
+from dataclasses import dataclass
+
+from ..progress.verification_feedback import WORK_GUIDANCE
+from ..workspace import now
+
+
+@dataclass
+class PromptPrefix:
+    # prefix 除了文本本身，还带一小份元数据，
+    # 这样 runtime 才能明确判断 prefix 是否可以复用。
+    text: str
+    hash: str
+    workspace_fingerprint: str
+    tool_signature: str
+    built_at: str
+
+
+def tool_signature(tools):
+    payload = []
+    for name in sorted(tools):
+        tool = tools[name]
+        payload.append(
+            {
+                "name": name,
+                "schema": tool["schema"],
+                "risky": tool["risky"],
+                "description": tool["description"],
+            }
+        )
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def build_prompt_prefix(workspace, tools, built_at=None):
+    tool_lines = []
+    for name, tool in tools.items():
+        fields = ", ".join(
+            f"{key}: {json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else value}"
+            for key, value in tool["schema"].items()
+        )
+        risk = "approval required" if tool["risky"] else "safe"
+        tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
+    tool_text = "\n".join(tool_lines)
+    examples = (
+        '<tool>{"name":"list_files","args":{"path":"."}}</tool>\n'
+        '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>\n'
+        '<tool>{"name":"inspect_repository","args":{"query":"service implementation","limit":12}}</tool>\n'
+        '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n'
+        "    return -1\n</content></tool>\n"
+        '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text>'
+        "<new_text>return mid</new_text></tool>\n"
+        '<tool>{"name":"apply_patch","args":{"edits":['
+        '{"path":"service.py","old_text":"return 1","new_text":"return 2"},'
+        '{"path":"test_service.py","old_text":"== 1","new_text":"== 2"}'
+        ']}}</tool>\n'
+        '<tool>{"name":"run_verification","args":{"argv":["python","-m","pytest","-q"],'
+        '"timeout":120}}</tool>\n'
+        "<final>Done.</final>"
+    )
+    # prefix 可以理解成 agent 的“工作手册”：
+    # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
+    text = textwrap.dedent(
+        f"""\
+        You are pico, a small local coding agent working inside a local repository.
+
+        Rules:
+        - {WORK_GUIDANCE}
+        - Use tools instead of guessing about the workspace.
+        - Return exactly one <tool>...</tool> or one <final>...</final>.
+        - Tool calls must look like:
+          <tool>{{"name":"tool_name","args":{{...}}}}</tool>
+        - For write_file and patch_file with multi-line text, prefer XML style:
+          <tool name="write_file" path="file.py"><content>...</content></tool>
+        - Final answers must look like:
+          <final>your answer</final>
+        - Never invent tool results.
+        - Keep answers concise and concrete.
+        - If the user asks you to create or update a specific file and the path is clear, use write_file, patch_file, or apply_patch instead of repeatedly listing files.
+        - Use apply_patch for related exact edits across multiple locations or files. It validates the complete work unit before writing; if one edit fails, correct that patch set from the returned current source.
+        - Before writing tests for existing code, read the implementation first.
+        - Work from the requested behavior, follow relevant calls and data, implement a focused change, and use test results to correct it. Use inspect_repository when symbol or dependency navigation helps.
+        - For a multi-requirement coding request, call update_work_plan to name concise delivery obligations and select one active item. Keep a simple local task to one item. Repository graph candidates are hints, not unfinished work.
+        - Bind discovery to the active item with obligation_id, decision_question, and decision_effect. After receiving evidence, update the plan with the resulting hypothesis, blocker, or candidate action before reading again. When action_readiness.status=ready_to_act, implement the smallest coherent change.
+        - Put obligation_ids and the evidence-backed change_hypothesis on mutations, and obligation_ids plus expected_outcome on verification. These fields explain a decision and never grant permission or prove completion.
+        - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
+        - New files should be complete and runnable, including obvious imports.
+        - Reuse available source and results; reread when information is missing or code has changed. Failed tools and tests are feedback for the next action, not proof the task cannot be completed.
+        - Use run_verification, not run_shell, for tests, builds, lint, and type checks. It runs one argv directly and preserves the real exit status.
+        - Set run_verification purpose=acceptance only for real delivery checks that must pass. Use purpose=diagnostic for generated probes or experiments; diagnostic results do not satisfy or block delivery.
+        - Do not use run_verification for listing, searching, or reading repository files; use the typed read tools.
+        - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, apply_patch, run_shell, run_verification, or delegate with args={{}}.
+
+        Tools:
+        {tool_text}
+
+        Valid response examples:
+        {examples}
+
+        {workspace.text()}
+        """
+    ).strip()
+    signature = tool_signature(tools)
+    return PromptPrefix(
+        text=text,
+        hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        workspace_fingerprint=workspace.fingerprint(),
+        tool_signature=signature,
+        built_at=built_at or now(),
+    )

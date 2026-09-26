@@ -1,11 +1,11 @@
 from io import StringIO
 
 from pico.cli import run_exit_code
-from pico.progress_output import ConsoleProgressRenderer
+from pico.cli.progress_output import ConsoleProgressRenderer
+from pico.domain.task_state import TaskState
+from pico.persistence.session_store import SessionStore
 from pico.providers.clients import FakeModelClient
 from pico.runtime import Pico
-from pico.session_store import SessionStore
-from pico.task_state import TaskState
 from pico.workspace import WorkspaceContext
 
 

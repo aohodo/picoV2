@@ -1,10 +1,16 @@
 import json
 
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
-from pico.context_projection import _project_runtime_state
-from pico.interaction_policy import build_interaction_contract, extract_referenced_paths
+from pico.context.context_projection import _project_runtime_state
+from pico.context.working_set import (
+    build_initial_working_set,
+    project_current_working_set,
+)
+from pico.domain.interaction_policy import (
+    build_interaction_contract,
+    extract_referenced_paths,
+)
 from pico.progress import ProgressController
-from pico.working_set import build_initial_working_set, project_current_working_set
 
 
 def _observe_read(controller, path):

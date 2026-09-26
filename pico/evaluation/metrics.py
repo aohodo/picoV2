@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..config import load_project_env, provider_env
+from ..cli.config_loader import load_project_env, provider_env
 from ..providers.clients import (
     AnthropicCompatibleModelClient,
     FakeModelClient,

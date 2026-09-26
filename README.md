@@ -1,8 +1,10 @@
-# Pico V2
+# Pico V3
 
 [![CI](https://github.com/aohodo/picoV2/actions/workflows/ci.yml/badge.svg)](https://github.com/aohodo/picoV2/actions/workflows/ci.yml)
 
 `pico` 是一个受熟练程序员工作机制启发的、证据驱动且具有事务执行边界的本地 Coding Agent Runtime。它把软件开发建模为对“预期程序行为”和“实际运行证据”的持续校准，而不是让模型在一段不断增长的聊天历史里自由调用工具。
+
+V3 保留 V2 的行为语义和安全边界，将原本集中在主循环中的调度显式建模为 LangGraph 状态图。模型轮次、工具轮次、最终化和交付是可单独测试的运行阶段；证据账本、验证语义和事务工作区仍由 Pico 自己的领域组件统一管理，避免图框架和持久化层成为两个状态权威。
 
 Pico 直接运行在终端中，围绕当前目标建立局部代码理解，区分已确认事实和待解决问题，在编辑与运行之间小步推进，并优先解释仍未解决的失败。所有修改先发生在事务型 Shadow 工作区中；只有当前代码、验证结果和交付要求一致时，才进入 Review/Commit。
 
@@ -20,6 +22,7 @@ Pico 直接运行在终端中，围绕当前目标建立局部代码理解，区
 - 包名是 `pico`
 - CLI 命令是 `pico`
 - 模块入口是 `python -m pico`
+- LangGraph 显式编排 `bootstrap → action turn → finalization → delivery/stop`
 - 通过 `work_focus` 和 evidence frontier 维护当前已知事实、未决问题和下一阶段
 - 从用户明确指出的文件构建有修订身份的首轮 source working set
 - 支持单文件修改和可回滚的原子跨文件 `apply_patch` 工作单元
@@ -36,7 +39,7 @@ Pico 直接运行在终端中，围绕当前目标建立局部代码理解，区
 
 ## 核心设计
 
-Pico V2 的主循环不是“尽可能读完仓库再一次性生成答案”，而是熟练程序员常见的交替推进过程：
+Pico V3 的主循环不是“尽可能读完仓库再一次性生成答案”，而是熟练程序员常见的交替推进过程：
 
 ```text
 目标与约束
@@ -50,9 +53,45 @@ Pico V2 的主循环不是“尽可能读完仓库再一次性生成答案”，
 
 Runtime 保存的是支撑下一步判断的工程事实，而不是模型的私有推理过程：源码范围及其修订、调用关系、未验证修改、尚未消解的失败、验证身份、事务状态和用户约束。详细研究依据、架构映射、非目标和评测假设见 [Human-Inspired Programming Loop](docs/architecture/human-inspired-programming-loop.md)。
 
+V3 的编排边界、状态权威和 V2 等价性原则见 [LangGraph Runtime V3](docs/architecture/langgraph-runtime-v3.md)。
+
+### 启动链路与包结构
+
+Pico 只有一条产品启动链，不保留并行的 demo Runtime：
+
+```text
+python -m pico / pico
+  → pico/__main__.py
+  → pico/cli/cli_runtime.py::main()
+  → pico/runtime/pico_runtime.py::Pico
+  → pico/runtime/agent_graph_runtime.py::AgentGraphRuntime
+```
+
+`pico/` 根目录只保留 Python 包入口，其余代码按责任组织：
+
+```text
+pico/
+├─ cli/          # 参数、配置和终端交互
+├─ runtime/      # LangGraph 阶段编排与 Pico 总装
+├─ domain/       # 任务、模型合约和交互策略
+├─ context/      # 工作集、证据投影和 Prompt 上下文
+├─ memory/       # Working / Durable Memory
+├─ progress/     # 证据账本、失败反馈和验证语义
+├─ tools/        # Tool schema、校验、执行和 patch
+├─ execution/    # 宿主命令边界与模型执行策略
+├─ workspace/    # 仓库智能、文档和事务工作区
+├─ persistence/  # Session、Run、Checkpoint 和 state root
+├─ providers/    # 模型供应商适配
+├─ security/     # 密钥边界和脱敏
+├─ evaluation/   # benchmark 与离线评测
+└─ utils/        # 无领域状态的路径、文本和时间工具
+```
+
+V2 的稳定实现保留在 `pico-v2-stable` 分支；V3 不通过同时保留两套主循环来实现兼容，而是用完整 V2 回归套件验证等价性。
+
 ## 当前验证状态
 
-当前仓库回归为 `229 passed, 1 skipped`。除单元和状态转换测试外，Pico 还使用 Qwen3.8-Flash 在隔离的历史项目副本中执行过真实任务：
+当前仓库回归为 `230 passed, 1 skipped`。除单元和状态转换测试外，Pico 还使用 Qwen3.8-Flash 在隔离的历史项目副本中执行过真实任务：
 
 | 任务 | 结果 | 观察 |
 | --- | --- | --- |

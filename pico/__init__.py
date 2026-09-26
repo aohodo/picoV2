@@ -1,4 +1,5 @@
 from .cli import build_agent, build_arg_parser, build_welcome, main
+from .persistence import SessionConflictError, SessionLoadError
 from .providers.clients import (
     AnthropicCompatibleModelClient,
     FakeModelClient,
@@ -6,7 +7,6 @@ from .providers.clients import (
     OpenAICompatibleModelClient,
 )
 from .runtime import Pico, SessionStore
-from .session_store import SessionConflictError, SessionLoadError
 from .workspace import WorkspaceContext
 
 __all__ = [

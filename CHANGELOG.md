@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 - Unreleased
+
+- Migrate the coding-agent control flow to an explicit LangGraph runtime.
+- Preserve Pico's evidence-driven progress, transactional workspace, and
+  verification-gated delivery as domain-owned services.
+
 ## 0.2.0 - 2026-09-26
 
 - Reworked Pico into a human-inspired, evidence-driven coding Runtime.

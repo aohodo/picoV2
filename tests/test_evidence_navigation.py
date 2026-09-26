@@ -1,7 +1,7 @@
+from pico.context.read_observation import compact_read_observation, render_reads
 from pico.progress import ExecutionLedger, ProgressController
-from pico.read_observation import compact_read_observation, render_reads
-from pico.repository_graph import RepositoryGraph
-from pico.repository_intelligence import RepositoryIntelligence
+from pico.workspace.repository_graph import RepositoryGraph
+from pico.workspace.repository_intelligence import RepositoryIntelligence
 
 
 def test_late_symbol_and_callee_are_navigable(tmp_path):

@@ -1,0 +1,130 @@
+"""工作区快照工具。
+
+这个模块负责在 agent 按需读文件之前，先给它一份便宜的“仓库第一印象”。
+这份快照刻意保持小而稳定：主要包含 Git 事实和少量白名单项目文档。
+"""
+
+import hashlib
+import json
+import os
+import shutil
+import stat
+import subprocess
+import textwrap
+from pathlib import Path
+
+from ..utils import clip, native_path
+from .git_support import run_git
+from .text_document import TextDecodingError, read_text_document
+
+MAX_HISTORY = 12000
+# 这些文件最可能直接影响 agent 的行动方式。
+# 我们不会预加载整个仓库，只会先给模型一小份“导航包”。
+DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
+IGNORED_PATH_NAMES = {".git", ".pico", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
+
+
+def remove_workspace_tree(path):
+    """Remove an owned workspace tree, including read-only Git files on Windows."""
+    path = native_path(path)
+    if not path.exists():
+        return
+
+    def make_writable_and_retry(function, value, exc_info):
+        try:
+            os.chmod(value, stat.S_IWRITE)
+            function(value)
+        except OSError:
+            raise exc_info[1]
+
+    shutil.rmtree(path, onerror=make_writable_and_retry)
+
+
+class WorkspaceContext:
+    def __init__(self, cwd, repo_root, branch, default_branch, status, recent_commits, project_docs):
+        self.cwd = cwd
+        self.repo_root = repo_root
+        self.branch = branch
+        self.default_branch = default_branch
+        self.status = status
+        self.recent_commits = recent_commits
+        self.project_docs = project_docs
+
+    @classmethod
+    def build(cls, cwd, repo_root_override=None):
+        cwd = Path(cwd).resolve()
+
+        def git(args, fallback=""):
+            try:
+                result = run_git(args, cwd=cwd, check=True, timeout=5)
+                return result.stdout.strip() or fallback
+            except (OSError, subprocess.SubprocessError):
+                return fallback
+
+        repo_root = (
+            Path(repo_root_override).resolve()
+            if repo_root_override is not None
+            else Path(git(["rev-parse", "--show-toplevel"], str(cwd))).resolve()
+        )
+        docs = {}
+        # 同时扫描 repo_root 和 cwd，这样在子目录启动时也能看到本地文档；
+        # 但用相对路径做 key，避免同一份文档被重复收集。
+        for base in (repo_root, cwd):
+            for name in DOC_NAMES:
+                path = base / name
+                if not path.exists():
+                    continue
+                key = str(path.relative_to(repo_root))
+                if key in docs:
+                    continue
+                try:
+                    docs[key] = clip(read_text_document(path).text, 1200)
+                except (OSError, TextDecodingError):
+                    continue
+
+        default_branch = git(
+            ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], "origin/main"
+        ) or "origin/main"
+        return cls(
+            cwd=str(cwd),
+            repo_root=str(repo_root),
+            branch=git(["branch", "--show-current"], "-") or "-",
+            default_branch=default_branch.removeprefix("origin/"),
+            status=clip(git(["status", "--short"], "clean") or "clean", 1500),
+            recent_commits=[line for line in git(["log", "--oneline", "-5"]).splitlines() if line],
+            project_docs=docs,
+        )
+
+    def text(self):
+        # 这段文本会被塞进 prompt prefix，作为相对稳定的基线上下文。
+        commits = "\n".join(f"- {line}" for line in self.recent_commits) or "- none"
+        docs = "\n".join(f"- {path}\n{snippet}" for path, snippet in self.project_docs.items()) or "- none"
+        return textwrap.dedent(
+            f"""\
+            Workspace:
+            - cwd: {self.cwd}
+            - repo_root: {self.repo_root}
+            - branch: {self.branch}
+            - default_branch: {self.default_branch}
+            - status:
+            {self.status}
+            - recent_commits:
+            {commits}
+            - project_docs:
+            {docs}
+            """
+        ).strip()
+
+    def fingerprint(self):
+        # 这个指纹用来判断仓库状态是否发生了足够大的变化，
+        # 从而决定是否需要重建缓存中的 prompt prefix。
+        payload = {
+            "cwd": self.cwd,
+            "repo_root": self.repo_root,
+            "branch": self.branch,
+            "default_branch": self.default_branch,
+            "status": self.status,
+            "recent_commits": list(self.recent_commits),
+            "project_docs": dict(self.project_docs),
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()

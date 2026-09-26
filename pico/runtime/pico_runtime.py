@@ -1,0 +1,1655 @@
+"""Agent 运行时核心逻辑。
+
+Pico 就是包在模型外面的控制循环：负责组 prompt、解析模型输出、
+校验并执行工具、写 trace、更新工作记忆，以及在合适的时候停下来。
+"""
+
+import hashlib
+import json
+import os
+import re
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+from .. import tools as toolkit
+from ..context.context_manager import ContextManager
+from ..context.context_projection import ContextProjector, project_model_events
+from ..context.prompt_prefix import build_prompt_prefix, tool_signature
+from ..domain.interaction_policy import (
+    PACKAGE_LAYOUTS,
+    PreferenceError,
+    WorkspacePreferenceStore,
+    build_interaction_contract,
+    is_executable_test_artifact,
+    path_matches_patterns,
+)
+from ..domain.run_outcome import RunOutcome
+from ..domain.task_state import TaskState
+from ..execution import ExecutionLease, WorkspaceCommandRunner
+from ..execution.model_execution_policy import ModelExecutionPolicy
+from ..memory import memory_store as memorylib
+from ..memory.memory_admission import extract_explicit_memory
+from ..persistence import SessionStore, WorkspaceState
+from ..persistence import checkpoint_store as checkpointlib
+from ..persistence.checkpoint_store import CHECKPOINT_NONE_STATUS
+from ..persistence.run_store import RunStore
+from ..progress import ExecutionLedger
+from ..security import REDACTED_VALUE, SecretBoundary
+from ..security import secret_boundary as securitylib
+from ..tools.tool_context import ToolContext
+from ..tools.tool_executor import ToolExecutor
+from ..utils.path_utils import logical_path, native_path
+from ..workspace import (
+    COPY_EXCLUDES,
+    MAX_HISTORY,
+    TERMINAL_STATES,
+    RepositoryIntelligence,
+    TransactionalWorkspace,
+    TransactionContext,
+    WorkspaceContext,
+    clip,
+    now,
+)
+from ..workspace.text_document import TextDecodingError
+from .model_protocol_runtime import (
+    extract as extract_protocol_text,
+)
+from .model_protocol_runtime import (
+    extract_raw as extract_raw_protocol_text,
+)
+from .model_protocol_runtime import (
+    parse_attrs as parse_protocol_attrs,
+)
+from .model_protocol_runtime import (
+    parse_model_output,
+)
+from .model_protocol_runtime import (
+    parse_xml_tool as parse_xml_tool_output,
+)
+from .model_protocol_runtime import (
+    retry_notice as protocol_retry_notice,
+)
+from .session_state_runtime import normalize_session
+
+DEFAULT_SHELL_ENV_ALLOWLIST = (
+    "APPDATA",
+    "COMSPEC",
+    "HOME",
+    "GRADLE_HOME",
+    "JAVA_HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOCALAPPDATA",
+    "LOGNAME",
+    "MAVEN_HOME",
+    "PATH",
+    "PATHEXT",
+    "PROGRAMDATA",
+    "PWD",
+    "SHELL",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TERM",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "USER",
+    "USERPROFILE",
+    "WINDIR",
+)
+MAX_SESSION_HISTORY_ITEMS = 128
+MAX_SESSION_HISTORY_CONTENT_CHARS = 4000
+MAX_SESSION_TOOL_ARGUMENT_CHARS = 2000
+DEFAULT_FEATURE_FLAGS = {
+    "memory": True,
+    "relevant_memory": True,
+    "context_reduction": True,
+    "prompt_cache": True,
+}
+SECRET_SHAPED_TEXT_PATTERN = re.compile(
+    r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,}|<redacted>)"
+)
+
+__all__ = ["Pico", "SessionStore"]
+
+
+class Pico:
+    def __init__(
+        self,
+        model_client,
+        workspace,
+        session_store,
+        session=None,
+        run_store=None,
+        approval_policy="ask",
+        max_steps=6,
+        max_new_tokens=None,
+        depth=0,
+        max_depth=1,
+        read_only=False,
+        shell_env_allowlist=None,
+        secret_env_names=None,
+        feature_flags=None,
+        allowed_tools=None,
+        commit_policy=None,
+        state_root=None,
+        transaction_context=None,
+        sandbox_image="pico-sandbox:1",
+        soft_discovery_limit=None,
+        hard_discovery_limit=None,
+        model_execution_policy="adaptive",
+        progress_sink=None,
+        package_layout=None,
+        semantic_index="auto",
+    ):
+        self.model_client = model_client
+        self.workspace = workspace
+        self.source_root = Path(workspace.repo_root).resolve()
+        self.root = self.source_root
+        self.session_store = session_store
+        self._configure_execution(
+            approval_policy=approval_policy,
+            commit_policy=commit_policy,
+            max_steps=max_steps,
+            max_new_tokens=max_new_tokens,
+            model_execution_policy=model_execution_policy,
+            semantic_index=semantic_index,
+        )
+        self._configure_runtime_options(
+            depth=depth,
+            max_depth=max_depth,
+            read_only=read_only,
+            shell_env_allowlist=shell_env_allowlist,
+            feature_flags=feature_flags,
+            allowed_tools=allowed_tools,
+            sandbox_image=sandbox_image,
+            soft_discovery_limit=soft_discovery_limit,
+            hard_discovery_limit=hard_discovery_limit,
+            progress_sink=progress_sink,
+        )
+        self._configure_security(secret_env_names, transaction_context)
+        fallback_state_root = self._configure_storage(state_root)
+        self._configure_preferences(fallback_state_root, package_layout)
+        self._configure_run_store(run_store, fallback_state_root)
+        self._load_session(session)
+        self._restore_active_transaction()
+        self._build_runtime_services(fallback_state_root)
+        self._reset_transient_state()
+        self._recover_orphaned_runs()
+        self.session_path = self.session_store.save(self.session)
+
+    def _configure_execution(
+        self,
+        *,
+        approval_policy,
+        commit_policy,
+        max_steps,
+        max_new_tokens,
+        model_execution_policy,
+        semantic_index,
+    ):
+        self.approval_policy = str(approval_policy)
+        if self.approval_policy not in {"ask", "auto", "never"}:
+            raise ValueError("approval_policy must be 'ask', 'auto', or 'never'")
+        self.max_steps = int(max_steps)
+        self.max_new_tokens = (
+            int(max_new_tokens) if max_new_tokens not in (None, "") else None
+        )
+        if self.max_steps < 1:
+            raise ValueError("max_steps must be positive")
+        if self.max_new_tokens is not None and self.max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive")
+        self.model_execution_policy = ModelExecutionPolicy(model_execution_policy)
+        self.semantic_index = str(semantic_index or "auto").strip().lower()
+        if self.semantic_index not in {"auto", "off"}:
+            raise ValueError("semantic_index must be 'auto' or 'off'")
+        self.commit_policy = str(
+            commit_policy or ("auto" if self.approval_policy == "auto" else "review")
+        )
+        if self.commit_policy not in {"review", "auto"}:
+            raise ValueError("commit_policy must be 'review' or 'auto'")
+
+    def _configure_runtime_options(
+        self,
+        *,
+        depth,
+        max_depth,
+        read_only,
+        shell_env_allowlist,
+        feature_flags,
+        allowed_tools,
+        sandbox_image,
+        soft_discovery_limit,
+        hard_discovery_limit,
+        progress_sink,
+    ):
+        self.depth = depth
+        self.max_depth = max_depth
+        self.read_only = read_only
+        self.shell_env_allowlist = tuple(
+            shell_env_allowlist or DEFAULT_SHELL_ENV_ALLOWLIST
+        )
+        self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
+        if feature_flags:
+            self.feature_flags.update(
+                {str(key): bool(value) for key, value in feature_flags.items()}
+            )
+        self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
+        self.sandbox_image = str(sandbox_image)
+        self.soft_discovery_limit = soft_discovery_limit
+        self.hard_discovery_limit = hard_discovery_limit
+        self.progress_sink = progress_sink
+
+    def _configure_security(self, secret_env_names, transaction_context):
+        self.secret_env_names = {str(name).upper() for name in (secret_env_names or ())}
+        self.transaction_context = transaction_context
+        if transaction_context is not None:
+            self.root = Path(transaction_context.execution_root)
+        self.secret_boundary = (
+            transaction_context.secret_boundary
+            if transaction_context is not None
+            else SecretBoundary(secret_env_names=self.secret_env_names)
+        )
+        for attribute in ("api_key", "token", "auth_token"):
+            self.secret_boundary.register_secret(
+                getattr(self.model_client, attribute, "")
+            )
+        self.session_store.secret_boundary = self.secret_boundary
+
+    def _configure_storage(self, state_root):
+        self.workspace_state = None
+        if state_root is not None:
+            self.workspace_state = WorkspaceState(
+                self.source_root, root=state_root
+            ).ensure()
+            self.transactions_root = self.workspace_state.transactions
+        else:
+            self.transactions_root = (
+                Path(self.session_store.root).parent / "transactions"
+            )
+            self.transactions_root.mkdir(parents=True, exist_ok=True)
+        configured_package_cache = str(
+            os.environ.get("PICO_PACKAGE_CACHE_ROOT", "")
+        ).strip()
+        self.package_cache_root = (
+            Path(configured_package_cache).expanduser()
+            if configured_package_cache
+            else (
+                self.workspace_state.cache
+                if self.workspace_state
+                else Path(self.session_store.root).parent / "cache"
+            )
+        ).resolve()
+        self.package_cache_root.mkdir(parents=True, exist_ok=True)
+        return Path(self.session_store.root).parent
+
+    def _configure_preferences(self, fallback_state_root, package_layout):
+        self.semantic_cache_root = (
+            self.workspace_state.root if self.workspace_state else fallback_state_root
+        ) / "lsp"
+        preference_root = (
+            self.workspace_state.root if self.workspace_state else fallback_state_root
+        )
+        self.preference_store = WorkspacePreferenceStore(
+            preference_root / "preferences.json"
+        )
+        self.package_layout_override = (
+            str(package_layout).strip() if package_layout else ""
+        )
+        if (
+            self.package_layout_override
+            and self.package_layout_override not in PACKAGE_LAYOUTS
+        ):
+            choices = ", ".join(sorted(PACKAGE_LAYOUTS))
+            raise PreferenceError(f"package_layout must be one of: {choices}")
+        self.current_interaction = {}
+
+    def _configure_run_store(self, run_store, fallback_state_root):
+        self.run_store = run_store or RunStore(
+            self.workspace_state.runs
+            if self.workspace_state
+            else fallback_state_root / "runs"
+        )
+        self.run_store.secret_boundary = self.secret_boundary
+
+    def _load_session(self, session):
+        self.session = session or {
+            "id": datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+            + "-"
+            + uuid.uuid4().hex[:6],
+            "created_at": now(),
+            "workspace_root": self.workspace.repo_root,
+            "history": [],
+            "memory": memorylib.default_memory_state(),
+        }
+        self._ensure_session_shape()
+        self.model_execution_policy.load_usage(
+            self.session.get("model_usage_samples", [])
+        )
+
+    def _restore_active_transaction(self):
+        self.transaction_context = getattr(self, "transaction_context", None)
+        active_transaction_id = str(
+            self.session.get("active_transaction_id", "")
+        ).strip()
+        if self.transaction_context is None and active_transaction_id:
+            transaction = TransactionalWorkspace.load(
+                self.source_root,
+                self.transactions_root,
+                active_transaction_id,
+                secret_boundary=self.secret_boundary,
+            )
+            if transaction.state in TERMINAL_STATES:
+                # The transaction record is authoritative. A process may stop
+                # after commit/discard persisted its terminal state and removed
+                # the shadow, but before the session pointer is cleared.
+                self.session.pop("active_transaction_id", None)
+                transaction.cleanup_terminal_artifacts()
+                self.session_path = self.session_store.save(self.session)
+            elif not transaction.execution_root.exists():
+                raise RuntimeError(
+                    "RECOVERY_UNAVAILABLE: transaction shadow workspace is missing"
+                )
+            else:
+                runner = WorkspaceCommandRunner(
+                    transaction.execution_root,
+                    self.secret_boundary,
+                    env_allowlist=self.shell_env_allowlist,
+                    source_root=self.source_root,
+                    cache_root=self.package_cache_root,
+                )
+                self.transaction_context = TransactionContext(
+                    transaction_id=transaction.transaction_id,
+                    workspace=transaction,
+                    secret_boundary=self.secret_boundary,
+                    execution_lease=ExecutionLease(runner),
+                    owns_context=True,
+                )
+                self.root = transaction.execution_root
+
+    def _build_runtime_services(self, fallback_state_root):
+        self.memory = memorylib.LayeredMemory(
+            self.session.setdefault("memory", memorylib.default_memory_state()),
+            workspace_root=self.root,
+            durable_root=(
+                self.workspace_state.memory
+                if self.workspace_state
+                else fallback_state_root / "memory"
+            ),
+        )
+        self.session["memory"] = self.memory.to_dict()
+        self.tools = self._apply_tool_allowlist(self.build_tools())
+        self.tool_executor = ToolExecutor(self)
+        self.prefix_state = self.build_prefix()
+        self.prefix = self.prefix_state.text
+        self.context_manager = ContextManager(self)
+        self.resume_state = self.evaluate_resume_state()
+
+    def _reset_transient_state(self):
+        self.current_task_state = None
+        self.current_run_dir = None
+        self.current_run_lease = None
+        self.current_run_started_at = None
+        self.last_prompt_metadata = {}
+        self.last_completion_metadata = {}
+        self.last_durable_promotions = []
+        self.last_durable_rejections = []
+        self.last_durable_superseded = []
+        self._last_tool_result_metadata = {}
+        self.last_verification_succeeded = None
+        self.verification_stale = False
+        self.last_shell_validation_succeeded = (
+            None  # compatibility for persisted V1 state
+        )
+        self.last_run_outcome = None
+        self.progress_controller = None
+        self.repository_intelligence = None
+        self.last_repository_evidence = {}
+        self._last_prefix_refresh = {
+            "workspace_changed": False,
+            "prefix_changed": False,
+        }
+
+    def effective_package_layout(self):
+        if self.package_layout_override:
+            return self.package_layout_override
+        return self.preference_store.load()["package_layout"]
+
+    def preferences_view(self):
+        stored = self.preference_store.load()
+        return {
+            "package_layout": self.effective_package_layout(),
+            "workspace_package_layout": stored["package_layout"],
+            "source": "command_line" if self.package_layout_override else "workspace",
+        }
+
+    def set_workspace_package_layout(self, value):
+        values = self.preference_store.set_package_layout(value)
+        self.package_layout_override = ""
+        return values
+
+    def reset_workspace_package_layout(self):
+        values = self.preference_store.reset_package_layout()
+        self.package_layout_override = ""
+        return values
+
+    def interaction_contract(self, user_message):
+        contract = build_interaction_contract(
+            user_message, self.effective_package_layout()
+        )
+        continuation = str(user_message or "").strip().casefold() in {
+            "continue",
+            "continue.",
+            "继续",
+            "继续吧",
+            "好的，继续",
+            "ok, continue",
+        }
+        requirements = dict(self.session.get("transaction_requirements", {}) or {})
+        if continuation and self.transaction_context is not None and requirements:
+            contract["mode"] = "implement"
+            contract["mutation_allowed"] = True
+            contract["validation_required"] = bool(
+                requirements.get("validation_required")
+            )
+            contract["test_artifact_required"] = bool(
+                requirements.get("test_artifact_required")
+            )
+            contract["protected_paths"] = list(requirements.get("protected_paths", ()))
+            for key in (
+                "referenced_paths",
+                "requested_existing_paths",
+                "requested_missing_paths",
+                "unresolved_path_mentions",
+            ):
+                contract[key] = list(requirements.get(key, ()))
+        return contract
+
+    def repository_evidence(self, user_message, limit=10):
+        try:
+            bundle = self.inspect_repository(
+                user_message, limit, include_semantic=False
+            )
+            self.last_repository_evidence = bundle.ledger_seed()
+            return clip(bundle.render(), 2400)
+        except (OSError, TextDecodingError, ValueError):
+            self.last_repository_evidence = {}
+            return ""
+
+    def inspect_repository(self, query, limit=12, include_semantic=True):
+        if (
+            self.repository_intelligence is None
+            or self.repository_intelligence.root != Path(self.root).resolve()
+        ):
+            self.close_repository_intelligence()
+            self.repository_intelligence = RepositoryIntelligence(
+                self.root,
+                semantic_mode=self.semantic_index,
+                semantic_cache_root=self.semantic_cache_root,
+            )
+        bundle = self.repository_intelligence.inspect(
+            query,
+            limit=limit,
+            include_semantic=include_semantic,
+        )
+        self.last_repository_evidence = bundle.ledger_seed()
+        if self.progress_controller is not None:
+            self.progress_controller.ledger.seed_repository_evidence(
+                self.last_repository_evidence
+            )
+        return bundle
+
+    def close_repository_intelligence(self):
+        if self.repository_intelligence is not None:
+            self.repository_intelligence.close()
+            self.repository_intelligence = None
+
+    def _recover_orphaned_runs(self):
+        for payload in self.run_store.claim_orphaned_runs():
+            task_state = TaskState.from_dict(payload)
+            transaction_error = ""
+            delivered_paths = []
+            transaction_id = str(task_state.transaction_id or "").strip()
+            if transaction_id:
+                try:
+                    if (
+                        self.transaction_context is not None
+                        and self.transaction_context.transaction_id == transaction_id
+                    ):
+                        transaction = self.transaction_context.workspace
+                    else:
+                        transaction = TransactionalWorkspace.load(
+                            self.source_root,
+                            self.transactions_root,
+                            transaction_id,
+                            secret_boundary=self.secret_boundary,
+                        )
+                    transaction.interrupt("orphaned_run")
+                    task_state.transaction_state = transaction.state
+                    if transaction.state == "COMMITTED":
+                        delivered_paths = [
+                            change["path"] for change in transaction.committed_changes()
+                        ]
+                except Exception as exc:  # noqa: BLE001 - orphan recovery must still close the run record
+                    transaction_error = self.redact_text(str(exc))
+            final = "Recovered a run left active without a live process owner."
+            task_state.stop_orphaned(final)
+            self.capture_run_outcome(
+                task_state,
+                staged_paths=delivered_paths,
+                delivered_paths=delivered_paths,
+            )
+            self.run_store.write_task_state(task_state)
+            self.emit_trace(
+                task_state,
+                "orphan_recovered",
+                {
+                    "previous_status": "running",
+                    "transaction_error": transaction_error,
+                },
+            )
+            self.emit_trace(
+                task_state,
+                "run_finished",
+                {
+                    "status": task_state.status,
+                    "stop_reason": task_state.stop_reason,
+                    "final_answer": final,
+                },
+            )
+            self.run_store.write_report(
+                task_state,
+                self.redact_artifact(self.build_report(task_state)),
+            )
+
+    def begin_transaction(self):
+        if self.transaction_context is not None:
+            return self.transaction_context
+        transaction = TransactionalWorkspace(
+            self.source_root,
+            self.transactions_root,
+            secret_boundary=self.secret_boundary,
+            source_excludes=(
+                (self.workspace_state.global_root,) if self.workspace_state else ()
+            ),
+        ).begin()
+        runner = WorkspaceCommandRunner(
+            transaction.execution_root,
+            self.secret_boundary,
+            env_allowlist=self.shell_env_allowlist,
+            source_root=self.source_root,
+            cache_root=self.package_cache_root,
+        )
+        self.transaction_context = TransactionContext(
+            transaction_id=transaction.transaction_id,
+            workspace=transaction,
+            secret_boundary=self.secret_boundary,
+            execution_lease=ExecutionLease(runner),
+            owns_context=True,
+        )
+        self.root = transaction.execution_root
+        self.workspace = WorkspaceContext.build(self.root, repo_root_override=self.root)
+        self.session["active_transaction_id"] = transaction.transaction_id
+        self.last_verification_succeeded = None
+        self.verification_stale = False
+        self.last_shell_validation_succeeded = None
+        self.memory.workspace_root = self.root
+        self.tools = self._apply_tool_allowlist(self.build_tools())
+        self._apply_prefix_state(self.build_prefix())
+        try:
+            self.session_path = self.session_store.save(self.session)
+        except Exception:
+            # The session pointer is the ownership record for a live shadow.
+            # If it cannot be persisted, the untouched new shadow must not be
+            # left orphaned and undiscoverable.
+            self.session.pop("active_transaction_id", None)
+            self.transaction_context.execution_lease.stop()
+            try:
+                transaction.discard()
+            except OSError:
+                pass
+            self.transaction_context = None
+            self.root = self.source_root
+            self.workspace = WorkspaceContext.build(
+                self.source_root, repo_root_override=self.source_root
+            )
+            self.memory.workspace_root = self.source_root
+            self.tools = self._apply_tool_allowlist(self.build_tools())
+            self._apply_prefix_state(self.build_prefix())
+            raise
+        return self.transaction_context
+
+    def _restore_source_view(self, clear_context=True):
+        context = self.transaction_context
+        self.close_repository_intelligence()
+        self.root = self.source_root
+        self.workspace = WorkspaceContext.build(
+            self.source_root, repo_root_override=self.source_root
+        )
+        self.memory.workspace_root = self.source_root
+        if clear_context:
+            if context and context.owns_context:
+                context.execution_lease.stop()
+            self.transaction_context = None
+            self.session.pop("active_transaction_id", None)
+            self.session.pop("transaction_requirements", None)
+            self.session["execution_ledger"] = {}
+        self.tools = self._apply_tool_allowlist(self.build_tools())
+        self._apply_prefix_state(self.build_prefix())
+        self.session_path = self.session_store.save(self.session)
+
+    def finalize_transaction(self):
+        context = self.transaction_context
+        if context is None or not context.owns_context:
+            return {"state": "COMMITTED", "changes": [], "conflicts": []}
+        transaction = context.workspace
+        changes = transaction.stage()
+        requirements = dict(self.session.get("transaction_requirements", {}) or {})
+        protected_paths = sorted(
+            set(requirements.get("protected_paths", ()))
+            | set((self.current_interaction or {}).get("protected_paths", ()))
+        )
+        scope_violations = [
+            change["path"]
+            for change in changes
+            if path_matches_patterns(change["path"], protected_paths)
+        ]
+        if scope_violations:
+            conflicts = transaction.block_validation(
+                "scope_constraint_violation",
+                paths=scope_violations,
+            )
+            return {
+                "state": transaction.state,
+                "changes": changes,
+                "conflicts": conflicts,
+            }
+        verification_error = self.verification_failure_reason(changes)
+        if verification_error:
+            conflicts = transaction.block_validation(verification_error)
+            return {
+                "state": transaction.state,
+                "changes": changes,
+                "conflicts": conflicts,
+            }
+        conflicts = transaction.validate_commit()
+        if conflicts:
+            return {
+                "state": transaction.state,
+                "changes": changes,
+                "conflicts": conflicts,
+            }
+        if self.commit_policy == "auto" or not changes:
+            context.execution_lease.stop()
+            transaction.commit()
+            result = {"state": transaction.state, "changes": changes, "conflicts": []}
+            self._restore_source_view(clear_context=True)
+            return result
+        return {"state": transaction.state, "changes": changes, "conflicts": []}
+
+    def verification_failure_reason(self, changes=None):
+        """Inspect delivery evidence without staging or closing the repair cycle."""
+        if (
+            self.transaction_context is None
+            or not self.transaction_context.owns_context
+        ):
+            return ""
+        if changes is None:
+            changes = self.transaction_context.workspace.diff()
+        requirements = dict(self.session.get("transaction_requirements", {}) or {})
+        ledger = (
+            self.progress_controller.ledger
+            if self.progress_controller is not None
+            else ExecutionLedger.from_dict(self.session.get("execution_ledger", {}))
+        )
+        validation_records = [
+            item for item in ledger.validations if item.get("kind") == "validation"
+        ]
+        unresolved_failures = bool(
+            ledger.unresolved_failures or ledger.unresolved_failure_count
+        )
+        unverified_changes = bool(
+            ledger.unverified_changes or ledger.unverified_change_count
+        )
+        validation_passed = bool(
+            any(item.get("status") == "ok" for item in validation_records)
+            and not unresolved_failures
+            and not unverified_changes
+        )
+        changed_test_paths = {
+            item["path"]
+            for item in changes or []
+            if is_executable_test_artifact(self.root, item["path"])
+        }
+        if (
+            requirements.get("test_artifact_required")
+            and changes
+            and not changed_test_paths
+        ):
+            return "required_test_artifact_missing"
+        if unresolved_failures:
+            return "verification_failed"
+        if self.verification_stale or (validation_records and unverified_changes):
+            return "verification_stale"
+        if self.last_verification_succeeded is False:
+            return "verification_failed"
+        if (
+            changes
+            and (
+                requirements.get("validation_required")
+                or (self.current_interaction or {}).get("validation_required")
+            )
+            and not (validation_passed or self.last_verification_succeeded is True)
+        ):
+            return "verification_required"
+        return ""
+
+    def capture_run_outcome(
+        self, task_state, staged_paths=(), delivered_paths=(), conflicts=()
+    ):
+        outcome = RunOutcome.from_task_state(
+            task_state,
+            staged_paths=staged_paths,
+            delivered_paths=delivered_paths,
+            conflicts=conflicts,
+        )
+        task_state.record_outcome(outcome)
+        self.last_run_outcome = outcome
+        return outcome
+
+    def apply_transaction(self):
+        if self.transaction_context is None:
+            raise RuntimeError("no active transaction")
+        context = self.transaction_context
+        transaction = context.workspace
+        context.execution_lease.stop()
+        committed_changes = transaction.commit()
+        result = {
+            "state": transaction.state,
+            "changes": committed_changes,
+            "conflicts": [],
+        }
+        self._restore_source_view(clear_context=True)
+        if self.current_task_state is not None:
+            self.current_task_state.transaction_state = transaction.state
+            self.current_task_state.finish_success(self.current_task_state.final_answer)
+            paths = [change["path"] for change in committed_changes]
+            self.capture_run_outcome(
+                self.current_task_state,
+                staged_paths=paths,
+                delivered_paths=paths,
+            )
+            self.run_store.write_task_state(self.current_task_state)
+            self.run_store.write_report(
+                self.current_task_state,
+                self.redact_artifact(self.build_report(self.current_task_state)),
+            )
+        return result
+
+    def discard_transaction(self):
+        if self.transaction_context is None:
+            raise RuntimeError("no active transaction")
+        transaction = self.transaction_context.workspace
+        transaction.discard()
+        self._restore_source_view(clear_context=True)
+        if self.current_task_state is not None:
+            self.current_task_state.transaction_state = transaction.state
+            self.current_task_state.stop(
+                "transaction_discarded",
+                final_answer=self.current_task_state.final_answer,
+            )
+            self.capture_run_outcome(self.current_task_state)
+            self.run_store.write_task_state(self.current_task_state)
+            self.run_store.write_report(
+                self.current_task_state,
+                self.redact_artifact(self.build_report(self.current_task_state)),
+            )
+        return {"state": transaction.state}
+
+    def interrupt_transaction(self, reason="interrupted"):
+        if (
+            self.transaction_context is not None
+            and self.transaction_context.owns_context
+        ):
+            self.transaction_context.workspace.interrupt(reason)
+            self.session_path = self.session_store.save(self.session)
+
+    @classmethod
+    def from_session(cls, model_client, workspace, session_store, session_id, **kwargs):
+        return cls(
+            model_client=model_client,
+            workspace=workspace,
+            session_store=session_store,
+            session=session_store.load(session_id),
+            **kwargs,
+        )
+
+    def _ensure_session_shape(self):
+        normalize_session(
+            self.session,
+            compact_tool_args=self.compact_tool_args,
+            event_char_budget=ContextProjector(self).event_char_budget,
+            history_item_limit=MAX_SESSION_HISTORY_ITEMS,
+            history_content_limit=MAX_SESSION_HISTORY_CONTENT_CHARS,
+        )
+
+    def current_runtime_identity(self):
+        return checkpointlib.current_runtime_identity(self)
+
+    def checkpoint_state(self):
+        return checkpointlib.checkpoint_state(self)
+
+    def current_checkpoint(self):
+        return checkpointlib.current_checkpoint(self)
+
+    def invalidate_stale_memory(self):
+        invalidated = self.memory.invalidate_stale_file_summaries()
+        self.session["memory"] = self.memory.to_dict()
+        return invalidated
+
+    def evaluate_resume_state(self):
+        return checkpointlib.evaluate_resume_state(self)
+
+    def render_checkpoint_text(self):
+        return checkpointlib.render_checkpoint_text(self)
+
+    @staticmethod
+    def remember(bucket, item, limit):
+        if not item:
+            return
+        if item in bucket:
+            bucket.remove(item)
+        bucket.append(item)
+        del bucket[:-limit]
+
+    def build_tools(self):
+        tools = toolkit.build_tool_registry(self.tool_context())
+        if "run_shell" in tools:
+            profile = self.execution_profile_view()
+            dialect = profile.get("dialect", "unavailable")
+            host_os = profile.get("host_os", "unknown")
+            python_command = profile.get("python_command", "python")
+            tools["run_shell"]["description"] = (
+                f"Run a non-inspection {dialect} command on {host_os} in the transaction workspace. "
+                f"Use {python_command} for Python; do not assume python3 exists. "
+                "Use typed repository tools for listing, searching, and source reads; "
+                f"use `{python_command} -m pytest` for Python validation."
+            )
+        if "run_verification" in tools:
+            tools["run_verification"]["description"] = (
+                "Run one verification executable directly in the transaction workspace. "
+                "Pass argv as separate elements. Use purpose=acceptance only for a real test, "
+                "build, lint, or type check whose exit status is authoritative; use "
+                "purpose=diagnostic for an exploratory probe that must not satisfy or block delivery."
+            )
+        return tools
+
+    @staticmethod
+    def _normalize_allowed_tools(allowed_tools):
+        if allowed_tools is None:
+            return None
+        normalized = tuple(str(name).strip() for name in allowed_tools)
+        if not normalized or any(not name for name in normalized):
+            raise ValueError("allowed_tools must be a non-empty sequence of tool names")
+        return normalized
+
+    def _apply_tool_allowlist(self, tools):
+        if self.allowed_tools is None:
+            return tools
+        legal_names = toolkit.legal_tool_names()
+        unknown = [name for name in self.allowed_tools if name not in legal_names]
+        if unknown:
+            raise ValueError(f"unknown allowed tool: {', '.join(unknown)}")
+        allowed = set(self.allowed_tools)
+        return {name: tool for name, tool in tools.items() if name in allowed}
+
+    def tool_signature(self):
+        return tool_signature(self.tools)
+
+    def build_prefix(self):
+        return build_prompt_prefix(workspace=self.workspace, tools=self.tools)
+
+    def _apply_prefix_state(self, prefix_state):
+        self.prefix_state = prefix_state
+        self.prefix = prefix_state.text
+
+    def refresh_prefix(self, force=False):
+        previous_hash = getattr(getattr(self, "prefix_state", None), "hash", None)
+        previous_workspace_fingerprint = getattr(
+            getattr(self, "prefix_state", None), "workspace_fingerprint", None
+        )
+
+        # 工作区事实相对稳定，所以这里按整体刷新；
+        # 只有这些事实真的变化了，才重建完整 prefix。
+        refreshed_workspace = WorkspaceContext.build(self.root)
+        refreshed_workspace_fingerprint = refreshed_workspace.fingerprint()
+        workspace_changed = (
+            force or refreshed_workspace_fingerprint != previous_workspace_fingerprint
+        )
+        if workspace_changed:
+            self.workspace = refreshed_workspace
+
+        prefix_state = (
+            self.build_prefix()
+            if workspace_changed or force or previous_hash is None
+            else self.prefix_state
+        )
+        prefix_changed = force or previous_hash != prefix_state.hash
+        if prefix_changed:
+            self._apply_prefix_state(prefix_state)
+
+        self._last_prefix_refresh = {
+            "workspace_changed": workspace_changed,
+            "prefix_changed": prefix_changed,
+        }
+        return dict(self._last_prefix_refresh)
+
+    def memory_text(self):
+        return self.memory.render_memory_text()
+
+    def history_text(self):
+        history = self.session["history"]
+        if not history:
+            return "- empty"
+
+        lines = []
+        seen_reads = set()
+        recent_start = max(0, len(history) - 6)
+        for index, item in enumerate(history):
+            recent = index >= recent_start
+            if item["role"] == "tool" and item["name"] == "read_file" and not recent:
+                path = str(item["args"].get("path", ""))
+                if path in seen_reads:
+                    continue
+                seen_reads.add(path)
+
+            if item["role"] == "tool":
+                limit = 900 if recent else 180
+                lines.append(
+                    f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}"
+                )
+                lines.append(clip(item["content"], limit))
+            else:
+                limit = 900 if recent else 220
+                lines.append(f"[{item['role']}] {clip(item['content'], limit)}")
+
+        return clip("\n".join(lines), MAX_HISTORY)
+
+    def feature_enabled(self, name):
+        return bool(self.feature_flags.get(str(name), False))
+
+    def prompt(self, user_message):
+        prompt, _ = self._build_prompt_and_metadata(user_message)
+        return prompt
+
+    def record(self, item):
+        history = self.session["history"]
+        item = self.redact_artifact(item)
+        if isinstance(item, dict):
+            item = dict(item)
+            if "content" in item:
+                item["content"] = clip(
+                    item["content"], MAX_SESSION_HISTORY_CONTENT_CHARS
+                )
+            if item.get("role") == "tool":
+                item["args"] = self.compact_tool_args(item.get("args", {}))
+        history.append(item)
+        del history[:-MAX_SESSION_HISTORY_ITEMS]
+        self.session_path = self.session_store.save(self.session)
+
+    @staticmethod
+    def compact_tool_args(args):
+        compact = {}
+        for key, value in dict(args or {}).items():
+            if isinstance(value, str) and len(value) > MAX_SESSION_TOOL_ARGUMENT_CHARS:
+                compact[key] = (
+                    f"[compacted argument; original_chars={len(value)}]\n"
+                    + clip(value, 600)
+                )
+                compact[f"{key}_chars"] = len(value)
+            else:
+                compact[key] = value
+        return compact
+
+    def record_model_events(self, events, execution_ledger=None):
+        projected, _ = project_model_events(
+            events,
+            event_limit=None,
+            char_budget=ContextProjector(self).event_char_budget,
+        )
+        self.session["model_events"] = self.redact_artifact(projected)
+        if execution_ledger is not None:
+            self.session["execution_ledger"] = self.redact_artifact(execution_ledger)
+        self.session_path = self.session_store.save(self.session)
+
+    @staticmethod
+    def looks_sensitive_env_name(name):
+        return securitylib.looks_sensitive_env_name(name)
+
+    def is_secret_env_name(self, name):
+        return securitylib.is_secret_env_name(
+            name, secret_env_names=self.secret_env_names
+        )
+
+    def configured_secret_env_items(self):
+        return securitylib.configured_secret_env_items(
+            secret_env_names=self.secret_env_names
+        )
+
+    def detected_secret_env_items(self):
+        return securitylib.detected_secret_env_items(
+            secret_env_names=self.secret_env_names
+        )
+
+    def secret_env_summary(self):
+        return securitylib.secret_env_summary(secret_env_names=self.secret_env_names)
+
+    def detected_secret_env_summary(self):
+        return securitylib.detected_secret_env_summary(
+            secret_env_names=self.secret_env_names
+        )
+
+    def redact_text(self, text):
+        return self.secret_boundary.sanitize_text(text)
+
+    def redact_artifact(self, value, key=None):
+        return self.secret_boundary.sanitize_object(value, key=key)
+
+    def shell_env(self):
+        return self.secret_boundary.build_sandbox_env(
+            allowlist=self.shell_env_allowlist,
+            extra={"PWD": "/workspace"},
+        )
+
+    def execution_profile_view(self):
+        if self.transaction_context is None:
+            return {"dialect": "unavailable", "executable": ""}
+        return self.transaction_context.execution_lease.runner.profile_view()
+
+    def prompt_metadata(self, user_message, prompt):
+        _, metadata = self._build_prompt_and_metadata(user_message)
+        return metadata
+
+    def _build_prompt_and_metadata(self, user_message):
+        refresh = self.refresh_prefix()
+        self.resume_state = self.evaluate_resume_state()
+        prompt, metadata = self.context_manager.build(user_message)
+        # 这里把“这轮 prompt 是怎么拼出来的”连同缓存相关状态一起记下来，
+        # 后面 trace/report 才能解释清楚：为什么这一轮 prefix 变了、缓存有没有命中。
+        metadata.update(
+            {
+                "prefix_chars": len(self.prefix),
+                "workspace_chars": len(self.workspace.text()),
+                "memory_chars": len(self.memory_text()),
+                "history_chars": len(self.history_text()),
+                "request_chars": len(user_message),
+                "tool_count": len(self.tools),
+                "workspace_docs": len(self.workspace.project_docs),
+                "recent_commits": len(self.workspace.recent_commits),
+                "prefix_hash": self.prefix_state.hash,
+                "prompt_cache_key": self.prefix_state.hash,
+                "workspace_fingerprint": self.prefix_state.workspace_fingerprint,
+                "tool_signature": self.prefix_state.tool_signature,
+                "workspace_changed": refresh["workspace_changed"],
+                "prefix_changed": refresh["prefix_changed"],
+                "prompt_cache_supported": bool(
+                    getattr(self.model_client, "supports_prompt_cache", False)
+                ),
+                "resume_status": self.resume_state.get(
+                    "status", CHECKPOINT_NONE_STATUS
+                ),
+                "stale_summary_invalidations": int(
+                    self.resume_state.get("stale_summary_invalidations", 0)
+                ),
+                "stale_paths": list(self.resume_state.get("stale_paths", [])),
+                "runtime_identity_mismatch_fields": list(
+                    self.resume_state.get("runtime_identity_mismatch_fields", [])
+                ),
+            }
+        )
+        metadata.update(self.detected_secret_env_summary())
+        return self.secret_boundary.sanitize_text(
+            prompt
+        ), self.secret_boundary.sanitize_object(metadata)
+
+    def emit_trace(self, task_state, event, payload=None):
+        payload = self.redact_artifact(payload or {})
+        payload["event"] = event
+        payload["created_at"] = now()
+        # trace 是运行中的逐事件时间线，适合回答“这一轮 agent 到底做了什么”。
+        self.run_store.append_trace(task_state, payload)
+        if self.progress_sink is not None:
+            try:
+                self.progress_sink(event, dict(payload), task_state)
+            except (OSError, UnicodeError):
+                pass
+        return payload
+
+    def capture_workspace_snapshot(self):
+        snapshot = {}
+        for path in self.root.rglob("*"):
+            try:
+                relative_parts = path.relative_to(self.root).parts
+            except ValueError:
+                continue
+            if any(part in COPY_EXCLUDES for part in relative_parts):
+                continue
+            if not path.is_file():
+                continue
+            try:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                digest = None
+            if digest is not None:
+                snapshot[path.relative_to(self.root).as_posix()] = digest
+        return snapshot
+
+    @staticmethod
+    def diff_workspace_snapshots(before, after):
+        changed_paths = []
+        summaries = []
+        all_paths = sorted(set(before) | set(after))
+        for path in all_paths:
+            if before.get(path) == after.get(path):
+                continue
+            changed_paths.append(path)
+            if path not in before:
+                summaries.append(f"created:{path}")
+            elif path not in after:
+                summaries.append(f"deleted:{path}")
+            else:
+                summaries.append(f"modified:{path}")
+        return changed_paths, summaries
+
+    def create_checkpoint(self, task_state, user_message, trigger):
+        return checkpointlib.create_checkpoint(self, task_state, user_message, trigger)
+
+    def infer_next_step(self, task_state):
+        return checkpointlib.infer_next_step(task_state)
+
+    def update_memory_after_tool(self, name, args, result):
+        """把少量高价值工具结果沉淀到 working memory。
+
+        为什么存在：
+        并不是每个工具结果都值得长期带进下一轮 prompt。完整结果已经进了
+        `history`，这里只挑少量“下一轮大概率还会用到”的事实做提纯，
+        例如最近读写过哪些文件、某个文件读出来的短摘要。
+
+        输入 / 输出：
+        - 输入：工具名 `name`、参数 `args`、执行结果 `result`
+        - 输出：无显式返回值，副作用是更新 `self.memory`
+
+        在 agent 链路里的位置：
+        它发生在 `run_tool()` 真正执行完工具之后、下一轮 prompt 组装之前。
+        也就是说：工具结果先进入完整历史，再由这个函数择优沉淀成轻量记忆。
+        """
+        if not self.feature_enabled("memory"):
+            return
+        paths = toolkit.mutation_paths(name, args)
+        if name == "read_file" and args.get("path"):
+            paths = [args["path"]]
+        if not paths:
+            return
+        # 不是所有工具结果都进入工作记忆。
+        # 读文件会生成摘要；写文件/patch 会让旧摘要失效，因为它们可能过期了。
+        canonical_paths = [self.memory.canonical_path(path) for path in paths]
+        if name in {"read_file", "write_file", "patch_file", "apply_patch"}:
+            for canonical_path in canonical_paths:
+                self.memory.remember_file(canonical_path)
+        if name == "read_file":
+            canonical_path = canonical_paths[0]
+            summary = memorylib.summarize_read_result(result)
+            self.memory.set_file_summary(canonical_path, summary)
+            self.memory.append_note(
+                summary, tags=(canonical_path,), source=canonical_path
+            )
+        elif name in {"write_file", "patch_file", "apply_patch"}:
+            for canonical_path in canonical_paths:
+                self.memory.invalidate_file_summary(canonical_path)
+
+    def note_tool(self, name, args, result):
+        self.update_memory_after_tool(name, args, result)
+
+    def record_process_note_for_tool(self, name, metadata):
+        status = str(metadata.get("tool_status", "")).strip()
+        if status not in {"partial_success", "error", "rejected"}:
+            return
+        affected_paths = [
+            str(path).strip()
+            for path in metadata.get("affected_paths", [])
+            if str(path).strip()
+        ]
+        path_text = ", ".join(affected_paths) or "workspace"
+        if status == "partial_success":
+            text = f"{name} partial_success on {path_text}; inspect diff before retry"
+        elif status == "error":
+            text = f"{name} error on {path_text}; check the failure before retry"
+        else:
+            text = f"{name} rejected; choose a different action before retry"
+        tags = ["process", status, *affected_paths]
+        self.memory.append_note(text, tags=tuple(tags), source=name, kind="process")
+        self.session["memory"] = self.memory.to_dict()
+
+    def reject_durable_reason(self, note_text):
+        text = str(note_text or "").strip()
+        lowered = text.lower()
+        if not text:
+            return "empty"
+        if REDACTED_VALUE in text or SECRET_SHAPED_TEXT_PATTERN.search(text):
+            return "secret_shaped"
+        checkpoint_like_prefixes = (
+            "current goal",
+            "current blocker",
+            "next step",
+            "current phase",
+            "key files",
+            "freshness",
+            "当前目标",
+            "当前卡点",
+            "下一步",
+            "当前阶段",
+            "关键文件",
+            "已完成",
+            "已排除",
+        )
+        if any(lowered.startswith(prefix) for prefix in checkpoint_like_prefixes):
+            return "transient_task_state"
+        if (
+            re.search(r"(?i)\b(stdout|stderr|traceback|exit_code)\b", text)
+            or len(text) > 220
+        ):
+            return "noisy_output"
+        return ""
+
+    def extract_durable_promotions(self, user_message, final_answer=None):
+        # The model's final answer is deliberately not a memory source.  Only
+        # explicit user-authored facts can cross the durable-memory boundary.
+        del final_answer
+        admission = extract_explicit_memory(user_message)
+        promotions = []
+        rejections = list(admission.rejections)
+        for candidate in admission.candidates:
+            reason = self.reject_durable_reason(candidate["text"])
+            if reason:
+                rejections.append(f"{candidate['topic']}:{reason}")
+            else:
+                promotions.append(dict(candidate))
+        return promotions, rejections
+
+    def promote_durable_memory(self, user_message, final_answer=None):
+        promotions, rejections = self.extract_durable_promotions(
+            user_message, final_answer
+        )
+        promoted, superseded = self.memory.promote_durable(promotions)
+        self.session["memory"] = self.memory.to_dict()
+        self.last_durable_promotions = promoted
+        self.last_durable_rejections = rejections
+        self.last_durable_superseded = superseded
+        if promoted or rejections or superseded:
+            self.session_path = self.session_store.save(self.session)
+        return promoted, rejections, superseded
+
+    def ask(self, user_message):
+        from .agent_loop_runtime import AgentLoopRuntime
+
+        if (
+            self.transaction_context is not None
+            and self.transaction_context.workspace.state
+            not in {"ACTIVE", "INTERRUPTED"}
+        ):
+            state = self.transaction_context.workspace.state
+            raise RuntimeError(
+                f"active transaction is {state}; Apply, Discard, or recover it before another task"
+            )
+        return AgentLoopRuntime(self).run(user_message)
+
+    def execute_tool(self, name, args):
+        result = self.tool_executor.execute(name, args)
+        self._last_tool_result_metadata = dict(result.metadata)
+        return result
+
+    def run_tool(self, name, args):
+        """执行一次工具调用，并在执行前后套上完整护栏。
+
+        为什么存在：
+        在 agent 系统里，真正危险的不是“模型会不会想调用工具”，而是
+        “平台有没有在执行前把边界守住”。这个函数就是工具层的总闸口：
+        所有工具调用都必须先经过它，不能让模型直接碰到底层函数。
+
+        输入 / 输出：
+        - 输入：工具名 `name`，参数字典 `args`
+        - 输出：字符串结果。无论是成功结果还是错误信息，都会统一返回文本，
+          这样模型下一轮都能继续消费这份反馈。
+
+        在 agent 链路里的位置：
+        它位于 `ask()` 的“模型决定要调用工具”之后，是控制循环里真正把模型
+        意图落到外部世界的一步。因此这里串起了几乎所有安全与可控设计：
+        工具是否存在、参数是否合法、是否重复、是否需要审批、执行结果是否裁剪、
+        是否需要回写记忆。
+        """
+        direct_transaction = self.transaction_context is None
+        if direct_transaction:
+            self.begin_transaction()
+        result = self.execute_tool(name, args)
+        if (
+            direct_transaction
+            and self.commit_policy == "auto"
+            and result.metadata.get("read_only") is False
+        ):
+            if result.metadata.get("tool_status") == "ok":
+                outcome = self.finalize_transaction()
+                if outcome.get("conflicts"):
+                    return "error: workspace conflict: " + json.dumps(
+                        outcome["conflicts"], ensure_ascii=False
+                    )
+            else:
+                self.interrupt_transaction(
+                    result.metadata.get("tool_error_code") or "tool_failed"
+                )
+        return result.content
+
+    @staticmethod
+    def new_task_id():
+        return (
+            "task_"
+            + datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+            + "-"
+            + uuid.uuid4().hex[:6]
+        )
+
+    @staticmethod
+    def new_run_id():
+        return (
+            "run_"
+            + datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+            + "-"
+            + uuid.uuid4().hex[:6]
+        )
+
+    def build_report(self, task_state):
+        # report 是一次运行的最终摘要；
+        # 和 trace 的区别在于，trace 关注过程，report 关注结果与关键指标。
+        interaction = dict(self.current_interaction)
+        if not interaction or task_state.run_id != getattr(
+            self.current_task_state, "run_id", ""
+        ):
+            interaction = {
+                "mode": task_state.request_mode,
+                "request_profile": task_state.request_profile,
+                "package_layout": task_state.package_layout,
+                "relative_adjustment": task_state.relative_adjustment,
+            }
+        return {
+            "run_id": task_state.run_id,
+            "task_id": task_state.task_id,
+            "status": task_state.status,
+            "stop_reason": task_state.stop_reason,
+            "final_answer": task_state.final_answer,
+            "tool_steps": task_state.tool_steps,
+            "attempts": task_state.attempts,
+            "checkpoint_id": task_state.checkpoint_id,
+            "resume_status": task_state.resume_status,
+            "task_state": task_state.to_dict(),
+            "prompt_metadata": self.last_prompt_metadata,
+            "durable_promotions": list(self.last_durable_promotions),
+            "durable_rejections": list(self.last_durable_rejections),
+            "durable_superseded": list(self.last_durable_superseded),
+            "redacted_env": self.detected_secret_env_summary(),
+            "transaction_id": task_state.transaction_id,
+            "transaction_state": task_state.transaction_state,
+            "run_outcome": (
+                self.last_run_outcome.to_dict()
+                if self.last_run_outcome is not None
+                and task_state.run_id == getattr(self.current_task_state, "run_id", "")
+                else RunOutcome.from_task_state(
+                    task_state,
+                    staged_paths=task_state.staged_paths,
+                    delivered_paths=task_state.delivered_paths,
+                ).to_dict()
+            ),
+            "blocked_repeats": task_state.blocked_repeats,
+            "intervention_count": task_state.intervention_count,
+            "steps_to_first_mutation": task_state.steps_to_first_mutation,
+            "steps_to_first_shell": task_state.steps_to_first_shell,
+            "max_discovery_streak": task_state.max_discovery_streak,
+            "stuck_detected": task_state.stuck_detected,
+            "model_incomplete_count": task_state.model_incomplete_count,
+            "model_protocol_error_count": task_state.model_protocol_error_count,
+            "model_transport_failure_count": task_state.model_transport_failure_count,
+            "model_duration_ms": task_state.model_duration_ms,
+            "tool_duration_ms": task_state.tool_duration_ms,
+            "provider_retry_count": task_state.provider_retry_count,
+            "model_recovery_count": task_state.model_recovery_count,
+            "completion_quality": task_state.completion_quality(),
+            "model_execution_policy": self.model_execution_policy.mode,
+            "adaptive_budget": {
+                "hard_output_cap": self.max_new_tokens,
+                "last_requested_output_tokens": self.last_completion_metadata.get(
+                    "requested_output_tokens"
+                ),
+                "last_input_tokens": self.last_completion_metadata.get("input_tokens"),
+                "last_output_tokens": self.last_completion_metadata.get(
+                    "output_tokens"
+                ),
+                "last_incomplete_reason": self.last_completion_metadata.get(
+                    "incomplete_reason", ""
+                ),
+                "usage_sample_count": len(self.model_execution_policy.usage_snapshot()),
+            },
+            "execution_backend": "workspace-process",
+            "execution_isolation": "deployment-boundary",
+            "session_revision": int(self.session.get("revision", 0)),
+            "interaction": interaction,
+            "evidence": {
+                # changed_paths is retained for report-schema compatibility. It is
+                # scoped to this ask(), while transaction_paths is the authoritative
+                # aggregate delivered or staged by a resumed transaction.
+                "changed_paths": list(task_state.changed_paths),
+                "run_changed_paths": list(task_state.changed_paths),
+                "transaction_paths": list(
+                    task_state.delivered_paths or task_state.staged_paths
+                ),
+                "validation_commands": list(task_state.validation_commands),
+                "validation_status": task_state.validation_status,
+                "initial_evidence_count": task_state.initial_evidence_count,
+                "broad_exploration_count": task_state.broad_exploration_count,
+                "targeted_read_count": task_state.targeted_read_count,
+                "evidence_hit_rate": task_state.evidence_hit_rate,
+                "semantic_backend": task_state.semantic_backend,
+                "semantic_status": task_state.semantic_status,
+            },
+        }
+
+    def tool_example(self, name):
+        return toolkit.tool_example(name)
+
+    def validate_tool(self, name, args):
+        """把通用工具校验和 runtime 级额外约束串起来。"""
+        toolkit.validate_tool(self.tool_context(), name, args)
+
+    def tool_context(self):
+        projection = ContextProjector(self)
+        return ToolContext(
+            root=self.root,
+            path_resolver=self.path,
+            shell_env_provider=self.shell_env,
+            repository_inspector=lambda query, limit: self.inspect_repository(
+                query, limit, include_semantic=True
+            ),
+            pending_test_paths_provider=lambda: [
+                change["path"]
+                for change in (
+                    self.transaction_context.workspace.diff()
+                    if self.transaction_context is not None
+                    else []
+                )
+                if is_executable_test_artifact(self.root, change["path"])
+            ],
+            command_runner=(
+                self.transaction_context.execution_lease.runner
+                if self.transaction_context is not None
+                else None
+            ),
+            depth=self.depth,
+            max_depth=self.max_depth,
+            spawn_delegate=self.spawn_delegate,
+            observation_char_budget=projection.observation_char_budget,
+            source_window_lines=projection.source_window_lines,
+        )
+
+    def spawn_delegate(self, args):
+        task = str(args.get("task", "")).strip()
+        if self.transaction_context is None:
+            raise RuntimeError("delegate requires an active transaction")
+        child = Pico(
+            model_client=self.model_client,
+            workspace=self.workspace,
+            session_store=self.session_store,
+            run_store=self.run_store,
+            approval_policy="never",
+            max_steps=int(args.get("max_steps", 3)),
+            max_new_tokens=self.max_new_tokens,
+            depth=self.depth + 1,
+            max_depth=self.max_depth,
+            read_only=True,
+            secret_env_names=self.secret_env_names,
+            shell_env_allowlist=self.shell_env_allowlist,
+            commit_policy=self.commit_policy,
+            state_root=(
+                self.workspace_state.global_root if self.workspace_state else None
+            ),
+            transaction_context=self.transaction_context.borrow(),
+            sandbox_image=self.sandbox_image,
+            soft_discovery_limit=self.soft_discovery_limit,
+            hard_discovery_limit=self.hard_discovery_limit,
+            model_execution_policy=self.model_execution_policy.mode,
+            semantic_index=self.semantic_index,
+            progress_sink=self.progress_sink,
+            package_layout=self.effective_package_layout(),
+        )
+        # 委派的目标是“调查”，不是“放权执行”。
+        # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
+        child.session["memory"]["task"] = task
+        child.session["memory"]["notes"] = [clip(self.history_text(), 300)]
+        return "delegate_result:\n" + child.ask(task)
+
+    def tool_list_files(self, args):
+        return toolkit.tool_list_files(self.tool_context(), args)
+
+    def tool_read_file(self, args):
+        return toolkit.tool_read_file(self.tool_context(), args)
+
+    def tool_read_files(self, args):
+        return toolkit.tool_read_files(self.tool_context(), args)
+
+    def tool_search(self, args):
+        return toolkit.tool_search(self.tool_context(), args)
+
+    def tool_inspect_repository(self, args):
+        return toolkit.tool_inspect_repository(self.tool_context(), args)
+
+    def tool_run_shell(self, args):
+        return toolkit.tool_run_shell(self.tool_context(), args)
+
+    def tool_run_verification(self, args):
+        return toolkit.tool_run_verification(self.tool_context(), args)
+
+    def tool_write_file(self, args):
+        return toolkit.tool_write_file(self.tool_context(), args)
+
+    def tool_patch_file(self, args):
+        return toolkit.tool_patch_file(self.tool_context(), args)
+
+    def tool_apply_patch(self, args):
+        return toolkit.tool_apply_patch(self.tool_context(), args)
+
+    def tool_delegate(self, args):
+        return toolkit.tool_delegate(self.tool_context(), args)
+
+    def approve(self, name, args):
+        if self.read_only:
+            return False
+        if self.approval_policy == "auto":
+            return True
+        if self.approval_policy == "never":
+            return False
+        try:
+            answer = input(
+                f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] "
+            )
+        except EOFError:
+            return False
+        return answer.strip().lower() in {"y", "yes"}
+
+    @staticmethod
+    def parse(raw):
+        """把模型原始输出解析成 runtime 可执行的动作或最终答案。
+
+        为什么存在：
+        模型输出首先是自然语言文本，而 runtime 需要的是结构化决策：
+        “这是工具调用”还是“这是最终答案”。如果没有这层解析，后面的工具校验、
+        审批和执行链路就没法可靠工作。
+
+        输入 / 输出：
+        - 输入：模型返回的原始文本 `raw`
+        - 输出：`(kind, payload)`，其中 `kind` 可能是 `tool`、`final`、`retry`
+
+        在 agent 链路里的位置：
+        它位于 `model_client.complete()` 之后、`run_tool()` 之前，是模型输出
+        进入平台控制流的第一道结构化关口。
+        """
+        return parse_model_output(raw)
+
+    @staticmethod
+    def retry_notice(problem=None):
+        return protocol_retry_notice(problem)
+
+    @staticmethod
+    def parse_xml_tool(raw):
+        return parse_xml_tool_output(raw)
+
+    @staticmethod
+    def parse_attrs(text):
+        return parse_protocol_attrs(text)
+
+    @staticmethod
+    def extract(text, tag):
+        return extract_protocol_text(text, tag)
+
+    @staticmethod
+    def extract_raw(text, tag):
+        return extract_raw_protocol_text(text, tag)
+
+    def reset(self):
+        if self.transaction_context is not None:
+            raise RuntimeError(
+                "active transaction must be applied or discarded before session reset"
+            )
+        self.session["history"] = []
+        self.session["memory"].clear()
+        self.session["memory"].update(memorylib.default_memory_state())
+        self.memory = memorylib.LayeredMemory(
+            self.session["memory"],
+            workspace_root=self.root,
+            durable_root=(
+                self.workspace_state.memory
+                if self.workspace_state
+                else Path(self.session_store.root).parent / "memory"
+            ),
+        )
+        self.session_store.save(self.session)
+
+    def path(self, raw_path):
+        path = Path(raw_path)
+        path = path if path.is_absolute() else self.root / path
+        resolved = logical_path(native_path(path).resolve())
+        # 所有文件类工具都被锚定在 workspace root 之下。
+        # 这样既能防住 "../" 逃逸，也能防住符号链接解析后跳出仓库。
+        if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):
+            raise ValueError(f"path escapes workspace: {raw_path}")
+        relative = resolved.relative_to(self.root)
+        if relative.parts and relative.parts[0] in {".git", ".pico"}:
+            raise ValueError(f"path is internal to the runtime: {raw_path}")
+        return resolved

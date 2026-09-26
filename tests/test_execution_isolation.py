@@ -2,10 +2,10 @@ import subprocess
 from pathlib import Path
 
 from pico.execution import WorkspaceCommandRunner
+from pico.progress.verification_evidence import VerificationProbe
 from pico.security import SecretBoundary
-from pico.transactional_workspace import TransactionalWorkspace
-from pico.verification_evidence import VerificationProbe
 from pico.workspace import WorkspaceContext
+from pico.workspace.transactional_workspace import TransactionalWorkspace
 
 
 def _capture_runner(tmp_path):

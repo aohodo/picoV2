@@ -1,0 +1,43 @@
+"""Validated coding-agent tool boundary."""
+
+from .tool_registry import (
+    build_tool_registry,
+    legal_tool_names,
+    mutation_paths,
+    native_tool_definitions,
+    tool_apply_patch,
+    tool_delegate,
+    tool_example,
+    tool_inspect_repository,
+    tool_list_files,
+    tool_patch_file,
+    tool_read_file,
+    tool_read_files,
+    tool_run_shell,
+    tool_run_verification,
+    tool_search,
+    tool_update_work_plan,
+    tool_write_file,
+    validate_tool,
+)
+
+__all__ = [
+    "build_tool_registry",
+    "legal_tool_names",
+    "mutation_paths",
+    "native_tool_definitions",
+    "tool_apply_patch",
+    "tool_delegate",
+    "tool_example",
+    "tool_inspect_repository",
+    "tool_list_files",
+    "tool_patch_file",
+    "tool_read_file",
+    "tool_read_files",
+    "tool_run_shell",
+    "tool_run_verification",
+    "tool_search",
+    "tool_update_work_plan",
+    "tool_write_file",
+    "validate_tool",
+]

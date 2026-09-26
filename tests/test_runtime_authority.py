@@ -8,15 +8,15 @@ from unittest.mock import patch
 import pytest
 
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
-from pico.completion import CompletionAdmission
-from pico.context_projection import ContextProjector
+from pico.context.context_projection import ContextProjector
+from pico.domain.interaction_policy import classify_interaction
+from pico.domain.model_contract import ModelTurn
 from pico.execution import WorkspaceCommandRunner
-from pico.interaction_policy import classify_interaction
-from pico.model_contract import ModelTurn
+from pico.persistence.session_store import SessionLoadError
+from pico.persistence.state_root import workspace_identity
 from pico.progress import ProgressController
 from pico.providers.clients import OpenAICompatibleModelClient, ProviderResponseError
-from pico.session_store import SessionLoadError
-from pico.state_root import workspace_identity
+from pico.runtime.completion_runtime import CompletionAdmission
 
 
 def make_agent(tmp_path, outputs=()):
@@ -369,7 +369,7 @@ def test_failed_budget_run_resumes_in_new_process_and_delivers_only_after_verifi
     [{"path": "", "reason": "verification_failed"}, {"path": "app.py", "reason": "source_changed"}],
 ])
 def test_legacy_source_conflicts_are_never_migrated_to_resumable(tmp_path, conflicts):
-    from pico.transactional_workspace import TransactionalWorkspace
+    from pico.workspace.transactional_workspace import TransactionalWorkspace
 
     agent = make_agent(tmp_path)
     transaction = agent.begin_transaction().workspace

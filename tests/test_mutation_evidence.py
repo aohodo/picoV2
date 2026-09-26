@@ -2,9 +2,9 @@ import json
 from unittest.mock import patch
 
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
-from pico.context_projection import ContextProjector, discard_stale_read_groups
+from pico.context.context_projection import ContextProjector, discard_stale_read_groups
+from pico.context.mutation_observation import _changed_ranges
 from pico.execution import format_shell_result
-from pico.mutation_observation import _changed_ranges
 from pico.progress import ProgressController
 from pico.tools import native_tool_definitions
 
@@ -337,7 +337,7 @@ def test_apply_patch_rejects_ambiguous_or_overlapping_edits_without_writing(tmp_
 def test_apply_patch_rolls_back_earlier_file_if_a_later_write_fails(tmp_path):
     agent = make_agent(tmp_path)
     agent.execute_tool("write_file", {"path": "other.py", "content": "OTHER = 1\n"})
-    from pico import patch_set
+    from pico.tools import patch_set
 
     real_write = patch_set.write_text_document
     calls = 0
@@ -350,7 +350,7 @@ def test_apply_patch_rolls_back_earlier_file_if_a_later_write_fails(tmp_path):
             raise OSError("simulated locked file")
         return real_write(path, text, document)
 
-    with patch("pico.patch_set.write_text_document", side_effect=fail_second_write):
+    with patch("pico.tools.patch_set.write_text_document", side_effect=fail_second_write):
         result = agent.execute_tool(
             "apply_patch",
             {

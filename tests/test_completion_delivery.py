@@ -2,9 +2,9 @@ import json
 import sys
 
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
-from pico.completion import CompletionAdmission
-from pico.model_contract import ModelTurn
+from pico.domain.model_contract import ModelTurn
 from pico.progress import ProgressController
+from pico.runtime.completion_runtime import CompletionAdmission
 
 
 def test_explicitly_incomplete_final_is_not_admitted():

@@ -10,14 +10,14 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from ..features import memory as memorylib
-from ..git_support import run_git
+from ..domain.task_state import STOP_REASON_FINAL_ANSWER_RETURNED
+from ..memory import memory_store as memorylib
+from ..persistence.run_store import RunStore
 from ..providers.clients import FakeModelClient
-from ..run_store import RunStore
 from ..runtime import Pico, SessionStore
-from ..task_state import STOP_REASON_FINAL_ANSWER_RETURNED
 from ..tools import legal_tool_names
 from ..workspace import WorkspaceContext, remove_workspace_tree
+from ..workspace.git_support import run_git
 
 BENCHMARK_SCHEMA_VERSION = 1
 DEFAULT_BENCHMARK_PATH = Path("benchmarks/coding_tasks.json")

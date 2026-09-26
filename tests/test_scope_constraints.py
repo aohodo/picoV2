@@ -1,7 +1,7 @@
-from pico.interaction_policy import build_interaction_contract
+from pico.domain.interaction_policy import build_interaction_contract
+from pico.persistence.session_store import SessionStore
 from pico.providers.clients import FakeModelClient
 from pico.runtime import Pico
-from pico.session_store import SessionStore
 from pico.workspace import WorkspaceContext
 
 

@@ -1,8 +1,8 @@
 import json
 
-from pico.context_projection import project_model_events
+from pico.context.context_projection import project_model_events
+from pico.context.read_observation import render_reads, visible_read_coverage
 from pico.progress import NEW_EVIDENCE, ProgressController
-from pico.read_observation import render_reads, visible_read_coverage
 
 
 def read(controller, start=1, end=30, lines=None):

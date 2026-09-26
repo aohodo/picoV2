@@ -2,9 +2,9 @@ import json
 
 import pytest
 
-from pico.features.memory import LayeredMemory
+from pico.memory.memory_store import LayeredMemory
 from pico.progress import ProgressController
-from pico.verification_feedback import (
+from pico.progress.verification_feedback import (
     MAX_VERIFICATION_FEEDBACK_CHARS,
     completion_feedback,
     verification_observation,

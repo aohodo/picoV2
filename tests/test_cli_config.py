@@ -1,5 +1,5 @@
 from pico.cli import build_agent, build_arg_parser, main
-from pico.config import PicoConfigError
+from pico.cli.config_loader import PicoConfigError
 from pico.providers.clients import OpenAICompatibleModelClient
 
 PROVIDER_ENV_NAMES = (

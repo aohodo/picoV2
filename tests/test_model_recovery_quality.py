@@ -1,7 +1,7 @@
-from pico.execution_policy import ModelExecutionPolicy
-from pico.model_contract import ModelCapabilities, ModelTurn
+from pico.domain.model_contract import ModelCapabilities, ModelTurn
+from pico.execution.model_execution_policy import ModelExecutionPolicy
+from pico.persistence.session_store import SessionStore
 from pico.runtime import Pico
-from pico.session_store import SessionStore
 from pico.workspace import WorkspaceContext
 
 

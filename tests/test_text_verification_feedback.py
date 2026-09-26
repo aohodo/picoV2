@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
-from pico.context_manager import ContextManager
+from pico.context.context_manager import ContextManager
 from pico.progress import ProgressController
 
 
