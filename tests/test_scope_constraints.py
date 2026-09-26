@@ -1,3 +1,4 @@
+from pico.interaction_policy import build_interaction_contract
 from pico.providers.clients import FakeModelClient
 from pico.runtime import Pico
 from pico.session_store import SessionStore
@@ -101,3 +102,28 @@ def test_apply_patch_rejects_entire_work_unit_when_one_path_is_protected(tmp_pat
     assert not result.metadata["executed"]
     assert (agent.root / "solution.py").read_text(encoding="utf-8") == "value = 1\n"
     assert "assert True" in (agent.root / "test_solution.py").read_text(encoding="utf-8")
+
+
+def test_existing_read_only_acceptance_tests_do_not_require_a_new_test_artifact():
+    prompt = (
+        "请完成真实开发需求。仓库中已经加入本需求的验收测试。"
+        "请先理解现有实现和测试，再修改生产代码；禁止修改、删除或绕过任何测试。"
+        "完成后运行 mvn test，只有全部测试通过才能报告完成。"
+    )
+
+    contract = build_interaction_contract(prompt, "follow_repository")
+
+    assert contract["mutation_allowed"] is True
+    assert contract["validation_required"] is True
+    assert contract["test_artifact_required"] is False
+    assert "src/test/**" in contract["protected_paths"]
+
+
+def test_explicit_request_to_add_tests_remains_a_delivery_obligation():
+    for prompt in (
+        "Implement the fix and add a regression test.",
+        "修复问题并新增回归测试。",
+        "修复问题并添加针对超时场景的测试用例。",
+    ):
+        contract = build_interaction_contract(prompt, "follow_repository")
+        assert contract["test_artifact_required"] is True

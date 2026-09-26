@@ -841,7 +841,14 @@ class AgentLoop:
             "request_mode": interaction["mode"],
             "package_layout": interaction["package_layout"],
         }
-        max_attempts = max(agent.max_steps * 3, agent.max_steps + 4)
+        # ``max_steps`` bounds tool work. Model contract recovery and the final
+        # answer get their own policy-owned allowance; rejected calls must not
+        # silently triple the user's requested run budget.
+        max_attempts = (
+            agent.max_steps
+            + agent.model_execution_policy.max_recoveries
+            + 1
+        )
 
         # 这是 agent 的主循环，可以按“感知 -> 决策 -> 行动 -> 记录”来理解：
         # 1. 感知：重新组 prompt，把当前状态整理给模型看

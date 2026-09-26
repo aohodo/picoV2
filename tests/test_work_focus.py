@@ -148,6 +148,290 @@ def test_evidence_expansion_after_grounding_gets_decision_feedback_not_a_gate():
     assert controller.work_focus_view()["evidence_expansion_streak"] == 0
 
 
+def test_grounded_candidate_is_optional_after_local_implementation_surface_is_read():
+    controller = ProgressController(
+        24,
+        repository_evidence={
+            "paths": ["service.py", "helper.py"],
+            "confidence": "high",
+        },
+        delivery_requirements={"mutation_allowed": True},
+    )
+
+    assert controller.work_focus_view()["phase"] == "frame_or_locate_work"
+
+    _observe_read(controller, "service.py")
+
+    focus = controller.work_focus_view()
+    assert focus["phase"] == "implement"
+    assert focus["action_readiness"]["status"] == "ready_to_act"
+    assert focus["action_readiness"]["blocking_unknowns"] == []
+    assert focus["optional_evidence"]["candidate_paths"] == ["helper.py"]
+
+
+def test_decision_question_connects_optional_read_to_next_action():
+    controller = ProgressController(
+        24,
+        delivery_requirements={
+            "mutation_allowed": True,
+            "requested_existing_paths": ["service.py"],
+        },
+    )
+    _observe_read(controller, "service.py")
+
+    controller.observe(
+        "read_file",
+        {
+            "path": "helper.py",
+            "start": 1,
+            "end": 100,
+            "obligation_id": "implementation",
+            "decision_question": "Does helper.py define the error contract service.py must preserve?",
+            "decision_effect": "If it defines the contract, preserve it in the service patch.",
+        },
+        "source from helper.py",
+        {"executed": True, "tool_status": "ok", "workspace_changed": False},
+    )
+
+    focus = controller.work_focus_view()
+    assert focus["action_readiness"]["last_decision_question"].startswith(
+        "Does helper.py"
+    )
+    notices = "\n".join(controller.state.pending_notices)
+    assert "evidence was gathered for work item implementation" in notices
+    assert controller.metrics()["unscoped_discovery_count"] == 0
+
+
+def test_unscoped_optional_read_is_advisory_and_audited_without_becoming_a_gate():
+    controller = ProgressController(
+        24,
+        delivery_requirements={
+            "mutation_allowed": True,
+            "requested_existing_paths": ["service.py"],
+        },
+    )
+    _observe_read(controller, "service.py")
+
+    assert controller.preflight(
+        "search", {"pattern": "style", "path": "."}
+    )["allowed"]
+    controller.observe(
+        "search",
+        {"pattern": "style", "path": "."},
+        "helper.py:1:STYLE = 1",
+        {"executed": True, "tool_status": "ok", "workspace_changed": False},
+    )
+
+    assert controller.metrics()["unscoped_discovery_count"] == 1
+    assert "did not state what decision" in "\n".join(
+        controller.state.pending_notices
+    )
+
+
+def test_change_hypothesis_and_expected_outcome_survive_in_decision_context():
+    controller = ProgressController(
+        24,
+        delivery_requirements={
+            "mutation_allowed": True,
+            "requested_existing_paths": ["service.py"],
+        },
+    )
+    _observe_read(controller, "service.py")
+    controller.observe(
+        "patch_file",
+        {
+            "path": "service.py",
+            "change_hypothesis": "The stale fallback causes the failing behavior.",
+        },
+        "patched",
+        {
+            "executed": True,
+            "tool_status": "ok",
+            "workspace_changed": True,
+            "affected_paths": ["service.py"],
+        },
+    )
+    controller.observe(
+        "run_verification",
+        {
+            "argv": ["pytest", "-q"],
+            "expected_outcome": "The regression test and existing suite pass.",
+        },
+        "1 passed",
+        {
+            "executed": True,
+            "tool_status": "ok",
+            "workspace_changed": False,
+            "validation": True,
+        },
+    )
+
+    readiness = controller.work_focus_view()["action_readiness"]
+    assert readiness["working_hypothesis"].startswith("The stale fallback")
+    assert readiness["expected_observation"].startswith("The regression test")
+
+
+def test_action_intent_does_not_change_deterministic_read_identity():
+    controller = ProgressController(24)
+    base = {"path": "service.py", "start": 1, "end": 100}
+
+    first = controller.signature(
+        "read_file", {**base, "decision_question": "Is the fallback stale?"}
+    )
+    second = controller.signature(
+        "read_file", {**base, "decision_question": "Does the API permit null?"}
+    )
+
+    assert first == second
+
+
+def test_work_plan_turns_evidence_into_a_decision_before_more_discovery():
+    controller = ProgressController(24)
+    plan = {
+        "items": [
+            {
+                "id": "headers",
+                "requirement": "Preserve framework response headers.",
+                "hypothesis": "The exception handler drops ErrorResponse headers.",
+                "blocker": "Whether the acceptance test requires the Allow header.",
+            }
+        ],
+        "active_id": "headers",
+    }
+    evidence = controller.observe(
+        "update_work_plan",
+        plan,
+        "work plan updated",
+        {"executed": True, "tool_status": "ok", "workspace_changed": False},
+    )
+
+    assert evidence.kind == "NEW_EVIDENCE"
+    assert controller.state.last_action["value"] == "decision_progress"
+    assert controller.work_focus_view()["phase"] == "resolve_active_blocker"
+
+    controller.observe(
+        "read_file",
+        {
+            "path": "HandlerTest.java",
+            "start": 1,
+            "end": 100,
+            "obligation_id": "headers",
+            "decision_question": "Does the test require Allow header passthrough?",
+            "decision_effect": "If yes, copy ErrorResponse headers into ResponseEntity.",
+        },
+        "assertThat(response.getHeaders().getAllow()).contains(HttpMethod.GET);",
+        {"executed": True, "tool_status": "ok", "workspace_changed": False},
+    )
+
+    focus = controller.work_focus_view()
+    assert focus["phase"] == "interpret_active_evidence"
+    assert focus["work_plan"]["items"][0]["status"] == "decision_due"
+    assert controller.state.last_action["value"] == "evidence_only"
+
+    controller.observe(
+        "update_work_plan",
+        {
+            "items": [
+                {
+                    "id": "headers",
+                    "requirement": "Preserve framework response headers.",
+                    "hypothesis": "The handler must copy ErrorResponse headers.",
+                    "candidate_action": "Add headers(errorResponse.getHeaders()).",
+                    "expected_observation": "The 405 test retains Allow and passes.",
+                }
+            ],
+            "active_id": "headers",
+        },
+        "work plan updated",
+        {"executed": True, "tool_status": "ok", "workspace_changed": False},
+    )
+
+    focus = controller.work_focus_view()
+    assert focus["phase"] == "implement"
+    assert focus["action_readiness"]["status"] == "ready_to_act"
+
+
+def test_work_plan_status_follows_mutation_and_authoritative_verification():
+    controller = ProgressController(24)
+    controller.observe(
+        "update_work_plan",
+        {
+            "items": [
+                {
+                    "id": "implementation",
+                    "requirement": "Implement the requested behavior.",
+                    "candidate_action": "Patch service.py.",
+                }
+            ],
+            "active_id": "implementation",
+        },
+        "work plan updated",
+        {"executed": True, "tool_status": "ok", "workspace_changed": False},
+    )
+    controller.observe(
+        "patch_file",
+        {
+            "path": "service.py",
+            "obligation_ids": ["implementation"],
+            "change_hypothesis": "The focused patch implements the obligation.",
+        },
+        "patched",
+        {
+            "executed": True,
+            "tool_status": "ok",
+            "workspace_changed": True,
+            "affected_paths": ["service.py"],
+        },
+    )
+
+    assert controller.work_focus_view()["work_plan"]["items"][0]["status"] == "implemented"
+
+    controller.observe(
+        "run_verification",
+        {
+            "argv": ["pytest", "-q"],
+            "obligation_ids": ["implementation"],
+            "expected_outcome": "The focused and existing tests pass.",
+        },
+        "1 passed",
+        {
+            "executed": True,
+            "tool_status": "ok",
+            "workspace_changed": False,
+            "validation": True,
+        },
+    )
+
+    assert controller.work_focus_view()["work_plan"]["items"][0]["status"] == "verified"
+
+
+def test_work_plan_survives_ledger_persistence_without_parallel_state():
+    controller = ProgressController(24)
+    controller.observe(
+        "update_work_plan",
+        {
+            "items": [
+                {
+                    "id": "implementation",
+                    "requirement": "Implement the requested behavior.",
+                    "hypothesis": "The grounded service owns the behavior.",
+                    "candidate_action": "Patch service.py.",
+                }
+            ],
+            "active_id": "implementation",
+        },
+        "work plan updated",
+        {"executed": True, "tool_status": "ok", "workspace_changed": False},
+    )
+
+    restored = ProgressController(24, ledger=controller.ledger.to_dict())
+
+    assert restored.work_focus_view()["work_plan"] == controller.work_focus_view()[
+        "work_plan"
+    ]
+    assert restored.work_focus_view()["phase"] == "implement"
+
+
 def test_work_focus_survives_runtime_state_compaction():
     focus = {
         "phase": "implement",

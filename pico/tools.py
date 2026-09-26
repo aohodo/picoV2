@@ -5,6 +5,7 @@
 """
 
 import difflib
+import json
 import re
 from copy import deepcopy
 from functools import partial
@@ -25,40 +26,114 @@ from .verification_evidence import VerificationObservation, VerificationProbe
 from .workspace import IGNORED_PATH_NAMES
 
 BASE_TOOL_SPECS = {
-    "list_files": {
-        "schema": {"path": "str='.'"},
+    "update_work_plan": {
+        "schema": {
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 12,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "requirement": {"type": "string"},
+                        "hypothesis": {"type": "string"},
+                        "blocker": {"type": "string"},
+                        "candidate_action": {"type": "string"},
+                        "expected_observation": {"type": "string"},
+                    },
+                    "required": ["id", "requirement"],
+                    "additionalProperties": False,
+                },
+            },
+            "active_id": "str",
+        },
         "risky": False,
-        "description": "List files in the workspace.",
+        "description": (
+            "Create or update the current work-unit plan. Use concise delivery obligations, "
+            "select one active item, and record its hypothesis, concrete blocker, candidate "
+            "action, and expected observation. Runtime owns completion and verification status."
+        ),
+    },
+    "list_files": {
+        "schema": {
+            "path": "str='.'",
+            "obligation_id": "str=''",
+            "decision_question": "str=''",
+            "decision_effect": "str=''",
+        },
+        "risky": False,
+        "description": (
+            "List files in the workspace. Once an implementation surface is grounded, "
+            "set decision_question to the concrete decision this listing could change."
+        ),
     },
     "read_file": {
         "schema": {
             "path": "str",
             "start": "int=1",
             "end": f"int={DEFAULT_SOURCE_WINDOW_LINES}",
+            "obligation_id": "str=''",
+            "decision_question": "str=''",
+            "decision_effect": "str=''",
         },
         "risky": False,
-        "description": "Read a text file by line range while detecting its encoding.",
+        "description": (
+            "Read a text file by line range while detecting its encoding. Once an "
+            "implementation surface is grounded, set decision_question to the concrete "
+            "decision this source could change."
+        ),
     },
     "read_files": {
-        "schema": {"paths": "list[str]"},
+        "schema": {
+            "paths": "list[str]",
+            "obligation_id": "str=''",
+            "decision_question": "str=''",
+            "decision_effect": "str=''",
+        },
         "risky": False,
-        "description": "Read several text files in one bounded call.",
+        "description": (
+            "Read several text files in one bounded call. Once an implementation surface "
+            "is grounded, set decision_question to the concrete decision these files could change."
+        ),
     },
     "search": {
-        "schema": {"pattern": "str", "path": "str='.'"},
+        "schema": {
+            "pattern": "str",
+            "path": "str='.'",
+            "obligation_id": "str=''",
+            "decision_question": "str=''",
+            "decision_effect": "str=''",
+        },
         "risky": False,
-        "description": "Search using a case-insensitive Python regular expression. Escape punctuation for literal matching. Returns file:line evidence.",
+        "description": (
+            "Search using a case-insensitive Python regular expression. Escape punctuation "
+            "for literal matching. Returns file:line evidence. Once an implementation "
+            "surface is grounded, set decision_question to the decision this search could change."
+        ),
     },
     "inspect_repository": {
-        "schema": {"query": "str", "limit": "int=12"},
+        "schema": {
+            "query": "str",
+            "limit": "int=12",
+            "obligation_id": "str=''",
+            "decision_question": "str=''",
+            "decision_effect": "str=''",
+        },
         "risky": False,
         "description": (
             "Find relevant Python/Java files using symbols, imports, and reverse dependencies. "
-            "Use before broad repository exploration."
+            "Use before broad repository exploration. Once an implementation surface is grounded, "
+            "set decision_question to the concrete decision this inspection could change."
         ),
     },
     "run_shell": {
-        "schema": {"command": "str", "timeout": "int=20"},
+        "schema": {
+            "command": "str",
+            "timeout": "int=20",
+            "obligation_ids": "list[str]=[]",
+            "expected_outcome": "str=''",
+        },
         "risky": True,
         "description": (
             "Run a non-inspection command in the transaction workspace using the declared shell profile. "
@@ -70,6 +145,8 @@ BASE_TOOL_SPECS = {
             "argv": "list[str]",
             "timeout": "int=120",
             "purpose": "str='acceptance'",
+            "obligation_ids": "list[str]=[]",
+            "expected_outcome": "str=''",
         },
         "risky": True,
         "description": (
@@ -80,7 +157,12 @@ BASE_TOOL_SPECS = {
         ),
     },
     "write_file": {
-        "schema": {"path": "str", "content": "str"},
+        "schema": {
+            "path": "str",
+            "content": "str",
+            "obligation_ids": "list[str]=[]",
+            "change_hypothesis": "str=''",
+        },
         "risky": True,
         "description": (
             "Write a text file and return a bounded diff plus current post-edit source. "
@@ -88,7 +170,13 @@ BASE_TOOL_SPECS = {
         ),
     },
     "patch_file": {
-        "schema": {"path": "str", "old_text": "str", "new_text": "str"},
+        "schema": {
+            "path": "str",
+            "old_text": "str",
+            "new_text": "str",
+            "obligation_ids": "list[str]=[]",
+            "change_hypothesis": "str=''",
+        },
         "risky": True,
         "description": (
             "Replace one exact text block and return a bounded diff plus current post-edit source. "
@@ -110,7 +198,9 @@ BASE_TOOL_SPECS = {
                     "required": ["path", "old_text", "new_text"],
                     "additionalProperties": False,
                 },
-            }
+            },
+            "obligation_ids": "list[str]=[]",
+            "change_hypothesis": "str=''",
         },
         "risky": True,
         "description": (
@@ -133,7 +223,13 @@ class PatchMatchError(ValueError):
         self.coverage = observation.coverage
 
 DELEGATE_TOOL_SPEC = {
-    "schema": {"task": "str", "max_steps": "int=3"},
+    "schema": {
+        "task": "str",
+        "max_steps": "int=3",
+        "obligation_id": "str=''",
+        "decision_question": "str=''",
+        "decision_effect": "str=''",
+    },
     "risky": False,
     "description": "Ask a bounded read-only child agent to investigate.",
 }
@@ -143,6 +239,12 @@ def legal_tool_names():
     return set(BASE_TOOL_SPECS) | {"delegate"}
 
 TOOL_EXAMPLES = {
+    "update_work_plan": (
+        '<tool>{"name":"update_work_plan","args":{"items":['
+        '{"id":"implementation","requirement":"Implement the requested behavior",'
+        '"candidate_action":"Patch the grounded implementation"}],'
+        '"active_id":"implementation"}}</tool>'
+    ),
     "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
     "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
     "read_files": '<tool>{"name":"read_files","args":{"paths":["README.md","pyproject.toml"]}}</tool>',
@@ -229,6 +331,35 @@ def tool_example(name):
 
 def validate_tool(context, name, args):
     args = args or {}
+
+    if name == "update_work_plan":
+        items = args.get("items")
+        if not isinstance(items, list) or not items or len(items) > 12:
+            raise ValueError("items must be a non-empty list with at most 12 work items")
+        identifiers = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise TypeError("each work item must be an object")
+            identifier = str(item.get("id", "")).strip()
+            requirement = str(item.get("requirement", "")).strip()
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,39}", identifier):
+                raise ValueError("work item id must be 1-40 safe identifier characters")
+            if not requirement or len(requirement) > 400:
+                raise ValueError("work item requirement must contain at most 400 characters")
+            for field in (
+                "hypothesis",
+                "blocker",
+                "candidate_action",
+                "expected_observation",
+            ):
+                if len(str(item.get(field, ""))) > 800:
+                    raise ValueError(f"{field} must contain at most 800 characters")
+            identifiers.append(identifier)
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("work item ids must be unique")
+        if str(args.get("active_id", "")) not in identifiers:
+            raise ValueError("active_id must identify one of the supplied work items")
+        return
 
     if name == "list_files":
         path = context.path(args.get("path", "."))
@@ -565,6 +696,35 @@ def tool_apply_patch(context, args):
     return render_patch_set_observation(context, plans)
 
 
+def tool_update_work_plan(context, args):
+    del context
+    items = [
+        {
+            key: str(item.get(key, "")).strip()
+            for key in (
+                "id",
+                "requirement",
+                "hypothesis",
+                "blocker",
+                "candidate_action",
+                "expected_observation",
+            )
+            if str(item.get(key, "")).strip()
+        }
+        for item in args["items"]
+    ]
+    return json.dumps(
+        {
+            "work_plan_updated": True,
+            "active_id": str(args["active_id"]),
+            "items": items,
+            "note": "Runtime owns implementation and verification status.",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
 def mutation_paths(name, args):
     """Return every path targeted by a typed mutation call."""
     if name in {"write_file", "patch_file"}:
@@ -589,6 +749,7 @@ def tool_delegate(context, args):
 
 
 _TOOL_RUNNERS = {
+    "update_work_plan": tool_update_work_plan,
     "list_files": tool_list_files,
     "read_file": tool_read_file,
     "read_files": tool_read_files,
