@@ -33,7 +33,7 @@ jobs:
         run: python -m pico --help
 
       - name: Lint
-        run: python -m ruff check pico tests scripts
+        run: python -m ruff check pico tests scripts --output-format github
 
       - name: Test
         run: python -m pytest tests -q
