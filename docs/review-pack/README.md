@@ -18,6 +18,8 @@ Pico V2 is a human-inspired, evidence-driven, transactional runtime for reposito
 
 The design thesis and research-to-runtime mapping are documented in [Human-Inspired Programming Loop](../architecture/human-inspired-programming-loop.md).
 
+Real-model repository evidence uses the repeated-run protocol in [Real-repository coding benchmark](../repository-coding-benchmark.md). The boundary between Runtime invariants and model strategy is recorded in [ADR 0001](../decisions/0001-runtime-governs-invariants-not-model-strategy.md).
+
 ## Benchmark evidence
 
 Benchmark runs should preserve reproducibility metadata, task rows, summary counts, and failure categories so reviewers can distinguish runtime regressions from task or provider failures.

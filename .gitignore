@@ -50,6 +50,10 @@ docs/*
 !docs/architecture/
 !docs/architecture/agent-harness-v1-overview.md
 !docs/architecture/human-inspired-programming-loop.md
+!docs/decisions/
+!docs/decisions/0001-runtime-governs-invariants-not-model-strategy.md
+!docs/repository-coding-benchmark.md
+!docs/release-validation-0.2.0.md
 
 # OS files
 .DS_Store
