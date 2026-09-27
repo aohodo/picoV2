@@ -16,6 +16,7 @@ from ..context.read_observation import (
     visible_read_coverage,
 )
 from ..domain.work_plan import WorkPlanLedger
+from .verification_evidence import verification_identity
 from .verification_feedback import verification_observation
 
 NEW_EVIDENCE = "NEW_EVIDENCE"
@@ -1145,13 +1146,24 @@ class ProgressController:
                     # arguments). Preserve the executed argument boundaries
                     # for retries and persisted failure resolution.
                     record["argv"] = list(args["argv"])
+                    record["verification_identity"] = verification_identity(
+                        record["argv"]
+                    )
                     previous = [
                         item for item in self.ledger.unresolved_failures
-                        if item.get("argv") == record["argv"]
+                        if item.get("argv") is not None
+                        and item.get(
+                            "verification_identity",
+                            verification_identity(item["argv"]),
+                        ) == record["verification_identity"]
                     ]
                     remaining = [
                         item for item in self.ledger.unresolved_failures
-                        if item.get("argv") != record["argv"]
+                        if item.get("argv") is None
+                        or item.get(
+                            "verification_identity",
+                            verification_identity(item["argv"]),
+                        ) != record["verification_identity"]
                     ]
                 self.ledger.validations.append(record)
                 self.ledger.validation_count += 1

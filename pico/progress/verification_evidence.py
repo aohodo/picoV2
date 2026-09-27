@@ -4,9 +4,58 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+_MAVEN_EXECUTABLES = {"mvn", "mvn.cmd", "mvnw", "mvnw.cmd"}
+_MAVEN_PRESENTATION_ARGUMENTS = {
+    "-b",
+    "--batch-mode",
+    "-ntp",
+    "--no-transfer-progress",
+    "-q",
+    "--quiet",
+}
+
 
 def _normalized(value):
     return str(value or "").replace("\\", "/").lstrip("./")
+
+
+def verification_identity(argv):
+    """Return the delivery meaning of one verification invocation.
+
+    A retry may change transport/presentation details without changing what is
+    being verified.  In particular, Maven's batch, quiet, transfer-progress,
+    and local-repository options do not alter the selected lifecycle goals,
+    modules, profiles, or tests.  Keeping those execution details in failure
+    identity made a successful retry unable to resolve an earlier timeout.
+
+    Unknown runners remain byte-for-byte conservative: only the Maven family
+    receives semantic normalization, and test/profile/skip/module arguments
+    are deliberately retained.
+    """
+    values = [str(item) for item in argv]
+    if not values:
+        return []
+    executable = _normalized(values[0]).rsplit("/", 1)[-1].casefold()
+    if executable not in _MAVEN_EXECUTABLES:
+        return values
+
+    semantic = ["maven"]
+    index = 1
+    while index < len(values):
+        item = values[index]
+        folded = item.casefold()
+        if folded in _MAVEN_PRESENTATION_ARGUMENTS:
+            index += 1
+            continue
+        if folded.startswith("-dmaven.repo.local="):
+            index += 1
+            continue
+        if folded == "-dmaven.repo.local" and index + 1 < len(values):
+            index += 2
+            continue
+        semantic.append(item)
+        index += 1
+    return semantic
 
 
 def _is_pytest(argv):

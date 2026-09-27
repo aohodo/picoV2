@@ -171,6 +171,12 @@ class ExecutionProfile:
     python_command: str = "python"
     python_executable: str = ""
     available_commands: tuple = ()
+    workspace_root: str = ""
+    package_cache_root: str = ""
+    java_home: str = ""
+    java_executable: str = ""
+    maven_executable: str = ""
+    maven_local_repository: str = ""
 
     def view(self):
         return {
@@ -181,6 +187,12 @@ class ExecutionProfile:
             "python_command": self.python_command,
             "python_executable": self.python_executable,
             "available_commands": list(self.available_commands),
+            "workspace_root": self.workspace_root,
+            "package_cache_root": self.package_cache_root,
+            "java_home": self.java_home,
+            "java_executable": self.java_executable,
+            "maven_executable": self.maven_executable,
+            "maven_local_repository": self.maven_local_repository,
         }
 
 
@@ -214,6 +226,11 @@ class WorkspaceCommandRunner:
             available_commands = tuple(
                 name for name in known_commands if shutil.which(name)
             )
+            maven_local_repository = (
+                self.cache_root / "maven"
+                if self.cache_root is not None
+                else self.execution_root / ".pico" / "runtime" / "maven"
+            )
             self._profile = ExecutionProfile(
                 tuple(prefix),
                 dialect,
@@ -223,6 +240,12 @@ class WorkspaceCommandRunner:
                 python_command="python",
                 python_executable=str(Path(sys.executable).resolve()),
                 available_commands=available_commands,
+                workspace_root=str(self.execution_root),
+                package_cache_root=str(self.cache_root or ""),
+                java_home=str(os.environ.get("JAVA_HOME", "")),
+                java_executable=str(shutil.which("java") or ""),
+                maven_executable=str(shutil.which("mvn") or ""),
+                maven_local_repository=str(maven_local_repository),
             )
         except ExecutionRuntimeUnavailable as exc:
             self._profile_error = str(exc)

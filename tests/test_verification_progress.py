@@ -195,6 +195,64 @@ def test_verification_identity_copies_arguments_and_ignores_timeout():
     assert not controller.ledger.unresolved_failures
 
 
+def test_maven_retry_identity_ignores_execution_only_arguments():
+    controller = ProgressController(24)
+    metadata = {
+        "tool_status": "error",
+        "executed": True,
+        "workspace_changed": False,
+    }
+    controller.observe(
+        "run_verification",
+        {"argv": ["mvn", "-q", "test"]},
+        "timed out",
+        metadata,
+    )
+
+    controller.observe(
+        "run_verification",
+        {
+            "argv": [
+                "mvn.cmd",
+                "-B",
+                "--no-transfer-progress",
+                "-Dmaven.repo.local=E:/warm-cache/maven",
+                "test",
+            ]
+        },
+        "passed",
+        {**metadata, "tool_status": "ok"},
+    )
+
+    assert not controller.ledger.unresolved_failures
+    assert controller.ledger.unresolved_failure_count == 0
+    assert controller.metrics()["validation_status"] == "passed"
+
+
+def test_maven_retry_identity_keeps_test_and_profile_scope():
+    controller = ProgressController(24)
+    metadata = {
+        "tool_status": "error",
+        "executed": True,
+        "workspace_changed": False,
+    }
+    controller.observe(
+        "run_verification",
+        {"argv": ["mvn", "-q", "-Pfast", "-Dtest=OneTest", "test"]},
+        "failed",
+        metadata,
+    )
+    controller.observe(
+        "run_verification",
+        {"argv": ["mvn", "-B", "-Pfull", "-Dtest=OtherTest", "test"]},
+        "passed",
+        {**metadata, "tool_status": "ok"},
+    )
+
+    assert controller.ledger.unresolved_failure_count == 1
+    assert controller.metrics()["validation_status"] == "failed"
+
+
 def test_legacy_failure_without_arguments_is_not_resolved_by_guessing():
     controller = ProgressController(24, ledger={
         "unresolved_failures": [{
@@ -323,6 +381,10 @@ def test_execution_profile_reports_runtime_facts_without_environment_values(tmp_
     assert profile["python_command"] == "python"
     assert profile["python_executable"]
     assert "python" in profile["available_commands"]
+    assert profile["workspace_root"] == str(tmp_path.resolve())
+    assert profile["maven_local_repository"] == str(
+        tmp_path.resolve() / ".pico" / "runtime" / "maven"
+    )
     assert set(profile) == {
         "dialect",
         "executable",
@@ -331,7 +393,30 @@ def test_execution_profile_reports_runtime_facts_without_environment_values(tmp_
         "python_command",
         "python_executable",
         "available_commands",
+        "workspace_root",
+        "package_cache_root",
+        "java_home",
+        "java_executable",
+        "maven_executable",
+        "maven_local_repository",
     }
+
+
+def test_execution_profile_exposes_effective_shared_maven_repository(tmp_path):
+    from pico.execution import WorkspaceCommandRunner
+    from pico.security import SecretBoundary
+
+    cache_root = tmp_path / "package-cache"
+    profile = WorkspaceCommandRunner(
+        tmp_path / "shadow",
+        SecretBoundary(),
+        cache_root=cache_root,
+    ).profile_view()
+
+    assert profile["package_cache_root"] == str(cache_root.resolve())
+    assert profile["maven_local_repository"] == str(
+        cache_root.resolve() / "maven"
+    )
 
 
 def test_reasoning_usage_is_preserved_without_inventing_missing_values():
