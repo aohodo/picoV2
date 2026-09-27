@@ -82,7 +82,7 @@ V3 development is isolated on `pico-v3-langgraph`.
 
 ## Current validation
 
-- complete inherited suite: `230 passed, 1 skipped`;
+- complete inherited suite: `239 passed, 1 skipped`;
 - runtime lint: no Ruff findings;
 - runtime complexity audit (`C901`, `PLR0912`, `PLR0915`): no findings;
 - graph topology and `orchestrator=langgraph` trace metadata: covered by tests.

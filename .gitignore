@@ -53,6 +53,7 @@ docs/*
 !docs/architecture/langgraph-runtime-v3.md
 !docs/decisions/
 !docs/decisions/0001-runtime-governs-invariants-not-model-strategy.md
+!docs/project-evolution.zh-CN.md
 !docs/repository-coding-benchmark.md
 !docs/release-validation-0.2.0.md
 

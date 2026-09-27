@@ -5,6 +5,11 @@
 - Migrate the coding-agent control flow to an explicit LangGraph runtime.
 - Preserve Pico's evidence-driven progress, transactional workspace, and
   verification-gated delivery as domain-owned services.
+- Close the evidence-to-action handoff with work-item evidence episodes while
+  keeping mutation and verification available.
+- Ground verification in the effective build environment and keep rejected
+  tool steps consistent in progress reporting.
+- Rewrite the current-design README and separate the V1-to-V3 evolution record.
 
 ## 0.2.0 - 2026-09-26
 

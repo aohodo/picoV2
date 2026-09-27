@@ -1,6 +1,6 @@
 # ADR 0001: Runtime governs invariants, not model strategy
 
-- Status: Accepted
+- Status: Superseded by ADR 0002
 - Date: 2026-09-26
 - Baseline: `dev@7c1b99d`
 
@@ -57,3 +57,16 @@ turn is recorded in evaluation data rather than converted directly into a new Ru
 This decision preserves the human-inspired loop: the Runtime maintains reliable perception and
 feedback; the model performs semantic judgment; tools execute the chosen action; verification
 calibrates the next judgment.
+
+## Supersession note
+
+The rejected experiment treated every evidence call as a phase transition and forced a plan
+update before the rest of a coherent evidence bundle could be collected. Later repeated-run
+evidence showed a narrower, reproducible failure: once evidence had been bound to an active work
+item, wording-only plan edits and novel-but-irrelevant observations could keep an episode open
+without interpreting the evidence already obtained.
+
+ADR 0002 supersedes only the claim that work-focus state can never affect discovery-tool
+admission. It preserves this ADR's central boundary: the Runtime does not choose the semantic
+solution or force mutation. The new boundary closes one active evidence episode and accepts either
+action or an explicit evidence assessment with a concrete next decision.

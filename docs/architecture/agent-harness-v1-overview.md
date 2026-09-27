@@ -1,6 +1,6 @@
 # Agent Harness v1 Overview
 
-This document records Pico's original V1 runtime shape: a local control loop around a model, repository context, constrained tools, task state, memory, and auditable run artifacts. It is retained as historical baseline material, not as the current V2 architecture.
+This document records Pico's original V1 runtime shape: a local control loop around a model, repository context, constrained tools, task state, memory, and auditable run artifacts. It is retained as historical baseline material, not as the current V3 architecture.
 
 The current design thesis is documented in [Human-Inspired Programming Loop](human-inspired-programming-loop.md).
 

@@ -2,11 +2,11 @@
 
 ## Status
 
-This document defines the design thesis of Pico V2. It is the current architecture direction, not a claim that Pico reproduces human cognition or exposes a model's private chain of thought.
+This document defines the human-inspired design thesis introduced in Pico V2 and carried into the current Pico V3 LangGraph runtime. It is an architecture direction, not a claim that Pico reproduces human cognition or exposes a model's private chain of thought.
 
 ## Thesis
 
-Pico V2 treats repository coding as continuous calibration between an expected program behavior and observed execution evidence.
+Pico V3 treats repository coding as continuous calibration between an expected program behavior and observed execution evidence.
 
 The Runtime borrows observable strategies used by experienced programmers:
 
@@ -35,7 +35,7 @@ read source
 
 Adding another read counter or a larger fixed context does not repair that chain. The missing unit is the programmer's current problem state: what is already supported, what remains uncertain, what the last result changed, and what would count as completion.
 
-Pico V2 therefore projects one evidence-driven work state into every model turn and anchors all mutations and validations in a transactional workspace.
+Pico V3 therefore projects one evidence-driven work state into every model turn and anchors all mutations and validations in a transactional workspace.
 
 ## Empirical inspiration and engineering interpretation
 
@@ -159,20 +159,21 @@ delivery review
 
 | Programmer behavior | Runtime representation | Current implementation |
 | --- | --- | --- |
-| Preserve the current goal | Interaction and transaction requirements | `interaction_policy.py`, `TaskState` |
-| Start from user-named targets | Explicit path grounding | `AgentLoop._ground_referenced_paths()` |
-| Build a bounded local understanding | Revisioned initial source working set | `working_set.py` |
+| Preserve the current goal | Interaction and transaction requirements | `domain/interaction_policy.py`, `TaskState` |
+| Start from user-named targets | Explicit path grounding | `runtime/repository_grounding_runtime.py` |
+| Build a bounded local understanding | Revisioned initial source working set | `context/working_set.py` |
 | Know what is already supported | Source ranges, revisions, graph evidence | `ExecutionLedger` |
 | Keep the current uncertainty visible | Evidence frontier and `work_focus` | `ProgressController.work_focus_view()` |
+| Interpret evidence before widening discovery | Active evidence episode and `decision_due` | `WorkPlanLedger`, `ProgressController.admissible_tools()` |
 | Avoid rereading visible stable evidence | Call and evidence identity | `ProgressController.preflight()` |
 | Execute one coherent change | Exact single-file and atomic patch sets | `patch_file`, `apply_patch` |
 | Use negative feedback to redirect work | Unresolved failure ledger | `ProgressController.observe()` |
 | Distinguish experiments from acceptance | Verification purpose and evidence | `run_verification`, verification ledger |
 | Invalidate conclusions after code changes | Unverified changes and path revisions | `ExecutionLedger.mark_mutation()` |
 | Review before claiming completion | Delivery review | completion and progress control |
-| Experiment without damaging source | Transactional Shadow Workspace | `transactional_workspace.py` |
+| Experiment without damaging source | Transactional Shadow Workspace | `workspace/transactional_workspace.py` |
 | Continue after interruption | Checkpoint, session, transaction resume | checkpoint/session/run stores |
-| Separate current work from durable convention | Working and Durable Memory | `features/memory.py`, memory admission |
+| Separate current work from durable convention | Working and Durable Memory | `memory/memory_store.py`, memory admission |
 
 ## Evidence lifecycle
 
@@ -191,6 +192,21 @@ mutate path
 ```
 
 The audit log may retain historical events. The active model context must not present stale source as current fact.
+
+An active work item's evidence also has an interpretation boundary:
+
+```text
+blocker or hypothesis
+  → discriminating observation
+  → decision_due
+  → act on the evidence
+       or record evidence_assessment and a concrete next decision
+  → next evidence episode
+```
+
+This boundary does not force mutation and is not based on a read count. It prevents a sequence of
+novel observations or wording-only plan changes from masquerading as decision progress. See
+[ADR 0002](../decisions/0002-evidence-assimilation-at-action-boundary.md).
 
 ## Failure lifecycle
 
