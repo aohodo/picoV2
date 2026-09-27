@@ -130,6 +130,35 @@ def test_finished_progress_uses_transaction_delivery_scope_after_resume():
     assert "changed 1" not in output
 
 
+def test_rejected_tool_progress_keeps_the_started_step_identity():
+    stream = StringIO()
+    renderer = ConsoleProgressRenderer(stream=stream, max_steps=10)
+    task = TaskState.create("task-rejected", "Respect protected paths.")
+    task.tool_steps = 4
+
+    renderer(
+        "tool_started",
+        {"name": "write_file", "args": {"path": "test_app.py"}, "step": 5},
+        task,
+    )
+    renderer(
+        "tool_executed",
+        {
+            "name": "write_file",
+            "args": {"path": "test_app.py"},
+            "step": 5,
+            "tool_status": "rejected",
+            "duration_ms": 0,
+        },
+        task,
+    )
+
+    lines = stream.getvalue().splitlines()
+    assert lines[0].startswith("[pico] step 5 | write_file")
+    assert lines[1].startswith("[pico] step 5 | write_file")
+    assert "rejected" in lines[1]
+
+
 def test_report_separates_run_delta_from_transaction_paths(tmp_path):
     agent, _ = build_agent(tmp_path, ["<final>No changes.</final>"], max_steps=1)
     task = TaskState.create("task-resumed", "Continue the interrupted task.")

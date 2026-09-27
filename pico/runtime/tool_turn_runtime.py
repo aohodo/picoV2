@@ -31,13 +31,14 @@ class ToolTurnRuntime:
                     "arguments": json.dumps(args, ensure_ascii=False, sort_keys=True),
                 }
             )
+        display_step = task_state.tool_steps + 1
         agent.emit_trace(
             task_state,
             "tool_started",
             {
                 "name": name,
                 "args": agent.compact_tool_args(args),
-                "next_step": task_state.tool_steps + 1,
+                "step": display_step,
             },
         )
         tool_started_at = time.monotonic()
@@ -93,6 +94,7 @@ class ToolTurnRuntime:
             {
                 "name": name,
                 "args": agent.compact_tool_args(args),
+                "step": display_step,
                 "result": clip(result, 500),
                 "duration_ms": tool_duration_ms,
                 **tool_metadata,

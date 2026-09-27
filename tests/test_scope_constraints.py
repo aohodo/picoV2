@@ -1,3 +1,5 @@
+import json
+
 from pico.domain.interaction_policy import build_interaction_contract
 from pico.persistence.session_store import SessionStore
 from pico.providers.clients import FakeModelClient
@@ -49,6 +51,22 @@ def test_explicit_test_constraint_rejects_file_tool_and_allows_solution(tmp_path
     assert (workspace / "solution.py").read_text(encoding="utf-8") == "value = 2\n"
     assert "assert True" in (workspace / "test_solution.py").read_text(encoding="utf-8")
     assert agent.last_run_outcome.successful
+
+    events = [
+        json.loads(line)
+        for line in agent.run_store.trace_path(agent.current_task_state).read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    rejected_attempt = [
+        event
+        for event in events
+        if event.get("name") == "patch_file"
+        and event.get("args", {}).get("path") == "test_solution.py"
+        and event.get("event") in {"tool_started", "tool_executed"}
+    ]
+    assert [event["step"] for event in rejected_attempt] == [1, 1]
 
 
 def test_shell_side_effect_on_protected_test_is_blocked_at_commit(tmp_path):

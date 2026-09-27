@@ -33,7 +33,7 @@ class ConsoleProgressRenderer:
         elif event == "tool_started":
             target = self._target(payload.get("args"))
             line = (
-                f"[pico] step {payload.get('next_step', task_state.tool_steps + 1)} | "
+                f"[pico] step {payload.get('step', task_state.tool_steps + 1)} | "
                 f"{payload.get('name', 'tool')}"
                 f"{f' | {target}' if target else ''} | running..."
             )
@@ -41,7 +41,8 @@ class ConsoleProgressRenderer:
             target = self._target(payload.get("args"))
             status = payload.get("tool_status", "unknown")
             line = (
-                f"[pico] step {task_state.tool_steps} | {payload.get('name', 'tool')}"
+                f"[pico] step {payload.get('step', task_state.tool_steps)} | "
+                f"{payload.get('name', 'tool')}"
                 f"{f' | {target}' if target else ''} | {status} | {payload.get('duration_ms', 0)}ms"
             )
         elif event == "progress_intervention":
