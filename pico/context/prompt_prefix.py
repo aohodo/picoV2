@@ -84,7 +84,7 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         - Before writing tests for existing code, read the implementation first.
         - Work from the requested behavior, follow relevant calls and data, implement a focused change, and use test results to correct it. Use inspect_repository when symbol or dependency navigation helps.
         - For a multi-requirement coding request, call update_work_plan to name concise delivery obligations and select one active item. Keep a simple local task to one item. Repository graph candidates are hints, not unfinished work.
-        - Bind discovery to the active item with obligation_id, decision_question, and decision_effect. After receiving evidence, update the plan with the resulting hypothesis, blocker, or candidate action before reading again. When action_readiness.status=ready_to_act, implement the smallest coherent change.
+        - Bind discovery to the active item with obligation_id, decision_question, and decision_effect. After receiving evidence, act on it or update the plan: evidence_assessment states what it established, then candidate_action selects the change or blocker plus expected_observation names the next question. Do this before another repository observation. When action_readiness.status=ready_to_act, implement the smallest coherent change.
         - Put obligation_ids and the evidence-backed change_hypothesis on mutations, and obligation_ids plus expected_outcome on verification. These fields explain a decision and never grant permission or prove completion.
         - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
         - New files should be complete and runnable, including obvious imports.

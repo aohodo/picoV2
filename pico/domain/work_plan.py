@@ -23,6 +23,7 @@ class WorkPlanLedger:
         order = [str(item.get("id", "")) for item in self.items]
         updated = {identifier: dict(item) for identifier, item in existing.items()}
         changed = False
+        decision_advanced = False
         for raw in args.get("items", ())[:MAX_WORK_ITEMS]:
             identifier = str(raw.get("id", "")).strip()
             previous = existing.get(identifier, {})
@@ -35,12 +36,35 @@ class WorkPlanLedger:
                 "expected_observation": str(
                     raw.get("expected_observation", "")
                 ).strip(),
+                "evidence_assessment": str(
+                    raw.get("evidence_assessment", "")
+                ).strip(),
                 "evidence_paths": list(previous.get("evidence_paths", ()))[:12],
                 "mutation_paths": list(previous.get("mutation_paths", ()))[:12],
             }
             previous_status = str(previous.get("status", ""))
             if previous_status in {"implemented", "verified"}:
                 item["status"] = previous_status
+            elif previous_status == "decision_due":
+                assessment_changed = bool(item["evidence_assessment"]) and (
+                    item["evidence_assessment"]
+                    != str(previous.get("evidence_assessment", ""))
+                )
+                next_decision_is_concrete = bool(item["candidate_action"]) or bool(
+                    item["blocker"] and item["expected_observation"]
+                )
+                if not (assessment_changed and next_decision_is_concrete):
+                    # A wording-only update must not erase the evidence
+                    # frontier or masquerade as a decision. Keep the open
+                    # episode intact so the next model input still names the
+                    # fact that requires interpretation.
+                    item = dict(previous)
+                elif item["candidate_action"]:
+                    item["status"] = "actionable"
+                    decision_advanced = True
+                else:
+                    item["status"] = "needs_evidence"
+                    decision_advanced = True
             elif item["blocker"]:
                 item["status"] = "needs_evidence"
             elif item["candidate_action"]:
@@ -55,11 +79,18 @@ class WorkPlanLedger:
         active_id = str(args.get("active_id", "")).strip()
         if active_id != self.active_id:
             changed = True
+            decision_advanced = True
         self.items = [updated[identifier] for identifier in order][-MAX_WORK_ITEMS:]
         self.active_id = active_id
-        if changed:
+        if changed and not any(
+            str(existing.get(identifier, {}).get("status", "")) == "decision_due"
+            and str(updated.get(identifier, {}).get("status", "")) == "decision_due"
+            for identifier in updated
+        ):
+            decision_advanced = True
+        if decision_advanced:
             self.decision_progress_count += 1
-        return changed
+        return changed, decision_advanced
 
     def blockers(self):
         return {
@@ -80,6 +111,7 @@ class WorkPlanLedger:
         item["evidence_paths"] = known[-12:]
         if item.get("status") not in {"implemented", "verified"}:
             item["status"] = "decision_due"
+            item["evidence_assessment"] = ""
         return True
 
     def mark_implemented(self, identifiers, paths):

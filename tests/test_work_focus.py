@@ -333,6 +333,12 @@ def test_work_plan_turns_evidence_into_a_decision_before_more_discovery():
     assert focus["phase"] == "interpret_active_evidence"
     assert focus["work_plan"]["items"][0]["status"] == "decision_due"
     assert controller.state.last_action["value"] == "evidence_only"
+    assert "read_file" not in controller.admissible_tools(
+        {"read_file", "update_work_plan", "patch_file", "run_verification"}
+    )
+    assert controller.preflight(
+        "search", {"pattern": "header", "path": "."}
+    )["evidence"].reason == "evidence_assimilation_required"
 
     controller.observe(
         "update_work_plan",
@@ -342,6 +348,7 @@ def test_work_plan_turns_evidence_into_a_decision_before_more_discovery():
                     "id": "headers",
                     "requirement": "Preserve framework response headers.",
                     "hypothesis": "The handler must copy ErrorResponse headers.",
+                    "evidence_assessment": "The test explicitly requires Allow passthrough.",
                     "candidate_action": "Add headers(errorResponse.getHeaders()).",
                     "expected_observation": "The 405 test retains Allow and passes.",
                 }
@@ -355,6 +362,101 @@ def test_work_plan_turns_evidence_into_a_decision_before_more_discovery():
     focus = controller.work_focus_view()
     assert focus["phase"] == "implement"
     assert focus["action_readiness"]["status"] == "ready_to_act"
+    assert "read_file" in controller.admissible_tools({"read_file"})
+
+
+def test_work_plan_does_not_treat_wording_change_as_evidence_assimilation():
+    controller = ProgressController(24)
+    controller.observe(
+        "update_work_plan",
+        {
+            "items": [
+                {
+                    "id": "api",
+                    "requirement": "Update the API.",
+                    "blocker": "Which method owns validation?",
+                }
+            ],
+            "active_id": "api",
+        },
+        "work plan updated",
+        {"executed": True, "tool_status": "ok", "workspace_changed": False},
+    )
+    controller.observe(
+        "read_file",
+        {"path": "service.py", "obligation_id": "api"},
+        "def validate(value): ...",
+        {"executed": True, "tool_status": "ok", "workspace_changed": False},
+    )
+
+    evidence = controller.observe(
+        "update_work_plan",
+        {
+            "items": [
+                {
+                    "id": "api",
+                    "requirement": "Update the API safely.",
+                    "hypothesis": "Validation may be in the service.",
+                }
+            ],
+            "active_id": "api",
+        },
+        "work plan updated",
+        {"executed": True, "tool_status": "ok", "workspace_changed": False},
+    )
+
+    assert evidence.kind == "NEW_EVIDENCE"
+    assert controller.state.last_action["value"] == "evidence_only"
+    assert controller.work_focus_view()["phase"] == "interpret_active_evidence"
+    assert controller.admissible_tools({"read_file", "patch_file"}) == {
+        "patch_file"
+    }
+
+
+def test_work_plan_can_open_a_new_evidence_episode_after_assessment():
+    controller = ProgressController(24)
+    controller.observe(
+        "update_work_plan",
+        {
+            "items": [
+                {
+                    "id": "api",
+                    "requirement": "Update the API.",
+                    "blocker": "Where is validation called?",
+                }
+            ],
+            "active_id": "api",
+        },
+        "work plan updated",
+        {"executed": True, "tool_status": "ok", "workspace_changed": False},
+    )
+    controller.observe(
+        "read_file",
+        {"path": "service.py", "obligation_id": "api"},
+        "def validate(value): ...",
+        {"executed": True, "tool_status": "ok", "workspace_changed": False},
+    )
+
+    controller.observe(
+        "update_work_plan",
+        {
+            "items": [
+                {
+                    "id": "api",
+                    "requirement": "Update the API.",
+                    "evidence_assessment": "The service defines validation but exposes no caller.",
+                    "blocker": "Which controller invokes validate?",
+                    "expected_observation": "A controller call identifies the API boundary.",
+                }
+            ],
+            "active_id": "api",
+        },
+        "work plan updated",
+        {"executed": True, "tool_status": "ok", "workspace_changed": False},
+    )
+
+    assert controller.work_focus_view()["phase"] == "resolve_active_blocker"
+    assert "search" in controller.admissible_tools({"search", "patch_file"})
 
 
 def test_work_plan_status_follows_mutation_and_authoritative_verification():

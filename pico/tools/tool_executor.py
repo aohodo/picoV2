@@ -299,15 +299,19 @@ class ToolExecutor:
         if not preflight["allowed"]:
             evidence = preflight["evidence"]
             error_code = (
-                "broad_exploration_after_grounding"
-                if evidence.reason == "broad_exploration_after_grounding"
+                "evidence_assimilation_required"
+                if evidence.reason == "evidence_assimilation_required"
                 else (
-                    "material_action_required"
-                    if evidence.reason == "material_action_required"
+                    "broad_exploration_after_grounding"
+                    if evidence.reason == "broad_exploration_after_grounding"
                     else (
-                        "typed_repository_read_required"
-                        if evidence.reason == "typed_repository_read_required"
-                        else "repeated_no_progress"
+                        "material_action_required"
+                        if evidence.reason == "material_action_required"
+                        else (
+                            "typed_repository_read_required"
+                            if evidence.reason == "typed_repository_read_required"
+                            else "repeated_no_progress"
+                        )
                     )
                 )
             )
@@ -324,37 +328,40 @@ class ToolExecutor:
                     "progress_reason": evidence.reason,
                 }
             )
+            rejection_messages = {
+                "evidence_assimilation_required": (
+                    f"error: evidence_assimilation_required for {name}; the active work "
+                    "item has fresh evidence. Act on it, or update_work_plan with an "
+                    "evidence_assessment and either a candidate_action or a concrete next "
+                    "blocker plus expected_observation before gathering more evidence."
+                ),
+                "broad_exploration_after_grounding": (
+                    f"error: broad_exploration_after_grounding for {name}; high-confidence "
+                    "repository evidence already identified candidate files. Read those "
+                    "targets before another repository-wide listing or search."
+                ),
+                "material_action_required": (
+                    f"error: material_action_required for {name}; the exploration budget is "
+                    "exhausted. Complete related edits with write_file, patch_file, or "
+                    "apply_patch; use run_verification, read missing source at known targets, "
+                    "finalize from existing evidence, or identify a blocker."
+                ),
+                "typed_repository_read_required": (
+                    f"error: typed_repository_read_required for {name}; use read_file, "
+                    "read_files, list_files, search, or inspect_repository so repository "
+                    "evidence remains bounded and auditable."
+                ),
+                "repeated_no_progress": (
+                    f"error: repeated_no_progress for {name}; this exact read-only call already "
+                    "succeeded and the workspace has not changed. Reuse the previous result or "
+                    "choose a materially different action."
+                ),
+            }
             return self._finalize(
                 name,
                 args,
                 ToolExecutionResult(
-                    content=(
-                        (
-                            f"error: broad_exploration_after_grounding for {name}; high-confidence "
-                            "repository evidence already identified candidate files. Read those "
-                            "targets before another repository-wide listing or search."
-                        )
-                        if error_code == "broad_exploration_after_grounding"
-                        else (
-                            f"error: material_action_required for {name}; the exploration budget is "
-                            "exhausted. Complete related edits with write_file, patch_file, or "
-                            "apply_patch; use "
-                            "run_verification, read missing source at known targets, finalize from existing evidence, "
-                            "or identify a blocker."
-                        )
-                        if error_code == "material_action_required"
-                        else (
-                            f"error: typed_repository_read_required for {name}; use read_file, "
-                            "read_files, list_files, search, or inspect_repository so repository "
-                            "evidence remains bounded and auditable."
-                        )
-                        if error_code == "typed_repository_read_required"
-                        else (
-                            f"error: repeated_no_progress for {name}; this exact read-only call already "
-                            "succeeded and the workspace has not changed. Reuse the previous result or "
-                            "choose a materially different action."
-                        )
-                    ),
+                    content=rejection_messages[error_code],
                     metadata=metadata,
                 ),
                 progress_recorded=True,

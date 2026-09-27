@@ -22,6 +22,9 @@ REPAIRABLE_VERIFICATION_FAILURES = {
 COPY_EXCLUDES = set(IGNORED_PATH_NAMES) | {
     ".pico", ".venv", "venv", "node_modules", "target", "build", "dist",
     ".ssh", ".aws", ".azure", ".docker", ".gnupg", ".netrc", "_netrc", ".npmrc", ".pypirc",
+    # A CMD-style `>nul` issued through Git Bash creates this ordinary file.
+    # It is execution debris and must never cross the transaction commit boundary.
+    "nul",
 }
 
 

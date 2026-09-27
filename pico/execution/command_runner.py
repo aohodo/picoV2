@@ -489,13 +489,33 @@ class WorkspaceCommandRunner:
         # such as C:\Program Files.
         return [str(command_processor), "/d", "/s", "/c", "call", *values]
 
+    @staticmethod
+    def _absolute_executable_path(executable, cwd):
+        path = Path(str(executable))
+        if not path.is_absolute():
+            path = Path(cwd) / path
+        return str(path.resolve())
+
+    @staticmethod
+    def _normalize_command_for_shell(command, shell_kind):
+        if os.name == "nt" and shell_kind == "bash":
+            # Git Bash treats CMD's NUL device as an ordinary repository file.
+            # Keep the model-facing command useful while adapting the one
+            # cross-shell redirection that can otherwise pollute delivery.
+            command = re.sub(
+                r"(?i)(?P<redirect>(?:[012]\s*)?>{1,2}\s*)nul(?=(?:\s|[;&|]|$))",
+                r"\g<redirect>/dev/null",
+                command,
+            )
+        return command
+
     def run(self, command, timeout=20):
         self.start()
         if self._profile is None:
             raise ExecutionRuntimeUnavailable(self._profile_error or "shell_runtime_unavailable")
         prefix = list(self._profile.argv_prefix)
         shell_kind = self._profile.dialect
-        command = str(command)
+        command = self._normalize_command_for_shell(str(command), shell_kind)
         if re.search(
             r"(?i)(?:^|[;&|]\s*)(?:node|npm|npx|pnpm|yarn|vite)(?:\.exe|\.cmd)?(?:\s|$)",
             command,
@@ -543,6 +563,9 @@ class WorkspaceCommandRunner:
         process_argv = argv
         resolved_executable = shutil.which(argv[0], path=env.get("PATH"))
         if os.name == "nt" and resolved_executable and Path(resolved_executable).suffix.casefold() in {".cmd", ".bat"}:
+            resolved_executable = self._absolute_executable_path(
+                resolved_executable, self.execution_root
+            )
             command_processor = env.get("COMSPEC") or shutil.which("cmd.exe")
             if not command_processor:
                 raise ExecutionRuntimeUnavailable("verification_runtime_unavailable: cmd.exe was not found")

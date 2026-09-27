@@ -581,14 +581,14 @@ class ProgressController:
         return self.ledger.work_plan.active(identifier)
 
     def _update_work_plan(self, args):
-        changed = self.ledger.work_plan.update(args)
+        _changed, decision_advanced = self.ledger.work_plan.update(args)
         active = self._work_item()
         if active is not None:
             self.ledger.last_change_hypothesis = str(active.get("hypothesis", ""))
             self.ledger.last_expected_outcome = str(
                 active.get("expected_observation", "")
             )
-        return changed
+        return decision_advanced
 
     def _bind_discovery_to_work_item(self, args, targets):
         return self.ledger.work_plan.bind_evidence(
@@ -622,11 +622,11 @@ class ProgressController:
     def work_focus_view(self):
         """Project one shared decision context from otherwise separate ledgers.
 
-        This view is advisory.  It does not hide tools, impose a discovery
-        quota, or claim that reading a file means its behavior is understood.
-        Its job is to keep the current evidence frontier visible after history
-        compaction so the model can make the next decision from facts instead
-        of reconstructing the task state on every turn.
+        This view does not claim that reading a file means its behavior is
+        understood. Its job is to keep the current evidence frontier visible
+        after history compaction. When an active work item has fresh evidence,
+        the same state also closes that evidence episode before another one is
+        opened; this is a semantic handoff, not a discovery-count quota.
         """
         unread = self._unread_requested_paths()
         unread_candidates = self._unread_candidate_paths()
@@ -930,6 +930,19 @@ class ProgressController:
 
     def preflight(self, tool_name, args):
         signature = self.signature(tool_name, args)
+        active = self._work_item()
+        if (
+            tool_name in DISCOVERY_TOOLS
+            and active is not None
+            and str(active.get("status", "")) == "decision_due"
+        ):
+            return {
+                "allowed": False,
+                "signature": signature,
+                "evidence": ProgressEvidence(
+                    NO_PROGRESS, "", "evidence_assimilation_required"
+                ),
+            }
         # This is an evidence-identity check, not a read-count quota. If the
         # exact current source range is already present in the model's actual
         # input, executing the read cannot add information. Once the evidence
@@ -965,8 +978,14 @@ class ProgressController:
         self.remaining_steps = max(0, int(remaining))
 
     def admissible_tools(self, tool_names):
-        # Keep the tool interface stable while the model repairs failed work.
-        return set(tool_names)
+        available = set(tool_names)
+        active = self._work_item()
+        if (
+            active is not None
+            and str(active.get("status", "")) == "decision_due"
+        ):
+            return available - DISCOVERY_TOOLS
+        return available
 
     @staticmethod
     def action_key(tool_name, args):

@@ -45,6 +45,7 @@ BASE_TOOL_SPECS = {
                         "blocker": {"type": "string"},
                         "candidate_action": {"type": "string"},
                         "expected_observation": {"type": "string"},
+                        "evidence_assessment": {"type": "string"},
                     },
                     "required": ["id", "requirement"],
                     "additionalProperties": False,
@@ -56,7 +57,10 @@ BASE_TOOL_SPECS = {
         "description": (
             "Create or update the current work-unit plan. Use concise delivery obligations, "
             "select one active item, and record its hypothesis, concrete blocker, candidate "
-            "action, and expected observation. Runtime owns completion and verification status."
+            "action, and expected observation. After gathering evidence, summarize what it "
+            "established in evidence_assessment and either choose a candidate action or name "
+            "the next concrete blocker and expected observation. Runtime owns completion and "
+            "verification status."
         ),
     },
     "list_files": {
@@ -366,6 +370,7 @@ def _validate_work_plan(_context, args):
             "blocker",
             "candidate_action",
             "expected_observation",
+            "evidence_assessment",
         ):
             if len(str(item.get(field, ""))) > 800:
                 raise ValueError(f"{field} must contain at most 800 characters")
@@ -765,6 +770,7 @@ def tool_update_work_plan(context, args):
                 "blocker",
                 "candidate_action",
                 "expected_observation",
+                "evidence_assessment",
             )
             if str(item.get(key, "")).strip()
         }

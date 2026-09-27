@@ -141,6 +141,34 @@ def test_windows_batch_preserves_executable_and_argument_boundaries():
     ]
 
 
+def test_relative_resolved_batch_launcher_is_anchored_to_workspace(tmp_path):
+    resolved = WorkspaceCommandRunner._absolute_executable_path(
+        ".\\mvn.CMD", tmp_path
+    )
+
+    assert resolved == str((tmp_path / "mvn.CMD").resolve())
+
+
+def test_git_bash_adapts_cmd_null_redirection_on_windows(monkeypatch):
+    monkeypatch.setattr("pico.execution.command_runner.os.name", "nt")
+
+    command = WorkspaceCommandRunner._normalize_command_for_shell(
+        "where mvn 2>nul & echo ok > NUL", "bash"
+    )
+
+    assert command == "where mvn 2>/dev/null & echo ok > /dev/null"
+
+
+def test_null_redirection_is_not_rewritten_for_powershell(monkeypatch):
+    monkeypatch.setattr("pico.execution.command_runner.os.name", "nt")
+
+    command = WorkspaceCommandRunner._normalize_command_for_shell(
+        "where mvn 2>nul", "powershell"
+    )
+
+    assert command == "where mvn 2>nul"
+
+
 def test_node_dependencies_are_copied_privately_on_first_node_command(tmp_path):
     source = tmp_path / "source"
     shadow = tmp_path / "shadow"
